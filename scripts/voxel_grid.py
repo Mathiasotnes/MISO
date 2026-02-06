@@ -18,7 +18,7 @@ parser.add_argument('--config', type=str, help='Path to config file.', default='
 parser.add_argument('--default_config', type=str, help='Path to config file.', default='./configs/base.yaml')
 parser.add_argument('--save_dir', type=str, default='./results/mapping')
 parser.add_argument('--pose_init', type=str, default='gt')  # reg_icp OR kiss_icp OR gt
-parser.add_argument('--scannet_root', type=str, default='./data/ScanNet/scans')
+parser.add_argument('--scannet_root', type=str, default='../../data/ScanNet/scans')
 parser.add_argument('--scene', type=str, default='0000_00')
 
 

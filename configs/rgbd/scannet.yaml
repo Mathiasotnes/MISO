@@ -65,15 +65,15 @@ align:
   verbose: True
   save_iterations: True
 system:
-  init_odom: "external"                # odometry to use for initialization
-  submap_size: 100                      # number of frames in a submap
+  init_odom: "external" # odometry to use for initialization
+  submap_size: *num_frames # number of frames in a submap (creating 1 submap for all frames)
   submap_local_bound: [[-10, 10], [-5, 5], [-10, 10]]
-  submap_fov_thresh: 0.0             # Create a new submap if the overlap is less than this threshold
+  submap_fov_thresh: 0.0 # Create a new submap if the overlap is less than this threshold
   save_submap_mesh: False
   log_dir: "./results/default"
 visualizer:
   enable: True
-  mesh_vis_freq: 10                  # Frequency to update mesh visualization
+  mesh_vis_freq: 10 # Frequency to update mesh visualization
   show_mesh: True
   show_path: True
   show_curr_pose: True
@@ -109,3 +109,4 @@ sample:
   dist_behind_surf: 0.1
   n_strat_samples: 19
   n_surf_samples: 8 
+  
