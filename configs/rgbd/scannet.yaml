@@ -93,16 +93,16 @@ train:
   # Grid trainer parameters
   relchange_tol: 0
   max_epochs_in_level: 100
-  grid_training_mode: "coordinate+joint"
+  grid_training_mode: "joint"
 dataset:
   name: "ScanNet"
   bounds_method: "ray"
-  trunc_dist: *truncation_dist                 # Yulun: used by encoder experiment
+  trunc_dist: *truncation_dist
   path: "./data/ScanNet/scene0169_00_mipsfusion"
   online: False
   intrinsics_file: "./data/ScanNet/scene0169_00_mipsfusion/scene0169_00.txt"
   depth_scale: 1000.0
-  voxel_size: null                # Voxel downsampling (null for no downsampling)
+  voxel_size: null # Voxel downsampling (null for no downsampling)
 sample:
   n_rays: 200
   depth_range: [0.07, 12.0]
