@@ -100,6 +100,14 @@ class GridNGP(BaseNet):
         self.rotation_corrections.requires_grad_(True)
         self.translation_corrections.requires_grad_(True)
         self.unlock_all_pose_indices()
+        
+    def lock_feature(self):
+        for param in self.model.parameters():
+            param.requires_grad = False
+    
+    def unlock_feature(self):
+        for param in self.model.parameters():
+            param.requires_grad = True
     
     def lock_pose_index(self, pose_index:int):
         self.locked_pose_indices.add(pose_index)
