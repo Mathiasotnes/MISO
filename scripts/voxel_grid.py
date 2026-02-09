@@ -76,8 +76,8 @@ def submap_mapping(cfg, grid_atlas:GridAtlas, dataset:SubmapDataset, submap_id):
     )
     mapper.mapping(
         mapping_kfs=range(frame_start, frame_end),
-        iterations=300,
-        level_iterations=50
+        iterations=cfg['train']['epochs'],
+        level_iterations=cfg['train']['max_epochs_in_level']
     )
 
 def save_submap(grid_atlas:GridAtlas, submap_id:int, save_dir=None, visualize=True, postfix=''):

@@ -81,18 +81,18 @@ visualizer:
   show_submap_pcd: False
 train:
   trainer: "base"
-  verbose: False
+  verbose: True
   optimizer: "adam"
-  learning_rate: 0.001
+  learning_rate: 0.005
   epochs: 50
-  batch_size: 1000000     
+  batch_size: 100000     
   ckpt_every: -1
   eval_every: -1
   pretrained_model: null
   log_dir: "./results/default"
   # Grid trainer parameters
   relchange_tol: 0
-  max_epochs_in_level: 100
+  max_epochs_in_level: 50
   grid_training_mode: "joint"
 dataset:
   name: "ScanNet"
@@ -109,4 +109,3 @@ sample:
   dist_behind_surf: 0.1
   n_strat_samples: 19
   n_surf_samples: 8 
-  
