@@ -220,9 +220,9 @@ class Trainer(object):
 
             # Logging
             self.total_steps += 1
-            if self.verbose and step % 10 == 0:
-                logger.info(f"Train epoch {epoch} step {step} | train_loss={total_loss.item():.2e}.")
             step_cpu_time, step_gpu_time = self.timer.check()
+            if self.verbose and step % 10 == 0:
+                logger.info(f"Train epoch {epoch} step {step} | train_loss={total_loss.item():.2e} | cpu_time={step_cpu_time:.2f}s | gpu_time={step_gpu_time:.2f}s")
             cpu_time += step_cpu_time
             gpu_time += step_gpu_time
         self.total_epoch_time += gpu_time

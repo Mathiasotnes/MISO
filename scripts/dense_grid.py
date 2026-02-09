@@ -88,6 +88,7 @@ def main_scannet():
     args = parser.parse_args()
     model_path = join(args.save_dir, 'grid.pth')
     cfg, grid, dataset = initialize_scannet(args)
+    print("grid on:", next(grid.parameters()).device)
     
     mapping(cfg, grid, dataset)
     
