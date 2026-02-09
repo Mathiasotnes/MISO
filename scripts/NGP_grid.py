@@ -69,6 +69,11 @@ def mapping(cfg, hash_grid:BaseNet, dataset:SubmapDataset):
         dataset=dataset,
         cfg=cfg
     )
+    
+    for kf_id in range(dataset.num_kfs):
+        R, t = dataset.true_kf_pose_in_world(kf_id)
+        hash_grid.set_initial_kf_pose(kf_id, R, t, kf_key=f"KF{kf_id}")
+    
     mapper.mapping(
         mapping_kfs=range(frame_start, frame_end),
         iterations=cfg['train']['epochs'],
