@@ -4,6 +4,7 @@ from copy import deepcopy
 from typing import List
 from grid_opt.configs import *
 from grid_opt.models.grid_net import GridNet
+from grid_opt.models.grid_ngp import GridNGP
 from grid_opt.datasets.submap_dataset import SubmapDataset
 from grid_opt.loss import MisoLossMapping
 import grid_opt.utils.utils_sdf as utils_sdf
@@ -30,7 +31,7 @@ class Mapper:
     """
     def __init__(
             self,
-            model: GridNet,              # We always perform mapping in a single GridNet
+            model: BaseNet, # We always perform mapping in a single GridNet
             dataset: SubmapDataset,
             cfg: dict,
         ):
