@@ -48,7 +48,7 @@ mapping:
   finite_diff_eps: 0.024      # 0.002 * RMAX
   grad_method: "finitediff"
   eik_trunc_dist: 0.024       # 0.002 * RMAX
-  verbose: False
+  verbose: True
   max_replay_frames: 10
   max_replay_freq: 10
   gm_scale_sdf: *gm_scale_sdf 

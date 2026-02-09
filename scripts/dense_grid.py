@@ -52,7 +52,8 @@ def create_configs_scannet(args, dataset: SubmapDataset):
     return cfg
 
 def initialize_scannet(args):
-    dataset = utils_scannet.create_scannet_dataset(args.scannet_root, args.scene, n_rays=200, frame_downsample=1)
+    cfg = load_config(args.config, args.default_config)
+    dataset = utils_scannet.create_scannet_dataset(args.scannet_root, args.scene, n_rays=cfg['sample']['n_rays'], frame_downsample=1)
     cfg = load_config(args.config, args.default_config)
     cfg = create_configs_scannet(args, dataset)
 
