@@ -21,7 +21,7 @@ model:
     init_stddev: 0.0  
     bound: *bound  
     base_cell_size: 0.5
-    per_level_scale: 5
+    per_level_scale: 2
     n_levels: 2
     second_order_grid_sample: True  # Optional: true requires the cuda_gridsample package to be on PATH
   pose:
@@ -85,7 +85,7 @@ train:
   optimizer: "adam"
   learning_rate: 0.005
   epochs: 50
-  batch_size: 100000     
+  batch_size: 100000
   ckpt_every: -1
   eval_every: -1
   pretrained_model: null

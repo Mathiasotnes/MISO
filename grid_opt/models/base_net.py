@@ -52,8 +52,10 @@ class BaseNet(nn.Module):
     
     
     def print_trainable_params(self):
-        print("\n === Trainable parameters === ")
+        print("\n ===   Trainable parameters   === ")
+        print(f"Total parameters: {sum(p.numel() for p in self.parameters() if p.requires_grad)}")
+        print(" -------------------------------- ")
         for name, param in self.named_parameters():
             if param.requires_grad:
                 print(f"{name}: {param.shape}")
-        print("=== END trainable parameters === \n ")
+        print(" === END trainable parameters === \n ")
