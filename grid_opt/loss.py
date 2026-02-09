@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from .diff import gradient3d
 from .models.base_net import BaseNet
 from .models.grid_net import GridNet
+from .models.grid_ngp import GridNGP
 from .models.grid_atlas import GridAtlas
 import grid_opt.utils.utils_geometry as utils_geometry
 
@@ -849,7 +850,7 @@ class MisoLossMapping(MisoLossMappingBase):
     """For mapping within a single submap (GridNet).
     """
     def query_kf_pose(self, model, kf_id):
-        assert isinstance(model, GridNet)
+        assert isinstance(model, GridNet) or isinstance(model, GridNGP), f"Invalid model type {type(model)}."
         return model.updated_kf_pose_from_key(f'KF{kf_id}')
     
 
