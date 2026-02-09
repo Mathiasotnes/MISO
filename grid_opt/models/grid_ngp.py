@@ -44,7 +44,7 @@ class GridNGP(BaseNet):
             "n_levels": 16,             # Number of levels (resolutions)
             "n_features_per_level": 2,  # Dimensionality of feature vector
                                         # stored in each level's entries.
-            "log2_hashmap_size": 19,    # If type is "Hash", is the base-2
+            "log2_hashmap_size": 15,    # If type is "Hash", is the base-2
                                         # logarithm of the number of elements
                                         # in each backing hash table.
             "base_resolution": 16,      # The resolution of the coarsest le-

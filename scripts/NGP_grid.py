@@ -97,7 +97,7 @@ def main_scannet():
     model_path = join(args.save_dir, 'hash_grid.pth')
     cfg, hash_grid, dataset = initialize_scannet(args)
     
-    submap_mapping(cfg, hash_grid, dataset, 0)
+    submap_mapping(cfg, hash_grid, dataset)
     
     # Visualize
     # save_submap(hash_grid, 0, save_dir=join(args.save_dir, 'submaps'), visualize=True, postfix='Fine Level')
