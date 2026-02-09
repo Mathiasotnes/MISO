@@ -64,6 +64,9 @@ class GridNGP(BaseNet):
 
         }
         
+        self.num_levels = 1 # Hack to make it compatible with trainer.py. I think we can make a much simpler trainer unless we still want
+                            # to support coarse-to-fine curriculum learning (coordinate option).
+        
         self.encoding = tcnn.Encoding(config_encoding["n_input_dims"], config_encoding)
         self.network = tcnn.Network(self.encoding.n_output_dims, config_network["n_output_dims"], config_network)
         self.model = torch.nn.Sequential(self.encoding, self.network)
