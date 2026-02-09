@@ -65,11 +65,17 @@ def initialize_scannet(args):
 def mapping(cfg, grid:BaseNet, dataset:SubmapDataset):
     frame_start = 0  
     frame_end = dataset.num_kfs
+    
+    for kf_id in range(dataset.num_kfs):
+        R, t = dataset.true_kf_pose_in_world(kf_id)
+        grid.set_initial_kf_pose(kf_id, R, t, kf_key=f"KF{kf_id}")
+        
     mapper = Mapper(
         model=grid,
         dataset=dataset,
         cfg=cfg
     )
+    
     mapper.mapping(
         mapping_kfs=range(frame_start, frame_end),
         iterations=cfg['train']['epochs'],
