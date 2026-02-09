@@ -4,7 +4,7 @@ import numpy as np
 from grid_opt.configs import *
 from grid_opt.utils.utils_sdf import *
 from grid_opt.slam.mapper import Mapper
-from grid_opt.slam.system import System
+from grid_opt.models.grid_ngp import GridNGP
 from grid_opt.datasets.submap_dataset import SubmapDataset
 import grid_opt.utils.utils_sdf as utils_sdf
 import grid_opt.utils.utils_scannet as utils_scannet
@@ -37,8 +37,6 @@ def create_configs_scannet(args, dataset: SubmapDataset):
     
 
 def initialize_scannet(args):
-    # With this code, we only do a 'dry run' over the dataset sequence
-    # in order to create the submap structure
     dataset = utils_scannet.create_scannet_dataset(args.scannet_root, args.scene, n_rays=200, frame_downsample=1)
     cfg = load_config(args.config, args.default_config)
     cfg = create_configs_scannet(args, dataset)
@@ -48,29 +46,17 @@ def initialize_scannet(args):
     cfg['mapping']['disable'] = True
     cfg['mapping']['verbose'] = False
     cfg['visualizer']['enable'] = False
-    grid_atlas = GridAtlas(cfg['model'], device=cfg['device'], dtype=torch.float32) 
-    grid_atlas.to(cfg['device'])
-    R_world_origin, t_world_origin = dataset.true_kf_pose_in_world(0)
-    system = System(
-        model=grid_atlas,
-        dataset_track=dataset,
-        dataset_map=dataset,
-        cfg=cfg,
-        R_world_origin=R_world_origin,
-        t_world_origin=t_world_origin,
-        verbose=False
-    )
-    system.run()  
-    return cfg, grid_atlas, dataset
+    hash_grid = GridNGP(cfg['model'], device=cfg['device'], dtype=torch.float32) 
+    hash_grid.to(cfg['device'])
+    return cfg, hash_grid, dataset
 
-def submap_mapping(cfg, grid_atlas:GridAtlas, dataset:SubmapDataset, submap_id):
+def submap_mapping(cfg, grid:BaseNet, dataset:SubmapDataset):
     cfg['mapping']['verbose'] = True
     cfg['mapping']['disable'] = False
-    submap_size = cfg['system']['submap_size']
-    frame_start = submap_size * submap_id  
-    frame_end = min(submap_size * (submap_id + 1), dataset.num_kfs)
+    frame_start = 0  
+    frame_end = dataset.num_kfs
     mapper = Mapper(
-        model=grid_atlas.get_submap(submap_id),
+        model=grid,
         dataset=dataset,
         cfg=cfg
     )
@@ -108,14 +94,14 @@ def main_scannet():
     np.random.seed(55)
     torch.manual_seed(55)
     args = parser.parse_args()
-    model_path = join(args.save_dir, 'grid_atlas.pth')
-    cfg, grid_atlas, dataset = initialize_scannet(args)
+    model_path = join(args.save_dir, 'hash_grid.pth')
+    cfg, hash_grid, dataset = initialize_scannet(args)
     
-    submap_mapping(cfg, grid_atlas, dataset, 0)
+    submap_mapping(cfg, hash_grid, dataset, 0)
     
     # Visualize
-    # save_submap(grid_atlas, 0, save_dir=join(args.save_dir, 'submaps'), visualize=True, postfix='Fine Level')
-    torch.save(grid_atlas, model_path)
+    # save_submap(hash_grid, 0, save_dir=join(args.save_dir, 'submaps'), visualize=True, postfix='Fine Level')
+    torch.save(hash_grid, model_path)
     
 
 if __name__ == "__main__":

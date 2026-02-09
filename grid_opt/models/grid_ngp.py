@@ -2,16 +2,14 @@ import os
 import numpy as np
 import math
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from sdf.netowrk import SDFNetwork
-from pytorch3d.transforms import so3_exp_map
 import grid_opt.utils.utils as utils
 from .base_net import BaseNet
-from .modules import MLPNet
 from .grid_modules import *
 import grid_opt.utils.utils_geometry as utils_geometry
 import logging
+
+import tinycudann as tcnn
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -29,28 +27,47 @@ class GridNGP(BaseNet):
     def __init__(self,
         cfg: dict, 
         device = 'cuda:0',
-        dtype = torch.float32,
+        dtype = torch.float32, # Use FP16?
     ):
-        super(GridNGP, self).__init__(cfg, device, dtype)        
+        super(GridNGP, self).__init__(cfg, device, dtype)    
         self.init_ngp(cfg)
         self.init_poses(cfg)
     
     def init_ngp(self, cfg):
-        self.num_levels = cfg['grid']['n_levels']
-        if 'base_resolution' not in cfg['grid']:
-            logger.warning("base_resolution not found in cfg. Using default value of 16.")
-            base_res = 16
-        else:
-            base_res = cfg['grid']['base_resolution']
-        self.sdf_network = SDFNetwork(
-            encoding='hashgrid',
-            num_levels=cfg['grid']['n_levels'],
-            base_resolution=base_res,
-            level_dim=cfg['grid']['feature_dim'],   
-            hidden_dim=cfg['decoder']['hidden_dim'],
-            num_layers=cfg['decoder']['hidden_layers'],
-            output_dim=cfg['decoder']['out_dim'],
-        )
+        
+        # TODO: Move config to another location.
+        config_encoding = {
+            "otype": "Grid",            # Component type.
+            "type": "Hash",             # Type of backing storage of the
+                                        # grids. Can be "Hash", "Tiled"
+                                        # or "Dense".
+            "n_levels": 16,             # Number of levels (resolutions)
+            "n_features_per_level": 2,  # Dimensionality of feature vector
+                                        # stored in each level's entries.
+            "log2_hashmap_size": 19,    # If type is "Hash", is the base-2
+                                        # logarithm of the number of elements
+                                        # in each backing hash table.
+            "base_resolution": 16,      # The resolution of the coarsest le-
+                                        # vel is base_resolution^input_dims.
+            "per_level_scale": 2.0,     # The geometric growth factor, i.e.
+                                        # the factor by which the resolution
+                                        # of each grid is larger (per axis)
+                                        # than that of the preceding level.
+            "interpolation": "Linear",  # How to interpolate nearby grid
+                                        # lookups. Can be "Nearest", "Linear",
+                                        # or "Smoothstep" (for smooth deri-
+                                        # vatives).
+            "n_input_dims": 3,          # Number of dimensions of input coordinates.
+        }
+        config_network = {
+            "n_output_dims": 1,         # Number of dimensions of output features. 1 for SDF prediction.
+
+        }
+        
+        self.encoding = tcnn.Encoding(config_encoding["n_input_dims"], config_encoding)
+        self.network = tcnn.Network(self.encoding.n_output_dims, config_network["n_output_dims"], config_network)
+        self.model = torch.nn.Sequential(self.encoding, self.network)
+        self.print_trainable_params()
 
     def init_poses(self, cfg):
         """Initialize pose correction terms.
@@ -73,14 +90,6 @@ class GridNGP(BaseNet):
         self.locked_pose_indices = set()
         self._pose_key_to_id = dict()
         logger.info(f"Initialized {self.num_poses} pose variables (optimize={self.optimize_pose}).")
-
-    def lock_feature(self):
-        for param in self.sdf_network.encoder.parameters():
-            param.requires_grad = False
-
-    def unlock_feature(self):
-        for param in self.sdf_network.encoder.parameters():
-            param.requires_grad = True
     
     def lock_pose(self):
         self.rotation_corrections.requires_grad_(False)
@@ -168,15 +177,15 @@ class GridNGP(BaseNet):
     
     def query_feature(self, x):
         x = utils.normalize_coordinates(x, self.bound)
-        return self.sdf_network.encoder(x)
+        return self.encoding(x)
     
     def forward(self, x):
         x = utils.normalize_coordinates(x, self.bound)
-        return self.sdf_network(x)
+        return self.model(x)
     
     def params_at_level(self, level):
         # FIXME: right now this always return the full set of params!
-        return list(self.sdf_network.parameters())
+        return list(self.model.parameters())
     
     def print_kf_pose_info(self):
         max_rot = torch.max(torch.linalg.norm(self.rotation_corrections, dim=1))
