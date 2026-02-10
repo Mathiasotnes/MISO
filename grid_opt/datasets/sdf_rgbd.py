@@ -383,9 +383,10 @@ class PosedSdfRgbd(SubmapDataset):
         T_WC_select = self._T_WC_batch
         norm_batch = self._norm_batch
         if self._selected_kfs is None:
-            kframe_idxs = range(self._num_frames)
+            kframe_idxs = torch.arange(self._num_frames, device=self.device)
         else:
-            kframe_idxs = self._selected_kfs               
+            kframe_idxs = torch.tensor(self._selected_kfs, device=self.device)               
+        
         depth_batch = depth_batch[kframe_idxs]
         T_WC_select = T_WC_select[kframe_idxs]
         norm_batch = norm_batch[kframe_idxs]
@@ -412,75 +413,43 @@ class PosedSdfRgbd(SubmapDataset):
             norm_sample,
             do_grad=True,
         )
-        # Filter out nan values in coords
-        num_before_filter = pc.shape[0]
-        pc_is_nan = torch.isnan(pc)
-        valid_indices = (~torch.any(pc_is_nan.view(pc_is_nan.shape[0], -1), dim=1)).nonzero(as_tuple=True)[0]
-        pc = pc[valid_indices]
-        num_after_filter = pc.shape[0]
-        logger.debug(f"{num_after_filter}/{num_before_filter} points left after nan filtering.")
-        norm_sample = norm_sample[valid_indices]
-        bounds = bounds[valid_indices]
-        grad_vec = grad_vec[valid_indices]
 
-        # Get correspondence between each sample and submap
-        sampled_kframes = np.asarray(kframe_idxs)
-        indices_b = sample["indices_b"].unsqueeze(-1)[valid_indices]   # (total_num_rays, 1)
-        indices_k = torch.from_numpy(sampled_kframes[indices_b.squeeze().cpu().numpy()]).unsqueeze(-1)
-        num_samples_per_ray = self.n_surf_samples + self.n_strat_samples
-        indices_k = indices_k.unsqueeze(1).expand(-1, num_samples_per_ray, -1)
-        indices_k = indices_k.reshape(-1,1).squeeze()   # association between sample and keyframe (total_num_samples,)
-        logger.debug(f"indices_k {indices_k.shape}")
-
-        # Convert pc from world to submap frames
-        pc_world = pc.reshape(-1, 3)
-        pc_kf = pc_world.clone()
-        for kf_id in kframe_idxs:
-            indices = torch.nonzero(indices_k == kf_id, as_tuple=False).squeeze(1)
-            if indices.numel() == 0:
-                continue
-            Rwk, twk = self.true_kf_pose_in_world(kf_id)
-            coords_world = pc_world[indices, :].to(Rwk)
-            coords_kf = utils_geometry.transfrom_points_from(coords_world, Rwk, twk)
-            pc_kf[indices, :] = coords_kf.to(pc_kf)
-
-        gt_sdf = bounds.reshape(-1, 1)
-        num_samples = gt_sdf.shape[0]
-        coords_frame = pc_kf
-        sample_frame_ids = indices_k.unsqueeze(1).long()
-        weights = torch.ones_like(gt_sdf)
-        gt_sdf_valid = torch.abs(gt_sdf) < self.trunc_dist
-        gt_sdf_signs = torch.zeros_like(gt_sdf)
-        gt_sdf_signs[gt_sdf < -self.trunc_dist] = -1
-        gt_sdf_signs[gt_sdf > self.trunc_dist] = 1
-        assert gt_sdf_valid.shape == (num_samples, 1)
-        assert gt_sdf_signs.shape == (num_samples, 1)
-        # TODO: Extend the getitem output to include normals
-
-        # FIXME: This is inefficient. Instead, any voxel downsampling could
-        # be down offline for once
-        if self.voxel_size is not None:
-            down_idx = utils_geometry.voxel_down_sample_torch(
-                coords_frame.detach().cpu(), self.voxel_size)
-            coords_frame = coords_frame[down_idx, :]
-            sample_frame_ids = sample_frame_ids[down_idx]
-            weights = weights[down_idx, :]
-            gt_sdf = gt_sdf[down_idx, :]
-            gt_sdf_valid = gt_sdf_valid[down_idx, :]
-            gt_sdf_signs = gt_sdf_signs[down_idx, :]
+        # NaN filtering
+        pc_flat = pc.reshape(-1, 3)
+        valid_mask = ~torch.any(torch.isnan(pc_flat), dim=1)
         
-        input_dict = {
-            'coords_frame': coords_frame,
+        pc_world = pc_flat[valid_mask]
+        bounds = bounds.reshape(-1, 1)[valid_mask]
+        
+        # Map back to keyframe indices without a loop
+        # indices_b is (Ray_Index), we need (Sample_Index)
+        num_samples_per_ray = self.n_surf_samples + self.n_strat_samples
+        indices_b = sample["indices_b"].repeat_interleave(num_samples_per_ray)
+        indices_b = indices_b[valid_mask]
+        
+        # Final Frame ID association
+        sample_frame_ids = kframe_idxs[indices_b].unsqueeze(-1)
+
+        T_WC_all = self._T_WC_batch[sample_frame_ids.squeeze()] # (N, 4, 4)
+        R_WC = T_WC_all[:, :3, :3]
+        t_WC = T_WC_all[:, :3, 3:]
+        
+        # Transform: P_kf = R_WC^T @ (P_world - t_WC)
+        pc_kf = torch.bmm(R_WC.transpose(1, 2), (pc_world.unsqueeze(-1) - t_WC)).squeeze(-1)
+
+        gt_sdf = bounds
+        gt_sdf_valid = torch.abs(gt_sdf) < self.trunc_dist
+        gt_sdf_signs = torch.sign(gt_sdf) 
+
+        return {
+            'coords_frame': pc_kf,
             'sample_frame_ids': sample_frame_ids,
-            'weights': weights,
-        }
-        gt_dict = {
+            'weights': torch.ones_like(gt_sdf),
+        }, {
             'sdf': gt_sdf,
             'sdf_valid': gt_sdf_valid,
             'sdf_signs': gt_sdf_signs,
         }
-
-        return input_dict, gt_dict
 
 
     def __getitem__(self, index):
