@@ -60,8 +60,10 @@ class GridNGP(BaseNet):
             "n_input_dims": 3,          # Number of dimensions of input coordinates.
         }
         config_network = {
+            "otype": "FullyFusedMLP",   # Component type.
             "n_output_dims": 1,         # Number of dimensions of output features. 1 for SDF prediction.
-
+            "n_neurons": 64,            # Number of neurons in each hidden layer.
+            "n_hidden_layers": 1        # Number of hidden layers.
         }
         
         self.num_levels = 1 # Hack to make it compatible with trainer.py. I think we can make a much simpler trainer unless we still want
