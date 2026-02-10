@@ -84,7 +84,7 @@ train:
   verbose: True
   optimizer: "adam"
   learning_rate: 0.001
-  epochs: 50
+  epochs: 100
   batch_size: 1000000
   ckpt_every: -1
   eval_every: -1
