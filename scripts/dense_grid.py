@@ -93,7 +93,7 @@ def calculate_model_sparsity(model: torch.nn.Module):
     total_zeros = 0
 
     for name, parameter in model.named_parameters():
-        if 'weight' in name: # Focus on weight tensors
+        if 'feature' in name: # Focus on weight tensors
             # Get the total number of elements in the tensor
             num_elements = parameter.numel()
             total_elements += num_elements
