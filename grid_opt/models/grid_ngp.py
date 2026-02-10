@@ -44,7 +44,7 @@ class GridNGP(BaseNet):
             "n_levels": 16,             # Number of levels (resolutions)
             "n_features_per_level": 2,  # Dimensionality of feature vector
                                         # stored in each level's entries.
-            "log2_hashmap_size": 15,    # If type is "Hash", is the base-2
+            "log2_hashmap_size": 19,    # If type is "Hash", is the base-2
                                         # logarithm of the number of elements
                                         # in each backing hash table.
             "base_resolution": 16,      # The resolution of the coarsest le-
@@ -61,9 +61,11 @@ class GridNGP(BaseNet):
         }
         config_network = {
             "otype": "FullyFusedMLP",   # Component type.
+            "activation": "ReLU",       # Activation function. Can be "ReLU",
+            "output_activation": "None",# Activation function of the output layer.
             "n_output_dims": 1,         # Number of dimensions of output features. 1 for SDF prediction.
-            "n_neurons": 64,            # Number of neurons in each hidden layer.
-            "n_hidden_layers": 1        # Number of hidden layers.
+            "n_neurons": 128,           # Number of neurons in each hidden layer. (mus be 16, 32, 64 or 128)
+            "n_hidden_layers": 5        # Number of hidden layers.
         }
         
         self.num_levels = 1 # Hack to make it compatible with trainer.py. I think we can make a much simpler trainer unless we still want
