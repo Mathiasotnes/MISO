@@ -92,7 +92,7 @@ train:
   log_dir: "./results/default"
   # Grid trainer parameters
   relchange_tol: 0
-  max_epochs_in_level: 50
+  max_epochs_in_level: 100
   grid_training_mode: "joint"
 dataset:
   name: "ScanNet"
@@ -104,8 +104,8 @@ dataset:
   depth_scale: 1000.0
   voxel_size: null # Voxel downsampling (null for no downsampling)
 sample:
-  n_rays: 200
+  n_rays: 300
   depth_range: [0.07, 12.0]
   dist_behind_surf: 0.1
-  n_strat_samples: 19
-  n_surf_samples: 8 
+  n_strat_samples: 0
+  n_surf_samples: 10
