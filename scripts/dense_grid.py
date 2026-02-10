@@ -1,6 +1,7 @@
 import argparse
 import numpy as np
-from grid_opt.utils.utils_eval import compute_chamfer_metrics
+import json
+from grid_opt.utils.utils_eval import compute_chamfer_metrics, sample_points_from_mesh
 from grid_opt.datasets.submap_dataset import SubmapDataset
 from grid_opt.slam.mapper import Mapper
 from grid_opt.utils.utils_sdf import *
@@ -97,8 +98,12 @@ def main_scannet():
     torch.save(grid, model_path)
     mesh = utils_sdf.save_mesh(grid, grid.bound, save_path=mesh_path)
     gt_mesh_path = join(args.scannet_root, f"scene{args.scene}/scene{args.scene}_vh_clean.ply")
-    gt_mesh = o3d.io.read_triangle_mesh(gt_mesh_path)
-    print(compute_chamfer_metrics(mesh, gt_mesh))
+    
+    verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
+    verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
+    
+    metrics_results = compute_chamfer_metrics(verts_pred, verts_trgt)
+    print(json.dumps(metrics_results, indent=4))
 
 if __name__ == "__main__":
     main_scannet()
