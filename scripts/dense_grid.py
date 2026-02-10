@@ -98,7 +98,7 @@ def main_scannet():
     mesh = utils_sdf.save_mesh(grid, grid.bound, save_path=mesh_path)
     gt_mesh_path = join(args.scannet_root, f"scene{args.scene}/scene{args.scene}_vh_clean.ply")
     gt_mesh = o3d.io.read_triangle_mesh(gt_mesh_path)
-    print(compute_chamfer_metrics(mesh, gt_mesh, num_points=1000000))
+    print(compute_chamfer_metrics(mesh, gt_mesh))
 
 if __name__ == "__main__":
     main_scannet()
