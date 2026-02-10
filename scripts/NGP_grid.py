@@ -1,5 +1,6 @@
 import argparse
 import numpy as np
+from grid_opt.utils.utils_eval import compute_chamfer_metrics
 from grid_opt.datasets.submap_dataset import SubmapDataset
 from grid_opt.slam.mapper import Mapper
 from grid_opt.utils.utils_sdf import *
@@ -85,13 +86,17 @@ def main_scannet():
     torch.manual_seed(55)
     args = parser.parse_args()
     model_path = join(args.save_dir, 'hash_grid.pth')
+    mesh_path = join(args.save_dir, 'hash_pred_mesh.ply')
     cfg, hash_grid, dataset = initialize_scannet(args)
     
     mapping(cfg, hash_grid, dataset)
     
-    # Visualize
-    # save_submap(grid, 0, save_dir=join(args.save_dir, 'submaps'), visualize=True, postfix='Fine Level')
+    # Evaluate
     torch.save(hash_grid, model_path)
+    mesh = utils_sdf.save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
+    gt_mesh_path = join(args.scannet_root, f"scene{args.scene}/scene{args.scene}_vh_clean.ply")
+    gt_mesh = o3d.io.read_triangle_mesh(gt_mesh_path)
+    print(compute_chamfer_metrics(mesh, gt_mesh))
 
 if __name__ == "__main__":
     main_scannet()
