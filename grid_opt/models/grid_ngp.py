@@ -49,7 +49,7 @@ class GridNGP(BaseNet):
                                         # in each backing hash table.
             "base_resolution": 16,      # The resolution of the coarsest le-
                                         # vel is base_resolution^input_dims.
-            "per_level_scale": 1.18,    # The geometric growth factor, i.e.
+            "per_level_scale": 1.26,    # The geometric growth factor, i.e.
                                         # the factor by which the resolution
                                         # of each grid is larger (per axis)
                                         # than that of the preceding level.
