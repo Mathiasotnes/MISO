@@ -43,7 +43,7 @@ mapping:
   loss_type: "L1"
   weight_sdf: 1.0
   weight_eik: 0.0
-  weight_fs: 1.0
+  weight_fs: 0.1
   trunc_dist: *truncation_dist
   finite_diff_eps: 0.024      # 0.002 * RMAX
   grad_method: "finitediff"
