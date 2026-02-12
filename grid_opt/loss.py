@@ -715,7 +715,8 @@ class MisoLossMappingBase(BaseLoss):
             grad_method='autograd',
             eik_trunc_dist=0.1,
             use_stability=False, 
-            weight_clip=0
+            weight_clip=0,
+            track_occupancy=False
         ):
         super().__init__()
         self.loss_type = loss_type
@@ -728,6 +729,7 @@ class MisoLossMappingBase(BaseLoss):
         self.eik_trunc_dist = eik_trunc_dist
         self.use_stability = use_stability
         self.weight_clip = weight_clip
+        self.track_occupancy = track_occupancy
         logger.info("MisoLossMappingBase initialized with the following configuration:")
         logger.info(f"  - Loss function: {self.loss_type}")
         logger.info(f"  - Weight SDF: {self.weight_sdf}")
@@ -739,6 +741,7 @@ class MisoLossMappingBase(BaseLoss):
         logger.info(f"  - Eik truncation distance: {self.eik_trunc_dist}")
         logger.info(f"  - Use stability: {self.use_stability}")
         logger.info(f"  - Weight CLIP: {self.weight_clip}")
+        logger.info(f"  - Track occupancy: {self.track_occupancy}")
 
     def query_kf_pose(self, model: BaseNet, kf_id: int):
         raise NotImplementedError("This function should be implemented in the derived class.")
@@ -811,6 +814,15 @@ class MisoLossMappingBase(BaseLoss):
         if self.weight_clip > 0:
             clip_loss_dict = self.compute_clip(model, model_input, gt)
             loss_dict.update(clip_loss_dict)
+            
+        if self.track_occupancy:
+            with torch.no_grad():
+                valid_mask = (gt_sdf_valid.squeeze(-1) == 1) # (N,)
+                if valid_mask.any():
+                    coords_v = coords_world[valid_mask]          # (Nv,3)
+                    sdf_v    = gt_sdf[valid_mask]                # (Nv,1)  (or squeeze if you want)
+                    model.occupancy_grid.update(coords_v, sdf_v)
+            
         return loss_dict
 
     def compute_clip(self, model, model_input: dict, gt: dict) -> dict:

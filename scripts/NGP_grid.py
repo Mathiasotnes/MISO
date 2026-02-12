@@ -69,7 +69,8 @@ def mapping(cfg, hash_grid:BaseNet, dataset:SubmapDataset):
     mapper = Mapper(
         model=hash_grid,
         dataset=dataset,
-        cfg=cfg
+        cfg=cfg,
+        track_occupancy=True # Custom parameter for NGPGrid
     )
     
     for kf_id in range(dataset.num_kfs):
@@ -111,6 +112,53 @@ def calculate_model_sparsity(model: torch.nn.Module):
     else:
         return 0.0
 
+def save_mesh(
+        model, 
+        bounds: torch.Tensor, 
+        save_path=None, 
+        resolution=256, 
+        device='cuda:0', 
+        flip_face=True, 
+        transform:torch.Tensor=None   # [4,4] matrix
+    ):
+    """ Custom mesh saving that also applies occupancy grid. """
+
+    if save_path is not None:
+        logger.info(f"Saving mesh to {save_path}...")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    def query_func(pts):
+        pts = pts.to(device)
+        with torch.no_grad():
+            sdfs = model(pts)  # (N,1) or (N,)
+            sdfs = sdfs.view(-1)
+
+            occ = model.occupancy_grid.get_occupancy(pts)  # (N,) bool
+            # Push empty space to positive so iso-surface (0) can't appear there
+            sdfs = torch.where(occ, sdfs, torch.full_like(sdfs, 1.0))
+
+        return sdfs
+
+
+    vertices, triangles = extract_geometry(
+        bounds[:,0], bounds[:,1], resolution=resolution, threshold=0, query_func=query_func)
+    
+    if flip_face:
+        triangles = triangles[:, [2,1,0]]
+
+    mesh = trimesh.Trimesh(vertices, triangles, process=False) # important, process=True leads to seg fault...
+    if transform is not None:
+        mesh.apply_transform(transform.detach().cpu().numpy())
+    if save_path is not None:
+        mesh.export(save_path, file_type='ply')
+    # Return open3d mesh
+    mesh_o3d = o3d.geometry.TriangleMesh()
+    mesh_o3d.vertices = o3d.utility.Vector3dVector(np.asarray(mesh.vertices))
+    mesh_o3d.triangles = o3d.utility.Vector3iVector(np.asarray(mesh.faces))
+    mesh_o3d.compute_vertex_normals()
+    return mesh_o3d
+
+
 def main_scannet():
     np.random.seed(55)
     torch.manual_seed(55)
@@ -127,7 +175,7 @@ def main_scannet():
     
     # Evaluate
     torch.save(hash_grid, model_path)
-    mesh = utils_sdf.save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
+    mesh = save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
     gt_mesh_path = join(args.scannet_root, f"scene{args.scene}/scene{args.scene}_vh_clean.ply")
     
     verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
