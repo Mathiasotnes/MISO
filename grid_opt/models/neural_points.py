@@ -36,6 +36,7 @@ class NeuralPoints(BaseNet):
         # Config
         self.cell_size = 0.1
         self.fdim = 4
+        self.num_levels = 1 # To be compatible with trainer
         
         assert self.bound.shape == (3, 2), f"Invalid bound shape {self.bound.shape}!"
         
