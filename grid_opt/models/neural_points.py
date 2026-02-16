@@ -399,7 +399,12 @@ class NeuralPoints(BaseNet):
         s = (w_norm[..., None] * s_j).sum(dim=1)           # (N,D)
 
         return s                                           # (N,D)
-        
+    
+    def print_active_info(self):
+        n_active = int(self.active.sum().item())
+        n_total = int(self.num_cells)
+        logger.info(f"NeuralPoints active: {n_active}/{n_total} ({100.0*n_active/n_total:.3f}%)")
+
     def params_at_level(self, level):
         # FIXME: right now this always return the full set of params!
         return list(self.parameters())
