@@ -207,11 +207,11 @@ class NeuralPoints(BaseNet):
         self.unlock_all_pose_indices()
         
     def lock_feature(self):
-        for param in self.model.parameters():
+        for param in self.features.parameters():
             param.requires_grad = False
     
     def unlock_feature(self):
-        for param in self.model.parameters():
+        for param in self.features.parameters():
             param.requires_grad = True
     
     def lock_pose_index(self, pose_index:int):
@@ -398,7 +398,7 @@ class NeuralPoints(BaseNet):
         
     def params_at_level(self, level):
         # FIXME: right now this always return the full set of params!
-        return list(self.model.parameters())
+        return list(self.features.parameters())
     
     def print_kf_pose_info(self):
         max_rot = torch.max(torch.linalg.norm(self.rotation_corrections, dim=1))
