@@ -387,15 +387,18 @@ class NeuralPoints(BaseNet):
         decoder_in = torch.cat([Np_feat, Np_pos], dim=-1) # (N,K,fdim+3)
         decoder_in = decoder_in.view(N * K, -1) # (N*K,input_dim)
 
-        # Decode per-neighbor SDF s_j
-        s_j = self.decoder(decoder_in) # (N*K, out_dim=1)
-        s_j = s_j.view(N, K) # (N,K)
-        s_j[~valid] = 0.0
+        # Decode per-neighbor SDF s_j        
+        s_j = self.decoder(decoder_in)                     # (N*K, D)
+        D = s_j.shape[-1]
+        s_j = s_j.view(N, K, D)                            # (N,K,D)
 
-        # Weighted sum: s = sum_j w_norm * s_j
-        s = (w_norm * s_j).sum(dim=1) # (N,)
+        # Mask invalid
+        s_j = s_j.masked_fill((~valid)[..., None], 0.0)    # (N,K,D)
 
-        return s
+        # Weighted sum over neighbors
+        s = (w_norm[..., None] * s_j).sum(dim=1)           # (N,D)
+
+        return s                                           # (N,D)
         
     def params_at_level(self, level):
         # FIXME: right now this always return the full set of params!
