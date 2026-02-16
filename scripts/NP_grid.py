@@ -113,6 +113,13 @@ def calculate_model_sparsity(model: torch.nn.Module):
         return overall_sparsity
     else:
         return 0.0
+    
+def save_active_point_cloud(path, points_xyz):
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points_xyz)
+    o3d.io.write_point_cloud(path, pcd)
+
+
 
 def main_scannet():
     np.random.seed(55)
@@ -120,12 +127,15 @@ def main_scannet():
     args = parser.parse_args()
     model_path = join(args.save_dir, 'neural_points.pth')
     mesh_path = join(args.save_dir, 'neural_points_mesh.ply')
+    ptc_path = join(args.save_dir, 'neural_points_points.ply')
     cfg, neural_points, dataset = initialize_scannet(args)
     
     mapping(cfg, neural_points, dataset)
 
     # Evaluate
     neural_points.print_active_info()
+    pts = neural_points.points[neural_points.active].detach().cpu().numpy()
+    save_active_point_cloud(ptc_path, pts)
     torch.save(neural_points, model_path)
     mesh = utils_sdf.save_mesh(neural_points, neural_points.bound, save_path=mesh_path)
     gt_mesh_path = join(args.scannet_root, f"scene{args.scene}/scene{args.scene}_vh_clean.ply")
