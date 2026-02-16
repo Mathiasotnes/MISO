@@ -119,8 +119,6 @@ def save_active_point_cloud(path, points_xyz):
     pcd.points = o3d.utility.Vector3dVector(points_xyz)
     o3d.io.write_point_cloud(path, pcd)
 
-
-
 def main_scannet():
     np.random.seed(55)
     torch.manual_seed(55)
@@ -133,6 +131,7 @@ def main_scannet():
     mapping(cfg, neural_points, dataset)
 
     # Evaluate
+    neural_points.eval()
     neural_points.print_active_info()
     pts = neural_points.points[neural_points.active].detach().cpu().numpy()
     save_active_point_cloud(ptc_path, pts)

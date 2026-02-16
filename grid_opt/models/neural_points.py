@@ -317,7 +317,7 @@ class NeuralPoints(BaseNet):
         Query neighbor neural-point inputs for samples x (world coords).
 
         Behavior:
-            1) Ensures the voxel containing each x is activated (stores point position once).
+            1) Activates the voxel containing x if in training and not already active. (not when in eval)
             2) Queries K closest neighbor indices.
             3) Returns per-neighbor concatenated [feature, position].
 
@@ -332,14 +332,14 @@ class NeuralPoints(BaseNet):
         assert x.ndim == 2 and x.shape[1] == 3
 
         center_idx = self.world_to_grid(x) # (N,)
-        inactive = ~self.active[center_idx] # (N,) bool mask where inactive indices are True
-
-        # Initialize neural points for inactive voxels: set position, mark active
-        if inactive.any():
-            idx_new = center_idx[inactive]
-            with torch.no_grad():
-                self.points[idx_new] = x[inactive]
-                self.active[idx_new] = True
+        
+        if self.training:
+            inactive = ~self.active[center_idx] # (N,) bool mask where inactive indices are True
+            if inactive.any():
+                idx_new = center_idx[inactive]
+                with torch.no_grad():
+                    self.points[idx_new] = x[inactive]
+                    self.active[idx_new] = True
 
         Np_idx = self.query_neighbors(x, K) # (N,K), -1 for missing
         valid = Np_idx >= 0
@@ -388,17 +388,24 @@ class NeuralPoints(BaseNet):
         decoder_in = decoder_in.view(N * K, -1) # (N*K,input_dim)
 
         # Decode per-neighbor SDF s_j        
-        s_j = self.decoder(decoder_in)                     # (N*K, D)
+        s_j = self.decoder(decoder_in) # (N*K, D)
         D = s_j.shape[-1]
-        s_j = s_j.view(N, K, D)                            # (N,K,D)
+        s_j = s_j.view(N, K, D) # (N,K,D)
 
         # Mask invalid
-        s_j = s_j.masked_fill((~valid)[..., None], 0.0)    # (N,K,D)
+        s_j = s_j.masked_fill((~valid)[..., None], 0.0) # (N,K,D)
 
         # Weighted sum over neighbors
-        s = (w_norm[..., None] * s_j).sum(dim=1)           # (N,D)
+        s = (w_norm[..., None] * s_j).sum(dim=1) # (N,D)
+        
+        # Just set output to 1 if no valid neighbors to represent free space (for now)
+        no_nb = (valid.sum(dim=1) == 0) # (N,)
+        if no_nb.any():
+            s = s.clone()
+            s[no_nb] = 0.0
+            s[no_nb, 0] = 1.0
 
-        return s                                           # (N,D)
+        return s # (N,D)
     
     def print_active_info(self):
         n_active = int(self.active.sum().item())
