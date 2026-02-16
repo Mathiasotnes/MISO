@@ -1,7 +1,8 @@
 import math
 import torch
-import grid_opt.utils.utils as utils
+import torch.nn as nn
 from .base_net import BaseNet
+from .modules import MLPNet
 from .grid_modules import *
 import grid_opt.utils.utils_geometry as utils_geometry
 import logging
@@ -23,15 +24,27 @@ class NeuralPoints(BaseNet):
         super(NeuralPoints, self).__init__(cfg, device, dtype)    
         self.device = device
         self.dtype = dtype
-        self.init_hash_table(cfg)
+        self.init_grid(cfg)
         self.init_neural_points(cfg)
         self.init_decoder(cfg)
         self.init_poses(cfg)
         self.print_trainable_params()
     
-    def init_hash_table(self, cfg):
-        """ Initialize the hash table for storing neural points. """
-        pass
+    def init_grid(self, cfg):
+        
+        # TODO: Move this elsewhere
+        # Config
+        self.cell_size = 0.1
+        self.fdim = 4
+        
+        assert self.bound.shape == (3, 2), f"Invalid bound shape {self.bound.shape}!"
+        
+        self.grid_dims = torch.ceil((self.bound[:,1] - self.bound[:,0]) / self.cell_size).to(torch.long)  # (3,)
+        nx, ny, nz = self.grid_dims.tolist()
+        self.num_cells = nx * ny * nz
+        
+        # Recording active points
+        self.register_buffer("active", torch.zeros((self.num_cells,), device=self.device, dtype=torch.bool))
     
     def init_neural_points(self, cfg):
         """ Initializes neural point representation? Maybe it should be a class instead? """
@@ -45,19 +58,41 @@ class NeuralPoints(BaseNet):
                 - Creation time ?
                 - Last update time ?
                 - Stability ?
-            API:
-                - init(point): initialize a new point with position "point", and zero feature vector.
-                - query_distance(point): return the relative coordinate d_j.
-                - get_weight(point): inverse distance weight for interpolation. ??
         """
-        pass
-        
+        # Non-trainable position buffer
+        self.register_buffer("points", torch.zeros((self.num_cells, 3), device=self.device, dtype=self.dtype))
+
+        # Trainable feature buffer
+        self.features = nn.Parameter(torch.zeros((self.num_cells, self.fdim), device=self.device, dtype=self.dtype))
+
     def init_decoder(self, cfg):
-        """ Initialize the MLP decoder for neural point-based representation:
-            - Input: concat(feature vector, relative coordinate d_j).
-            - Ouput: SDF prediction.
-        """
-        pass
+        self.decoder_hidden_dim = cfg['decoder']['hidden_dim']
+        self.decoder_hidden_layers = cfg['decoder']['hidden_layers']
+        self.decoder_out_dim = cfg['decoder']['out_dim']
+        self.pos_invariant = cfg['decoder']['pos_invariant']
+        self.decoder_fixed = cfg['decoder']['fix']
+        self.decoder_type = cfg['decoder']['type']
+        input_dim = self.fdim + 3  # feature + position
+        if not self.pos_invariant:
+            input_dim += self.d
+        
+        if self.decoder_type == 'mlp':
+            logger.debug(f"Using MLP decoder.")
+            self.decoder = MLPNet(
+                input_dim=input_dim,
+                output_dim=self.decoder_out_dim,
+                hidden_dim=self.decoder_hidden_dim,
+                hidden_layers=self.decoder_hidden_layers,
+                bias=True,
+                pretrained_path=cfg['decoder']['pretrained_model'],
+                no_optimize=self.decoder_fixed
+            )
+        elif self.decoder_type == 'none':
+            logger.info("Not using decoder.")
+            self.decoder = None
+        else:
+            raise ValueError(f"Unknown decoder type: {self.decoder_type}")
+        logger.debug(f"Initialized docoder:\n {self.decoder}")
 
     def init_poses(self, cfg):
         """Initialize pose correction terms.
@@ -80,6 +115,86 @@ class NeuralPoints(BaseNet):
         self.locked_pose_indices = set()
         self._pose_key_to_id = dict()
         logger.info(f"Initialized {self.num_poses} pose variables (optimize={self.optimize_pose}).")
+        
+    def query_neighbors(self, x: torch.Tensor, K: int, Nn: int = 3) -> torch.Tensor:
+        """ PIN-SLAM neighbor query:
+        - collect candidates in an Nn^3 voxel cube around the query voxel
+        - keep active points only
+        - take K nearest by Euclidean distance
+
+        Args:
+            x: (N,3) world coords
+            K: number of neighbors
+            Nn: neighborhood cube side length (odd recommended)
+
+        Returns:
+            (N,K) long tensor with neighbor indices in [0, num_cells-1], or -1 if missing
+        """
+        assert x.ndim == 2 and x.shape[1] == 3, f"Invalid input shape {x.shape}"
+        assert Nn >= 1, "Nn must be >= 1"
+        if Nn % 2 == 0:
+            # works, but "centered" is less clean; PIN-SLAM describes centered cube
+            logger.warning(f"Nn={Nn} is even; consider using an odd Nn for a centered neighborhood.")
+
+        N = x.shape[0]
+        device = x.device
+
+        # world -> voxel coords (N,3)
+        g = torch.floor((x - self.bound[:,0]) / self.cell_size).to(torch.long)
+        g[:,0] = torch.clamp(g[:,0], 0, self.grid_dims[0] - 1)
+        g[:,1] = torch.clamp(g[:,1], 0, self.grid_dims[1] - 1)
+        g[:,2] = torch.clamp(g[:,2], 0, self.grid_dims[2] - 1)
+
+        # Build offsets for Nn x Nn x Nn cube (M,3)
+        r = Nn // 2
+        o = torch.arange(-r, r + 1, device=device, dtype=torch.long)
+        ox, oy, oz = torch.meshgrid(o, o, o, indexing="ij")  # (Nn,Nn,Nn)
+        offsets = torch.stack([ox, oy, oz], dim=-1).reshape(-1, 3)  # (M,3)
+        M = offsets.shape[0]
+
+        # Candidate voxel coords (N,M,3)
+        cand = g[:,None, :] + offsets[None, :,:] # broadcast to (N,M,3)
+
+        # in-bounds mask
+        inb = (
+            (cand[..., 0] >= 0) & (cand[..., 0] < self.grid_dims[0]) &
+            (cand[..., 1] >= 0) & (cand[..., 1] < self.grid_dims[1]) &
+            (cand[..., 2] >= 0) & (cand[..., 2] < self.grid_dims[2])
+        )
+
+        # Voxel coords -> linear cell idx (N,M)
+        nx, ny = self.grid_dims[0], self.grid_dims[1]
+        cand_idx = cand[..., 0] + nx * (cand[..., 1] + ny * cand[..., 2]) # (N,M)
+
+        # Mark out-of-bounds as invalid
+        cand_idx = torch.where(inb, cand_idx, torch.full_like(cand_idx, -1))
+        cand_idx_clamped = cand_idx.clamp(min=0) # (N,M)
+        is_active = self.active[cand_idx_clamped] & (cand_idx >= 0) # (N,M)
+
+        # Gather positions (N,M,3), compute distances (N,M)
+        cand_pos = self.points[cand_idx_clamped] # (N,M,3) (garbage for inactive, but masked out)
+        d = x[:,None, :] - cand_pos
+        d2 = (d * d).sum(dim=-1) # (N,M) using squared distance to make it scalar
+
+        # Set inactive candidates to +inf distance so they won't be selected
+        inf = torch.tensor(float("inf"), device=device, dtype=d2.dtype)
+        d2 = torch.where(is_active, d2, inf)
+
+        # Take K nearest
+        # topk works even if many are inf; we’ll convert inf-selected entries to -1.
+        K_eff = min(K, M)
+        vals, cols = torch.topk(d2, k=K_eff, dim=1, largest=False, sorted=True) # (N,K_eff)
+        nn_idx = cand_idx.gather(1, cols) # (N,K_eff)
+
+        # any picked inf means "no neighbor"
+        nn_idx = torch.where(torch.isfinite(vals), nn_idx, torch.full_like(nn_idx, -1))
+
+        # pad if K > M
+        if K_eff < K:
+            pad = torch.full((N, K - K_eff), -1, device=device, dtype=nn_idx.dtype)
+            nn_idx = torch.cat([nn_idx, pad], dim=1)
+
+        return nn_idx
     
     def lock_pose(self):
         self.rotation_corrections.requires_grad_(False)
@@ -173,21 +288,114 @@ class NeuralPoints(BaseNet):
         kf_id = self.pose_key_to_id(kf_key)
         return self.updated_kf_pose(kf_id)
     
-    def query_feature(self, x):
-        # FIXME: Do we need this function for neural points?
-        x = utils.normalize_coordinates(x, self.bound)
-        return ...
-    
-    def forward(self, x):
-        x = utils.normalize_coordinates(x, self.bound)
+    def world_to_grid(self, x: torch.Tensor) -> torch.Tensor:
+        """ Map world coords to a linear grid index (one cell -> one index).
+        Args:
+            x: (N,3) world coordinates
+        Returns:
+            idx: (N,) torch.long in [0, num_cells-1]
         """
-        TODO:
-        1. Query the map and find the neighborhood of neural points.
-        2. Decode the SDF prediction from each neural point using the MLP decoder.
-        3. Interpolate the SDF predictions from the neighboring neural points using inverse distance weighting.
+        assert x.ndim == 2 and x.shape[1] == 3, f"Invalid input shape {x.shape}!"
+
+        # voxel coords (N,3)
+        g = torch.floor((x - self.bound[:,0]) / self.cell_size).to(torch.long)
+
+        # clamp to grid bounds (should we discard out-of-bounds points instead?)
+        g[:,0] = torch.clamp(g[:,0], 0, self.grid_dims[0] - 1)
+        g[:,1] = torch.clamp(g[:,1], 0, self.grid_dims[1] - 1)
+        g[:,2] = torch.clamp(g[:,2], 0, self.grid_dims[2] - 1)
+
+        # 3D -> 1D index transformation: idx = ix + nx*(iy + ny*iz)
+        nx, ny = self.grid_dims[0], self.grid_dims[1]
+        idx = g[:,0] + nx * (g[:,1] + ny * g[:,2])
+
+        return idx
+
+    def query_feature(self, x: torch.Tensor, K: int):
         """
-        return ...
-    
+        Query neighbor neural-point inputs for samples x (world coords).
+
+        Behavior:
+            1) Ensures the voxel containing each x is activated (stores point position once).
+            2) Queries K closest neighbor indices.
+            3) Returns per-neighbor concatenated [feature, position].
+
+        Args:
+            x: (N,3) world coordinates
+            K: number of neighbors
+
+        Returns:
+            Np_idx: (N,K) long neighbor indices, with -1 for missing
+            valid: (N,K) bool mask for valid neighbors
+        """
+        assert x.ndim == 2 and x.shape[1] == 3
+
+        center_idx = self.world_to_grid(x) # (N,)
+        inactive = ~self.active[center_idx] # (N,) bool mask where inactive indices are True
+
+        # Initialize neural points for inactive voxels: set position, mark active
+        if inactive.any():
+            idx_new = center_idx[inactive]
+            with torch.no_grad():
+                self.points[idx_new] = x[inactive]
+                self.active[idx_new] = True
+
+        Np_idx = self.query_neighbors(x, K) # (N,K), -1 for missing
+        valid = Np_idx >= 0
+
+        return Np_idx, valid
+
+    def forward(self, x: torch.Tensor, K: int = 8) -> torch.Tensor:
+        """ Predict SDF at world coords x using inverse-distance weighting over K neighbors:
+            w_j = ||p - x_j||^{-2}
+            s(p) = sum_j (w_j / sum_k w_k) * s_j
+        """
+        assert x.ndim == 2 and x.shape[1] == 3, f"Invalid input shape {x.shape}!"
+        assert self.decoder is not None, "Decoder is not initialized."
+        
+        N = x.shape[0]
+        
+        # Neighbor lookup (also activates voxels if not already)
+        Np_idx, valid = self.query_feature(x, K=K) # (N,K), (N,K)
+
+        # Gather neighbor positions/features
+        idx0 = Np_idx.clamp(min=0) # (N,K) - Clamping to avoid indexing with -1 for invalid neighbors. We'll zero out these later.
+        Np_pos = self.points[idx0] # (N,K,3)
+        Np_feat = self.features[idx0] # (N,K,fdim)
+
+        # Zero out invalid neighbor data so that they don't contribute to the final prediction
+        if (~valid).any():
+            Np_pos = Np_pos.clone()
+            Np_feat = Np_feat.clone()
+            Np_pos[~valid] = 0.0
+            Np_feat[~valid] = 0.0
+
+        # Compute weights: w = ||p - x_j||^{-2}
+        # p is query x, x_j is neighbor position
+        diff = x[:,None, :] - Np_pos # (N,K,3)
+        d2 = (diff * diff).sum(dim=-1) # (N,K)
+        eps = 1e-12
+        w = 1.0 / (d2 + eps) # (N,K)
+        w[~valid] = 0.0
+
+        # normalize weights per point (avoid div-by-zero when no neighbors)
+        w_sum = w.sum(dim=1, keepdim=True) # (N,1)
+        w_norm = w / (w_sum + eps) # (N,K)
+
+        # Build decoder input per neighbor: [feature, position]
+        decoder_in = torch.cat([Np_feat, Np_pos], dim=-1) # (N,K,fdim+3)
+        decoder_in = decoder_in.view(N * K, -1) # (N*K,input_dim)
+
+        # Decode per-neighbor SDF s_j
+        s_j = self.decoder(decoder_in) # (N*K, out_dim=1)
+        s_j = s_j.view(N, K) # (N,K)
+        s_j[~valid] = 0.0
+
+        # Weighted sum: s = sum_j w_norm * s_j
+        s = (w_norm * s_j).sum(dim=1) # (N,)
+
+        return s
+        
     def params_at_level(self, level):
         # FIXME: right now this always return the full set of params!
         return list(self.model.parameters())
@@ -198,4 +406,4 @@ class NeuralPoints(BaseNet):
         logger.info(f"GridNet KF pose corrections: max_rot={math.degrees(max_rot):.3f}deg, max_tran={max_tran:.3f}m.")
         
     def print_feature_info(self):
-        logger.warning("Feature info not implemented yet for GridNGP.")
+        logger.warning("Feature info not implemented yet for neural points.")
