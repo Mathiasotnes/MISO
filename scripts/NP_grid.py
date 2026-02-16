@@ -59,9 +59,6 @@ def initialize_scannet(args):
     dataset = utils_scannet.create_scannet_dataset(args.scannet_root, args.scene, n_rays=cfg['sample']['n_rays'], frame_downsample=1)
     cfg = load_config(args.config, args.default_config)
     cfg = create_configs_scannet(args, dataset)
-    
-    # Overriding decoder config
-    cfg['model']['decoder']['hidden_layers'] = 2
 
     neural_points = NeuralPoints(cfg['model'], device=cfg['device'], dtype=torch.float32) 
     neural_points.to(cfg['device'])
