@@ -5,6 +5,7 @@ from typing import List
 from grid_opt.configs import *
 from grid_opt.models.grid_net import GridNet
 from grid_opt.models.grid_ngp import GridNGP
+from grid_opt.models.neural_points import NeuralPoints
 from grid_opt.datasets.submap_dataset import SubmapDataset
 from grid_opt.loss import MisoLossMapping
 import grid_opt.utils.utils_sdf as utils_sdf
@@ -36,7 +37,7 @@ class Mapper:
             cfg: dict,
             track_occupancy=False,
         ):
-        assert isinstance(model, GridNet) or isinstance(model, GridNGP), f"Invalid model type {type(model)}."
+        assert isinstance(model, GridNet) or isinstance(model, GridNGP) or isinstance(model, NeuralPoints), f"Invalid model type {type(model)}."
         self.grid = model
         self.dataset = dataset
         self.train_loader = DataLoader(dataset, shuffle=True, batch_size=1, num_workers=0)
