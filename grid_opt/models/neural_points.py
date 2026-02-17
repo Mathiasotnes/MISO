@@ -36,7 +36,7 @@ class NeuralPoints(BaseNet):
         # Config
         self.cell_size = 0.1
         self.fdim = 4
-        self.init_threshold = 0.1
+        self.init_threshold = 0.3
         self.num_levels = 1 # To be compatible with trainer
         
         assert self.bound.shape == (3, 2), f"Invalid bound shape {self.bound.shape}!"
@@ -339,40 +339,6 @@ class NeuralPoints(BaseNet):
             self.points[init_idx] = init_coords
             self.active[init_idx] = True
 
-    def query_feature(self, x: torch.Tensor, K: int):
-        """
-        Query neighbor neural-point inputs for samples x (world coords).
-
-        Behavior:
-            1) Activates the voxel containing x if in training and not already active. (not when in eval)
-            2) Queries K closest neighbor indices.
-            3) Returns per-neighbor concatenated [feature, position].
-
-        Args:
-            x: (N,3) world coordinates
-            K: number of neighbors
-
-        Returns:
-            Np_idx: (N,K) long neighbor indices, with -1 for missing
-            valid: (N,K) bool mask for valid neighbors
-        """
-        assert x.ndim == 2 and x.shape[1] == 3
-
-        center_idx = self.world_to_grid(x) # (N,)
-        
-        if self.training:
-            inactive = ~self.active[center_idx] # (N,) bool mask where inactive indices are True
-            if inactive.any():
-                idx_new = center_idx[inactive]
-                with torch.no_grad():
-                    self.points[idx_new] = x[inactive]
-                    self.active[idx_new] = True
-
-        Np_idx = self.query_neighbors(x, K) # (N,K), -1 for missing
-        valid = Np_idx >= 0
-
-        return Np_idx, valid
-
     def forward(self, x: torch.Tensor, K: int = 8) -> torch.Tensor:
         """ Predict SDF at world coords x using inverse-distance weighting over K neighbors:
             w_j = ||p - x_j||^{-2}
@@ -384,7 +350,7 @@ class NeuralPoints(BaseNet):
         N = x.shape[0]
         
         # Neighbor lookup
-        Np_idx = self.query_neighbors(x, K)
+        Np_idx = self.query_neighbors(x, K=15, Nn=5)
         valid = Np_idx >= 0 # (N,K) bool mask for valid neighbors
 
         # Gather neighbor positions/features
