@@ -349,8 +349,12 @@ class NeuralPoints(BaseNet):
         
         N = x.shape[0]
         
+        # Overriding these for test purposes FIXME
+        K = 15 
+        Nn = 5
+        
         # Neighbor lookup
-        Np_idx = self.query_neighbors(x, K=15, Nn=5)
+        Np_idx = self.query_neighbors(x, K=K, Nn=Nn)
         valid = Np_idx >= 0 # (N,K) bool mask for valid neighbors
 
         # Gather neighbor positions/features
@@ -379,10 +383,10 @@ class NeuralPoints(BaseNet):
 
         # Build decoder input per neighbor: [feature, position]
         decoder_in = torch.cat([Np_feat, Np_pos], dim=-1) # (N,K,fdim+3)
-        decoder_in = decoder_in.view(N * K, -1) # (N*K,input_dim)
+        decoder_in = decoder_in.view(N * K, -1) # (N*K,D)
 
         # Decode per-neighbor SDF s_j        
-        s_j = self.decoder(decoder_in) # (N*K, D)
+        s_j = self.decoder(decoder_in) # (N*K,D)
         D = s_j.shape[-1]
         s_j = s_j.view(N, K, D) # (N,K,D)
 
@@ -404,7 +408,7 @@ class NeuralPoints(BaseNet):
     def print_active_info(self):
         n_active = int(self.active.sum().item())
         n_total = int(self.num_cells)
-        logger.info(f"NeuralPoints active: {n_active}/{n_total} ({100.0*n_active/n_total:.3f}%)")
+        logger.info(f"NeuralPoints active: {n_active}/{n_total} ({100.0*n_active/n_total:.2f}%)")
 
     def params_at_level(self, level):
         # FIXME: right now this always return the full set of params!
