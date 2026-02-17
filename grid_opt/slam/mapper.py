@@ -36,6 +36,7 @@ class Mapper:
             dataset: SubmapDataset,
             cfg: dict,
             track_occupancy=False,
+            init_neural_points=False,
         ):
         assert isinstance(model, GridNet) or isinstance(model, GridNGP) or isinstance(model, NeuralPoints), f"Invalid model type {type(model)}."
         self.grid = model
@@ -62,7 +63,8 @@ class Mapper:
             finite_diff_eps=cfg_map['finite_diff_eps'],
             grad_method=cfg_map['grad_method'],
             eik_trunc_dist=cfg_map['eik_trunc_dist'],
-            track_occupancy=track_occupancy
+            track_occupancy=track_occupancy,
+            init_neural_points=init_neural_points
         )
 
 

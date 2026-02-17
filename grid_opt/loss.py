@@ -717,7 +717,8 @@ class MisoLossMappingBase(BaseLoss):
             eik_trunc_dist=0.1,
             use_stability=False, 
             weight_clip=0,
-            track_occupancy=False
+            track_occupancy=False,
+            init_neural_points=False
         ):
         super().__init__()
         self.loss_type = loss_type
@@ -731,6 +732,7 @@ class MisoLossMappingBase(BaseLoss):
         self.use_stability = use_stability
         self.weight_clip = weight_clip
         self.track_occupancy = track_occupancy
+        self.init_neural_points = init_neural_points
         logger.info("MisoLossMappingBase initialized with the following configuration:")
         logger.info(f"  - Loss function: {self.loss_type}")
         logger.info(f"  - Weight SDF: {self.weight_sdf}")
@@ -743,6 +745,7 @@ class MisoLossMappingBase(BaseLoss):
         logger.info(f"  - Use stability: {self.use_stability}")
         logger.info(f"  - Weight CLIP: {self.weight_clip}")
         logger.info(f"  - Track occupancy: {self.track_occupancy}")
+        logger.info(f"  - Init neural points: {self.init_neural_points}")
 
     def query_kf_pose(self, model: BaseNet, kf_id: int):
         raise NotImplementedError("This function should be implemented in the derived class.")
@@ -757,6 +760,8 @@ class MisoLossMappingBase(BaseLoss):
         return out_dict
         
     def compute(self, model, model_input: dict, gt: dict) -> dict:
+        assert (self.track_occupancy and isinstance(model, GridNGP)) or not self.track_occupancy, "Occupancy tracking only supported for GridNGP."
+        assert (self.init_neural_points and isinstance(model, NeuralPoints)) or not self.init_neural_points, "Neural point initialization only supported for NeuralPoints."
         coords_frame = model_input['coords_frame'][0]
         sample_frame_ids = model_input['sample_frame_ids'][0, :, 0]
         sample_weights = model_input['weights'][0]
@@ -820,9 +825,18 @@ class MisoLossMappingBase(BaseLoss):
             with torch.no_grad():
                 valid_mask = (gt_sdf_valid.squeeze(-1) == 1) # (N,)
                 if valid_mask.any():
-                    coords_v = coords_world[valid_mask]          # (Nv,3)
-                    sdf_v    = gt_sdf[valid_mask]                # (Nv,1)  (or squeeze if you want)
+                    coords_v = coords_world[valid_mask] # (Nv,3)
+                    sdf_v = gt_sdf[valid_mask] # (Nv,1)
                     model.occupancy_grid.update(coords_v, sdf_v)
+                    
+        if self.init_neural_points:
+            with torch.no_grad():
+                valid_mask = (gt_sdf_valid.squeeze(-1) == 1)
+                if valid_mask.any():
+                    coords_v = coords_world[valid_mask]
+                    sdf_v = gt_sdf[valid_mask]
+                    model.initialize_neural_points(coords_v, sdf_v)
+
             
         return loss_dict
 

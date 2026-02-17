@@ -25,7 +25,7 @@ class NeuralPoints(BaseNet):
         self.device = device
         self.dtype = dtype
         self.init_grid(cfg)
-        self.init_neural_points(cfg)
+        self.init_neural_params(cfg)
         self.init_decoder(cfg)
         self.init_poses(cfg)
         self.print_trainable_params()
@@ -36,6 +36,7 @@ class NeuralPoints(BaseNet):
         # Config
         self.cell_size = 0.1
         self.fdim = 4
+        self.init_threshold = 0.1
         self.num_levels = 1 # To be compatible with trainer
         
         assert self.bound.shape == (3, 2), f"Invalid bound shape {self.bound.shape}!"
@@ -47,7 +48,7 @@ class NeuralPoints(BaseNet):
         # Recording active points
         self.register_buffer("active", torch.zeros((self.num_cells,), device=self.device, dtype=torch.bool))
     
-    def init_neural_points(self, cfg):
+    def init_neural_params(self, cfg):
         """ Initializes neural point representation? Maybe it should be a class instead? """
         
         """
@@ -311,6 +312,32 @@ class NeuralPoints(BaseNet):
         idx = g[:,0] + nx * (g[:,1] + ny * g[:,2])
 
         return idx
+    
+    def init_neural_points(self, x: torch.Tensor, sdf: torch.Tensor):
+        """ Initializes neural points wherever the SDF is below a threshold (i.e., near the surface),
+        and the voxel is not already active."""
+        assert x.ndim == 2 and x.shape[1] == 3, f"Invalid input shape {x.shape}!"
+        assert sdf.ndim == 2 and sdf.shape[1] == 1, f"Invalid SDF shape {sdf.shape}!"
+        
+        # Only initializing points during training as of now
+        if not self.training:
+            return
+
+        mask = (sdf.squeeze(1).abs() < self.init_threshold)
+        if not mask.any():
+            return
+        
+        x_idx = self.world_to_grid(x[mask]) # All indexes to activate
+        inactive = ~self.active[x_idx] # Only activate those that are currently inactive
+        if not inactive.any():
+            return
+        
+        init_idx = x_idx[inactive]
+        init_coords = x[mask][inactive]
+        
+        with torch.no_grad():
+            self.points[init_idx] = init_coords
+            self.active[init_idx] = True
 
     def query_feature(self, x: torch.Tensor, K: int):
         """
@@ -356,8 +383,9 @@ class NeuralPoints(BaseNet):
         
         N = x.shape[0]
         
-        # Neighbor lookup (also activates voxels if not already)
-        Np_idx, valid = self.query_feature(x, K=K) # (N,K), (N,K)
+        # Neighbor lookup
+        Np_idx = self.query_neighbors(x, K)
+        valid = Np_idx >= 0 # (N,K) bool mask for valid neighbors
 
         # Gather neighbor positions/features
         idx0 = Np_idx.clamp(min=0) # (N,K) - Clamping to avoid indexing with -1 for invalid neighbors. We'll zero out these later.

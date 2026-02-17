@@ -76,7 +76,8 @@ def mapping(cfg, neural_points:BaseNet, dataset:SubmapDataset):
     mapper = Mapper(
         model=neural_points,
         dataset=dataset,
-        cfg=cfg
+        cfg=cfg,
+        init_neural_points=True # Custom parameter for Neural Points
     )
     
     mapper.mapping(
