@@ -349,9 +349,6 @@ class NeuralPoints(BaseNet):
         
         N = x.shape[0]
         
-        # Overriding these for test purposes FIXME
-        K = 15 
-        
         # Neighbor lookup
         Np_idx = self.query_neighbors(x, K=K)
         valid = Np_idx >= 0 # (N,K) bool mask for valid neighbors
