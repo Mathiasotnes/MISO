@@ -835,7 +835,7 @@ class MisoLossMappingBase(BaseLoss):
                 if valid_mask.any():
                     coords_v = coords_world[valid_mask]
                     sdf_v = gt_sdf[valid_mask]
-                    model.initialize_neural_points(coords_v, sdf_v)
+                    model.init_neural_points(coords_v, sdf_v)
 
             
         return loss_dict
