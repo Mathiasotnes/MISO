@@ -37,9 +37,9 @@ class NeuralPointsHash(BaseNet):
         
         # TODO: Move this elsewhere
         # Config
-        self.T = 2**19 # Hash table size (number of buckets)
+        self.T = 2**17 # Hash table size (number of buckets)
         self.max_probe = 16
-        self.max_points = 200_000
+        self.max_points = 100_000
         self.cell_size = 0.1
         self.fdim = 4
         self.init_threshold = 0.3 # SDF threshold for initializing neural points (i.e., activating voxels)
