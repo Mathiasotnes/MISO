@@ -10,7 +10,7 @@ import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-class NeuralPoints(BaseNet):
+class NeuralPointsHash(BaseNet):
     """
     A lightweight implementation of neural point-based map inspired by PIN-SLAM:
     Paper: https://arxiv.org/abs/2401.09101
@@ -23,7 +23,7 @@ class NeuralPoints(BaseNet):
         device = 'cuda:0',
         dtype = torch.float32,
     ):
-        super(NeuralPoints, self).__init__(cfg, device, dtype)    
+        super(NeuralPointsHash, self).__init__(cfg, device, dtype)    
         self.device = device
         self.dtype = dtype
         self.init_hash_grid(cfg)
