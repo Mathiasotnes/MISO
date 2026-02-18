@@ -15,6 +15,8 @@ class NeuralPoints(BaseNet):
     A lightweight implementation of neural point-based map inspired by PIN-SLAM:
     Paper: https://arxiv.org/abs/2401.09101
     Code:  https://github.com/PRBonn/PIN_SLAM/tree/main
+    This is identical as the neural point implemented in neural_points.py except that it uses
+    
     """
     def __init__(self,
         cfg: dict, 
@@ -24,30 +26,35 @@ class NeuralPoints(BaseNet):
         super(NeuralPoints, self).__init__(cfg, device, dtype)    
         self.device = device
         self.dtype = dtype
-        self.init_grid(cfg)
+        self.init_hash_grid(cfg)
         self.init_neural_params(cfg)
         self.init_decoder(cfg)
         self.init_poses(cfg)
         self.print_trainable_params()
     
-    def init_grid(self, cfg):
-        """ Initializes the grid used for indexing parameters. """
+    def init_hash_grid(self, cfg):
+        """ Initializes the hash-grid used for indexing parameters. """
         
         # TODO: Move this elsewhere
         # Config
+        self.T = 2**19 # Hash table size (number of buckets)
+        self.max_probe = 16
+        self.max_points = 200_000
         self.cell_size = 0.1
         self.fdim = 4
-        self.init_threshold = 0.3
+        self.init_threshold = 0.3 # SDF threshold for initializing neural points (i.e., activating voxels)
         self.num_levels = 1 # To be compatible with trainer
         
         assert self.bound.shape == (3, 2), f"Invalid bound shape {self.bound.shape}!"
         
         self.grid_dims = torch.ceil((self.bound[:,1] - self.bound[:,0]) / self.cell_size).to(torch.long)  # (3,)
-        nx, ny, nz = self.grid_dims.tolist()
-        self.num_cells = nx * ny * nz
         
-        # Recording active points
-        self.register_buffer("active", torch.zeros((self.num_cells,), device=self.device, dtype=torch.bool))
+        # Hash table
+        self.register_buffer("table_keys", torch.full((self.T, 3), -1, device=self.device, dtype=torch.int64))
+        self.register_buffer("table_vals", torch.full((self.T,), -1, device=self.device, dtype=torch.int32))
+
+        # Active points storage
+        self.register_buffer("next_free", torch.zeros((), device=self.device, dtype=torch.int32))
     
     def init_neural_params(self, cfg):
         """ Initializes neural point parameters. """
@@ -63,11 +70,11 @@ class NeuralPoints(BaseNet):
                 - Stability ?
         """
         # Non-trainable position buffer
-        self.register_buffer("points", torch.zeros((self.num_cells, 3), device=self.device, dtype=self.dtype))
+        self.register_buffer("points", torch.zeros((self.max_points, 3), device=self.device, dtype=self.dtype))
 
         # Trainable feature buffer
-        self.features = nn.Parameter(torch.zeros((self.num_cells, self.fdim), device=self.device, dtype=self.dtype))
-
+        self.features = nn.Parameter(torch.zeros((self.max_points, self.fdim), device=self.device, dtype=self.dtype))
+        
     def init_decoder(self, cfg):
         self.decoder_hidden_dim = cfg['decoder']['hidden_dim']
         self.decoder_hidden_layers = cfg['decoder']['hidden_layers']
@@ -119,6 +126,101 @@ class NeuralPoints(BaseNet):
         self._pose_key_to_id = dict()
         logger.info(f"Initialized {self.num_poses} pose variables (optimize={self.optimize_pose}).")
         
+    def hash_function(self, g: torch.Tensor) -> torch.Tensor:
+        """ Hash function mapping voxel coordinates to hash table indices.
+        This uses the hash function presented in InstantNGP: https://arxiv.org/abs/2201.05989.
+        """
+        g = g.to(torch.int64)
+        p1, p2, p3 = 1, 2_654_435_761, 805_459_861
+        h = (g[..., 0] * p1) ^ (g[..., 1] * p2) ^ (g[..., 2] * p3)
+        return h % self.T
+    
+    def lookup_probing(self, g: torch.Tensor) -> torch.Tensor:
+        """ Lookup voxel coordinates g in the hash table with linear probing. """
+        g = g.to(torch.int64)
+        N = g.shape[0]
+        device = g.device
+
+        out = torch.full((N,), -1, device=device, dtype=torch.int32)
+        alive = torch.ones((N,), device=device, dtype=torch.bool)  # still searching
+
+        h0 = self.hash_function(g).to(torch.int64)
+        empty_key = torch.tensor([-1, -1, -1], device=device, dtype=torch.int64)
+
+        for p in range(self.max_probe):
+            if not alive.any():
+                break
+            h = (h0 + p) % self.T
+
+            tk = self.table_keys[h]
+            tv = self.table_vals[h]
+
+            hit = (tk == g).all(dim=1)
+            empty = (tk == empty_key).all(dim=1)
+
+            write = alive & hit
+            out = torch.where(write, tv, out)
+
+            # stop searching after hit or empty
+            alive = alive & (~hit) & (~empty)
+
+        return out
+
+    def insert_probing(self, g: torch.Tensor, vals: torch.Tensor) -> torch.Tensor:
+        """
+        Insert mapping g[i] -> vals[i] with linear probing.
+
+        g: (U,3) int64 voxel coords
+        vals: (U,) int32 point indices
+
+        Returns: (U,) bool success per insert (False if probe budget exceeded).
+        """
+        assert g.ndim == 2 and g.shape[1] == 3
+        assert vals.ndim == 1 and vals.shape[0] == g.shape[0]
+        g = g.to(torch.int64)
+        vals = vals.to(torch.int32)
+
+        # Work on CPU copies to avoid concurrent write races
+        g_cpu = g.detach().to("cpu")
+        vals_cpu = vals.detach().to("cpu")
+
+        table_keys = self.table_keys.detach().to("cpu").clone()
+        table_vals = self.table_vals.detach().to("cpu").clone()
+
+        T = int(self.T)
+        P = int(self.max_probe)
+
+        empty_key_cpu = torch.tensor([-1, -1, -1], device="cpu", dtype=torch.int64)
+
+        # Use your hash_function on CPU tensors (same code path)
+        h0 = self.hash_function(g_cpu).to(torch.int64)  # (U,)
+
+        success = torch.zeros((g_cpu.shape[0],), dtype=torch.bool, device="cpu")
+
+        for i in range(g_cpu.shape[0]):
+            key = g_cpu[i]            # (3,)
+            v = int(vals_cpu[i].item())
+            start = int(h0[i].item())
+
+            placed = False
+            for p in range(P):
+                h = (start + p) % T
+                tk = table_keys[h]
+
+                if (tk == empty_key_cpu).all() or (tk == key).all():
+                    table_keys[h] = key
+                    table_vals[h] = v
+                    placed = True
+                    break
+
+            success[i] = placed
+
+        # Copy updated tables back to GPU
+        self.table_keys.copy_(table_keys.to(self.device))
+        self.table_vals.copy_(table_vals.to(self.device))
+
+        return success.to(g.device)
+        
     def query_neighbors(self, x: torch.Tensor, K: int, Nn: int = 3) -> torch.Tensor:
         """ PIN-SLAM neighbor query:
         - collect candidates in an Nn^3 voxel cube around the query voxel
@@ -142,63 +244,51 @@ class NeuralPoints(BaseNet):
         N = x.shape[0]
         device = x.device
 
-        # world -> voxel coords (N,3)
-        g = torch.floor((x - self.bound[:,0]) / self.cell_size).to(torch.long)
-        g[:,0] = torch.clamp(g[:,0], 0, self.grid_dims[0] - 1)
-        g[:,1] = torch.clamp(g[:,1], 0, self.grid_dims[1] - 1)
-        g[:,2] = torch.clamp(g[:,2], 0, self.grid_dims[2] - 1)
+        g = self.world_to_vox(x)  # (N,3)
 
-        # Build offsets for Nn x Nn x Nn cube (M,3)
         r = Nn // 2
         o = torch.arange(-r, r + 1, device=device, dtype=torch.long)
-        ox, oy, oz = torch.meshgrid(o, o, o, indexing="ij")  # (Nn,Nn,Nn)
+        ox, oy, oz = torch.meshgrid(o, o, o, indexing="ij")
         offsets = torch.stack([ox, oy, oz], dim=-1).reshape(-1, 3)  # (M,3)
         M = offsets.shape[0]
 
-        # Candidate voxel coords (N,M,3)
-        cand = g[:,None, :] + offsets[None, :,:] # broadcast to (N,M,3)
+        cand = g[:, None, :] + offsets[None, :, :]  # (N,M,3)
 
-        # in-bounds mask
         inb = (
             (cand[..., 0] >= 0) & (cand[..., 0] < self.grid_dims[0]) &
             (cand[..., 1] >= 0) & (cand[..., 1] < self.grid_dims[1]) &
             (cand[..., 2] >= 0) & (cand[..., 2] < self.grid_dims[2])
         )
 
-        # Voxel coords -> linear cell idx (N,M)
-        nx, ny = self.grid_dims[0], self.grid_dims[1]
-        cand_idx = cand[..., 0] + nx * (cand[..., 1] + ny * cand[..., 2]) # (N,M)
+        cand_flat = cand.reshape(-1, 3)
+        idx_flat = self.lookup_probing(cand_flat)  # (N*M,)
 
-        # Mark out-of-bounds as invalid
-        cand_idx = torch.where(inb, cand_idx, torch.full_like(cand_idx, -1))
-        cand_idx_clamped = cand_idx.clamp(min=0) # (N,M)
-        is_active = self.active[cand_idx_clamped] & (cand_idx >= 0) # (N,M)
+        idx = idx_flat.reshape(N, M).to(torch.long)
+        idx = torch.where(inb, idx, torch.full_like(idx, -1))
 
-        # Gather positions (N,M,3), compute distances (N,M)
-        cand_pos = self.points[cand_idx_clamped] # (N,M,3) (garbage for inactive, but masked out)
-        d = x[:,None, :] - cand_pos
-        d2 = (d * d).sum(dim=-1) # (N,M) using squared distance to make it scalar
+        # mask out indices beyond allocated range
+        nf = int(self.next_free.item())
+        idx = torch.where(idx < nf, idx, torch.full_like(idx, -1))
 
-        # Set inactive candidates to +inf distance so they won't be selected
+        # gather positions & compute distances
+        idx0 = idx.clamp(min=0)
+        cand_pos = self.points[idx0]
+        d2 = ((x[:, None, :] - cand_pos) ** 2).sum(dim=-1)
+
         inf = torch.tensor(float("inf"), device=device, dtype=d2.dtype)
-        d2 = torch.where(is_active, d2, inf)
+        d2 = torch.where(idx >= 0, d2, inf)
 
-        # Take K nearest
-        # topk works even if many are inf; we’ll convert inf-selected entries to -1.
         K_eff = min(K, M)
-        vals, cols = torch.topk(d2, k=K_eff, dim=1, largest=False, sorted=True) # (N,K_eff)
-        nn_idx = cand_idx.gather(1, cols) # (N,K_eff)
-
-        # any picked inf means "no neighbor"
+        vals, cols = torch.topk(d2, k=K_eff, dim=1, largest=False, sorted=True)
+        nn_idx = idx.gather(1, cols)
         nn_idx = torch.where(torch.isfinite(vals), nn_idx, torch.full_like(nn_idx, -1))
 
-        # pad if K > M
         if K_eff < K:
             pad = torch.full((N, K - K_eff), -1, device=device, dtype=nn_idx.dtype)
             nn_idx = torch.cat([nn_idx, pad], dim=1)
 
         return nn_idx
-    
+
     def lock_pose(self):
         self.rotation_corrections.requires_grad_(False)
         self.translation_corrections.requires_grad_(False)
@@ -291,54 +381,106 @@ class NeuralPoints(BaseNet):
         kf_id = self.pose_key_to_id(kf_key)
         return self.updated_kf_pose(kf_id)
     
-    def world_to_grid(self, x: torch.Tensor) -> torch.Tensor:
-        """ Map world coords to a linear grid index (one cell -> one index).
-        Args:
-            x: (N,3) world coordinates
-        Returns:
-            idx: (N,) torch.long in [0, num_cells-1]
-        """
-        assert x.ndim == 2 and x.shape[1] == 3, f"Invalid input shape {x.shape}!"
-
-        # voxel coords (N,3)
+    def world_to_vox(self, x: torch.Tensor) -> torch.Tensor:
+        """ Convert world coordinates to voxel coordinates. """
         g = torch.floor((x - self.bound[:,0]) / self.cell_size).to(torch.long)
-
-        # clamp to grid bounds (should we discard out-of-bounds points instead?)
         g[:,0] = torch.clamp(g[:,0], 0, self.grid_dims[0] - 1)
         g[:,1] = torch.clamp(g[:,1], 0, self.grid_dims[1] - 1)
         g[:,2] = torch.clamp(g[:,2], 0, self.grid_dims[2] - 1)
+        return g
 
-        # 3D -> 1D index transformation: idx = ix + nx*(iy + ny*iz)
-        nx, ny = self.grid_dims[0], self.grid_dims[1]
-        idx = g[:,0] + nx * (g[:,1] + ny * g[:,2])
-
-        return idx
-    
     def init_neural_points(self, x: torch.Tensor, sdf: torch.Tensor):
-        """ Initializes neural points wherever the SDF is below a threshold (i.e., near the surface),
-        and the voxel is not already active."""
-        assert x.ndim == 2 and x.shape[1] == 3, f"Invalid input shape {x.shape}!"
-        assert sdf.ndim == 2 and sdf.shape[1] == 1, f"Invalid SDF shape {sdf.shape}!"
-        
-        # Only initializing points during training as of now
+        """Initialize one neural point per voxel for samples near the surface.
+        The stored position is the sample x that triggered it.
+        """
+        assert x.ndim == 2 and x.shape[1] == 3, f"Invalid x shape {x.shape}"
+        assert sdf.ndim == 2 and sdf.shape[1] == 1, f"Invalid sdf shape {sdf.shape}"
+
         if not self.training:
             return
 
+        # 1) pick candidate samples near surface
         mask = (sdf.squeeze(1).abs() < self.init_threshold)
         if not mask.any():
             return
-        
-        x_idx = self.world_to_grid(x[mask]) # All indexes to activate
-        inactive = ~self.active[x_idx] # Only activate those that are currently inactive
-        if not inactive.any():
+
+        xm = x[mask]                       # (M,3)
+        gm = self.world_to_vox(xm).to(torch.int64)  # (M,3)
+
+        # 2) deduplicate voxels: keep FIRST triggering sample per voxel
+        # torch.unique sorts; to keep "first", we’ll use return_inverse + scatter-min on an index.
+        M = gm.shape[0]
+        uniq_g, inv = torch.unique(gm, dim=0, return_inverse=True)  # uniq_g: (U,3), inv: (M,)
+        U = uniq_g.shape[0]
+
+        # pick a representative sample index per unique voxel (first occurrence)
+        # create per-sample indices 0..M-1 and take min per group
+        sample_ids = torch.arange(M, device=inv.device, dtype=torch.int64)
+        rep = torch.full((U,), M, device=inv.device, dtype=torch.int64)
+        rep.scatter_reduce_(0, inv, sample_ids, reduce="amin")  # requires PyTorch 1.12+ / 2.x
+
+        x_rep = xm[rep]     # (U,3) triggering samples (first in each voxel)
+        g_rep = uniq_g      # (U,3)
+
+        # 3) check which voxels already exist
+        idx_exist = self.lookup_probing(g_rep)  # (U,) int32, -1 if missing
+        need = (idx_exist < 0)
+        if not need.any():
             return
-        
-        init_idx = x_idx[inactive]
-        init_coords = x[mask][inactive]
-        
+
+        g_new = g_rep[need]         # (Un,3)
+        x_new = x_rep[need]         # (Un,3)
+        Un = g_new.shape[0]
+
+        # 4) allocate new point indices
+        nf = int(self.next_free.item())
+        if nf + Un > self.max_points:
+            logger.warning(f"NeuralPoints full: need {Un} but only {self.max_points - nf} slots left.")
+            return
+
+        new_idx = torch.arange(nf, nf + Un, device=self.device, dtype=torch.int32)
+
+        # 5) write point positions (features can stay at 0 or you can init small noise)
         with torch.no_grad():
-            self.points[init_idx] = init_coords
-            self.active[init_idx] = True
+            self.points[nf:nf + Un] = x_new.to(self.device, dtype=self.dtype)
+            # optional: small feature init
+            # self.features.data[nf:nf + Un].normal_(0.0, 1e-3)
+            self.next_free += Un
+
+        # 6) insert into hash table (returns success per element)
+        success = self.insert_probing(g_new, new_idx)  # (Un,) bool
+        if not success.all():
+            # Roll back failed inserts: mark their points as "unused" by rewinding next_free
+            # and (optionally) clearing their positions/features.
+            # Note: this simplistic rollback assumes inserts are a contiguous allocation block
+            # and failures are rare. If you expect many failures, handle per-element free-list.
+            n_ok = int(success.sum().item())
+            n_fail = Un - n_ok
+            logger.warning(f"insert_probing: {n_fail}/{Un} failed (table too full or probe limit).")
+
+            # Move successful ones to the front to keep storage compact
+            ok_mask = success.to(device=self.device)
+            if n_ok > 0 and n_ok < Un:
+                ok_idx = new_idx[ok_mask]
+                ok_pos = self.points[ok_idx]
+                ok_feat = self.features.data[ok_idx]
+
+                # compact them into [nf, nf+n_ok)
+                with torch.no_grad():
+                    self.points[nf:nf + n_ok] = ok_pos
+                    self.features.data[nf:nf + n_ok] = ok_feat
+                    # rewind allocation to nf+n_ok
+                    self.next_free.fill_(nf + n_ok)
+
+                # IMPORTANT: hash table currently points to old ok_idx values.
+                # We must update those table entries to the new compacted indices.
+                # Easiest: re-insert ok keys with new indices (overwrites same keys).
+                new_compact_idx = torch.arange(nf, nf + n_ok, device=self.device, dtype=torch.int32)
+                self.insert_probing(g_new[ok_mask], new_compact_idx)
+            else:
+                # all failed
+                with torch.no_grad():
+                    self.next_free.fill_(nf)
 
     def forward(self, x: torch.Tensor, K: int = 8) -> torch.Tensor:
         """ Predict SDF at world coords x using inverse-distance weighting over K neighbors:
@@ -349,6 +491,9 @@ class NeuralPoints(BaseNet):
         assert self.decoder is not None, "Decoder is not initialized."
         
         N = x.shape[0]
+        
+        # Overriding these for test purposes FIXME
+        K = 15 
         
         # Neighbor lookup
         Np_idx = self.query_neighbors(x, K=K)
@@ -403,9 +548,20 @@ class NeuralPoints(BaseNet):
         return s # (N,D)
     
     def print_active_info(self):
-        n_active = int(self.active.sum().item())
-        n_total = int(self.num_cells)
-        logger.info(f"NeuralPoints active: {n_active}/{n_total} ({100.0*n_active/n_total:.2f}%)")
+        n_active = int(self.next_free.item())
+        n_max = int(self.max_points)
+        fill_points = 100.0 * n_active / max(1, n_max)
+
+        # table occupancy (how many hash slots are non-empty)
+        empty_key = torch.tensor([-1, -1, -1], device=self.table_keys.device, dtype=self.table_keys.dtype)
+        n_slots_used = int((self.table_keys != empty_key).all(dim=1).sum().item())
+        fill_table = 100.0 * n_slots_used / max(1, int(self.T))
+
+        logger.info(
+            f"NeuralPoints active points: {n_active}/{n_max} ({fill_points:.2f}%). "
+            f"Hash table used: {n_slots_used}/{int(self.T)} ({fill_table:.2f}%)."
+        )
+
 
     def params_at_level(self, level):
         # FIXME: right now this always return the full set of params!

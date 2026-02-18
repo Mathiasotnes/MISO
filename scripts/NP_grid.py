@@ -3,7 +3,7 @@ import numpy as np
 import json
 from grid_opt.utils.utils_eval import compute_chamfer_metrics, sample_points_from_mesh
 from grid_opt.datasets.submap_dataset import SubmapDataset
-from grid_opt.models.neural_points import NeuralPoints
+from grid_opt.models.neural_points_hash import NeuralPoints
 from grid_opt.slam.mapper import Mapper
 from grid_opt.utils.utils_sdf import *
 from grid_opt.configs import *
