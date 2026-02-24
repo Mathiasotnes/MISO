@@ -2,6 +2,7 @@ import os
 import numpy as np
 import math
 import torch
+import torch.nn as nn
 import grid_opt.utils.utils as utils
 from .base_net import BaseNet
 from .grid_modules import *
@@ -152,7 +153,28 @@ class GridNGP(BaseNet):
                             # to support coarse-to-fine curriculum learning (coordinate option).
         
         self.encoding = tcnn.Encoding(config_encoding["n_input_dims"], config_encoding)
-        self.network = tcnn.Network(self.encoding.n_output_dims, config_network["n_output_dims"], config_network)
+        
+        # Use this for an optimized fully fused MLP:
+        # self.network = tcnn.Network(self.encoding.n_output_dims, config_network["n_output_dims"], config_network)
+        
+        # I'm using this for research purposes to access activation patterns:
+        layers = []
+        input_dim = self.encoding.n_output_dims
+        hidden_dim = config_network["n_neurons"]
+
+        for i in range(config_network["n_hidden_layers"]):
+            layer = nn.Linear(input_dim if i == 0 else hidden_dim, hidden_dim)
+            nn.init.xavier_uniform_(layer.weight) # InstantNGP paper uses Glorot (Xavier) initialization
+            layers.append(layer)
+            layers.append(nn.ReLU())
+
+        # Final output layer (Linear) 
+        final_layer = nn.Linear(hidden_dim, config_network["n_output_dims"])
+        nn.init.xavier_uniform_(final_layer.weight)
+        layers.append(final_layer)
+
+        self.network = nn.Sequential(*layers)
+        
         self.model = torch.nn.Sequential(self.encoding, self.network)
         self.print_trainable_params()
         
