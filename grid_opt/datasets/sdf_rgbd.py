@@ -189,6 +189,16 @@ class PosedSdfRgbd(SubmapDataset):
 
     
     def load_rgbd(self):
+        # Caching for faster loading
+        cache_path = join(self.dataset_root, f"cache_scene_f{self.frame_downsample}.pt")
+        if os.path.exists(cache_path):
+            logger.info(f"Loading cached RGB-D data from {cache_path}")
+            cache_data = torch.load(cache_path)
+            self._depth_batch = cache_data['depth'].to(self.device)
+            self._T_WC_batch = cache_data['T_WC'].to(self.device)
+            self._norm_batch = cache_data['norms'].to(self.device)
+            return
+        
         depth_dir = join(self.dataset_root, 'frames', 'depth')
         color_dir = join(self.dataset_root, 'frames', 'color')
         kf_id = 0
@@ -216,6 +226,13 @@ class PosedSdfRgbd(SubmapDataset):
         self._depth_batch = torch.stack(depth_batch)
         self._T_WC_batch = torch.stack(T_WC_batch)
         self._norm_batch = torch.stack(norm_batch)
+        
+        logger.info(f"Saving RGB-D data to cache: {cache_path}")
+        torch.save({
+            'depth': self._depth_batch.cpu(),
+            'T_WC': self._T_WC_batch.cpu(),
+            'norms': self._norm_batch.cpu(),
+        }, cache_path)
     
 
     def sample_points(
