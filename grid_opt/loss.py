@@ -637,6 +637,48 @@ def miso_loss_regression(
     reg_loss = torch.mean(sample_weights * loss_vec)
     return reg_loss
 
+def miso_loss_regression_vector(
+        pred, 
+        targ, 
+        valid_mask=None, 
+        sample_weights=None,
+        loss_type='L1'
+    ):
+    """Helper function to compute the regression loss, and returns the loss vector instead of mean loss.
+
+    Args:
+        pred (_type_): Predicted value (N, d)
+        targ (_type_): Target value (N, d)
+        valid_mask (_type_): boolean mask (N, 1)
+        sample_weights (_type_): sample weights (N, 1)
+        loss_type (_type_): L2, L1, Cosine
+    """
+    assert pred.shape == targ.shape
+    num_samples = pred.shape[0]
+    if valid_mask is None:
+        valid_mask = torch.ones((num_samples, 1)).to(pred)
+    if sample_weights is None:
+        sample_weights = torch.ones((num_samples, 1)).to(pred)
+    assert valid_mask.shape == (num_samples, 1)
+    assert sample_weights.shape == (num_samples, 1)
+    if loss_type == 'L2':
+        # Compute L2 (MSE) loss
+        loss_vec = torch.sum((pred - targ)**2, dim=1, keepdim=True)  # (N, 1)
+    elif loss_type == 'L1':
+        # Compute L1 (MAE) loss
+        loss_vec = torch.sum(torch.abs(pred - targ), dim=1, keepdim=True)  # (N, 1)
+    elif loss_type == 'Cosine':
+        # Compute cosine similarity
+        loss_vec = 1.0 - F.cosine_similarity(pred, targ, dim=1, eps=1e-8).unsqueeze(1)  # (N, 1)
+    else:
+        raise ValueError(f"Invalid loss type: {loss_type}")
+    loss_vec = torch.where(
+        valid_mask == 1,
+        loss_vec,
+        torch.zeros_like(loss_vec)
+    )
+    reg_loss = sample_weights * loss_vec
+    return reg_loss.detach()
 
 def miso_loss_eikonal(
         model: BaseNet,
@@ -841,7 +883,14 @@ class MisoLossMappingBase(BaseLoss):
         # NGP Grid collision tracking:
         if isinstance(model, GridNGP):
             if model.track_collisions:
-                model.tracker.track_step(coords_world, model.bound, sdf_loss)
+                sdf_loss_vector = miso_loss_regression_vector(
+                    pred=pred_sdf,
+                    targ=gt_sdf,
+                    valid_mask=gt_sdf_valid,
+                    sample_weights=sample_weights,
+                    loss_type=self.loss_type
+                )
+                model.tracker.track_step(coords_world, model.bound, sdf_loss_vector)
         
         return loss_dict
 
