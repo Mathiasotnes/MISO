@@ -57,7 +57,7 @@ class CollisionTracker:
         
         for l in range(self.L):
             res = math.floor(self.N_min * (self.b ** l))
-            base_v = torch.floor(x * res).long()
+            base_v = torch.floor(x * res).long().clamp(min=0, max=res) # (Batch, 3)
             
             # 8 corners per sample
             all_v = (base_v.unsqueeze(0) + self.offsets.unsqueeze(1)).reshape(-1, 3) # (8*B, 3)
