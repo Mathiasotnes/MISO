@@ -15,135 +15,117 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 class CollisionTracker:
-    """ Utility class to track collision statistics during training of the GridNGP. """
     def __init__(self, n_levels=16, hashmap_size=2**15, base_res=16, per_level_scale=1.26):
-        self.L = n_levels
-        self.T = hashmap_size
-        self.N_min = base_res
-        self.b = per_level_scale
+        self.L, self.T = n_levels, hashmap_size
+        self.N_min, self.b = base_res, per_level_scale
         self.PI = torch.tensor([1, 2654435761, 805459861], device='cuda', dtype=torch.long)
         
-        # 1. Effective Collisions (Count of unique vertices per bin)
+        # C_eff: Count of unique vertices per hash bin
         self.eff_voxel_count = torch.zeros((self.L, self.T), dtype=torch.long, device='cuda')
         
-        # 2. Total Gradient Magnitude (Informational Load)
-        self.grad_sum = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
-        
-        # 3. For Variance (Conflict)
-        self.grad_sq_sum = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
-        self.sample_count = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
+        # Dominance tracking: Max G(l,v) per bin and Total G(l,v) per bin
+        self.max_voxel_grad = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
+        self.total_bin_grad = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
 
-        # Bitfields to track "Seen" voxels per level (to ensure C_eff only counts unique ones)
-        # For N_max=512, each level needs (512+1)^3 bits ~= 16MB per level.
+        # Accumulators for voxel-level importance G(l,v)
+        self.voxel_grads = []
         self.voxel_bitfields = []
+        
         for l in range(self.L):
             res = math.floor(self.N_min * (self.b ** l))
-            num_bits = (res + 1) ** 3
-            # We use a byte-tensor as a simple bitfield for GPU speed
-            self.voxel_bitfields.append(torch.zeros(num_bits, dtype=torch.uint8, device='cuda'))
+            num_verts = (res + 1) ** 3
+            # Stores G(l, v) for every active voxel
+            self.voxel_grads.append(torch.zeros(num_verts, dtype=torch.float32, device='cuda'))
+            self.voxel_bitfields.append(torch.zeros(num_verts, dtype=torch.uint8, device='cuda'))
 
         self.offsets = torch.stack(torch.meshgrid([torch.tensor([0, 1])] * 3, indexing='ij')).reshape(3, -1).t().to('cuda')
 
     def get_hash(self, coords: torch.Tensor) -> torch.Tensor:
-        # TODO: Make sure this is consistent with tcnn implementation. We might need to change the computer precision to match.
-        # coords shape: (8 * Batch, 3)
         h = (coords[:, 0] * self.PI[0]) ^ (coords[:, 1] * self.PI[1]) ^ (coords[:, 2] * self.PI[2])
         return h % self.T
     
     @torch.no_grad()
     def track_step(self, coords_world: torch.Tensor, bound: torch.Tensor, loss_vec: torch.Tensor):
         x = (coords_world - bound[:, 0]) / (bound[:, 1] - bound[:, 0])
-        valid_mask = (x >= 0).all(dim=-1) & (x < 1).all(dim=-1)
-        if not valid_mask.any(): return
+        valid = (x >= 0).all(dim=-1) & (x < 1).all(dim=-1)
+        if not valid.any(): return
             
-        x = x[valid_mask]
-        g = loss_vec.detach().reshape(-1)[valid_mask]
+        x, g = x[valid], loss_vec.detach().reshape(-1)[valid]
         x = torch.clamp(x, 0.0, 1.0 - 1e-6)
         
         for l in range(self.L):
             res = math.floor(self.N_min * (self.b ** l))
+            stride = res + 1
+            
             base_v = torch.floor(x * res).long()
             all_v = (base_v.unsqueeze(0) + self.offsets.unsqueeze(1)).reshape(-1, 3)
-            
-            # 1. Map to 1D voxel IDs
-            stride = res + 1
-            v_idx_all = all_v[:,0] + stride*(all_v[:,1] + stride*all_v[:,2])
-            
-            # 2. Map to Hash Indices
-            h_idx_all = self.get_hash(all_v)
+            v_idx = all_v[:,0] + stride*(all_v[:,1] + stride*all_v[:,2])
+            h_idx = self.get_hash(all_v)
 
-            # --- C_eff logic (Count unique voxels per bin) ---
-            # 1. Find unique voxel IDs within this specific batch
-            v_idx_batch_unique, inverse_indices = torch.unique(v_idx_all, return_inverse=True)
-            
-            # 2. Get one representative hash index for each unique voxel found in the batch
-            perm = torch.arange(inverse_indices.size(0), dtype=inverse_indices.dtype, device=inverse_indices.device)
-            unique_subset_idx = torch.empty(v_idx_batch_unique.size(0), dtype=inverse_indices.dtype, device=inverse_indices.device)
-            unique_subset_idx.scatter_(0, inverse_indices, perm)
-            h_idx_batch_unique = h_idx_all[unique_subset_idx]
+            # 1. Update Voxel-Level Importance G(l, v)
+            g_rep = g.repeat_interleave(8)
+            self.voxel_grads[l].index_add_(0, v_idx, g_rep)
 
-            # 3. Check which of these are new to the GLOBAL bitfield
-            already_seen = self.voxel_bitfields[l][v_idx_batch_unique]
-            is_globally_new = (already_seen == 0)
-            
-            if is_globally_new.any():
-                new_v_indices = h_idx_batch_unique[is_globally_new]
-                # Increment C_eff by 1 for every bin receiving a NEW unique voxel
-                self.eff_voxel_count[l].index_add_(0, new_v_indices, torch.ones_like(new_v_indices, dtype=torch.long))
-                # Mark as seen globally to prevent re-counting in future batches
-                self.voxel_bitfields[l][v_idx_batch_unique[is_globally_new]] = 1
+            # 2. Update Global Bin Total (Denominator of R_dom)
+            self.total_bin_grad[l].index_add_(0, h_idx, g_rep)
 
-    def save(self, path):
-        data = {
-            "eff_voxel_count": self.eff_voxel_count.cpu(),
-            "grad_sum": self.grad_sum.cpu(),
-            "grad_sq_sum": self.grad_sq_sum.cpu(),
-            "sample_count": self.sample_count.cpu(),
-            "config": {"L": self.L, "T": self.T, "b": self.b, "N_min": self.N_min}
-        }
-        torch.save(data, path)
-        
+            # 3. Update C_eff (Unique Voxel Count)
+            v_idx_batch, inv = torch.unique(v_idx, return_inverse=True)
+            perm = torch.arange(inv.size(0), dtype=inv.dtype, device=inv.device)
+            first_idx = torch.empty(v_idx_batch.size(0), dtype=inv.dtype, device=inv.device).scatter_(0, inv, perm)
+            h_idx_batch = h_idx[first_idx]
+
+            new_mask = (self.voxel_bitfields[l][v_idx_batch] == 0)
+            if new_mask.any():
+                self.eff_voxel_count[l].index_add_(0, h_idx_batch[new_mask], torch.ones_like(h_idx_batch[new_mask]))
+                self.voxel_bitfields[l][v_idx_batch[new_mask]] = 1
+
+            # 4. Update Max Voxel Importance per Bin (Numerator of R_dom)
+            # We take the updated G(l,v) of voxels in this batch and update the bin's max
+            current_v_grads = self.voxel_grads[l][v_idx_batch]
+            self.max_voxel_grad[l].index_reduce_(0, h_idx_batch, current_v_grads, reduce='amax', include_self=True)
+
     def print_collision_summary(self):
-        print("\n" + "="*105)
-        print(f"{'MHE SPATIAL COLLISION DENSITY ANALYSIS SUMMARY':^105}")
-        print("="*105)
-        header = f"{'L':<3} | {'Res':<5} | {'Bins (Occ)':<10} | {'Avg C_eff':<10} | {'Max C_eff':<10} | {'Total C_grad':<14} | {'Avg Conflict'}"
+        print("\n" + "="*115)
+        print(f"{'MHE SPATIAL COLLISION DENSITY & DOMINANCE ANALYSIS':^115}")
+        print("="*115)
+        header = f"{'L':<3} | {'Res':<5} | {'Bins (Occ)':<10} | {'Avg C_eff':<10} | {'Max C_eff':<10} | {'Total G':<12} | {'Avg R_dom'}"
         print(header)
         print("-" * len(header))
 
         for l in range(self.L):
-            N_l = int(math.floor(self.N_min * (self.b ** l)))
-            
-            # Use eff_voxel_count to determine occupied bins
-            occ_mask = self.eff_voxel_count[l] > 0
-            num_occ = occ_mask.sum().item()
+            res = math.floor(self.N_min * (self.b ** l))
+            occ = self.eff_voxel_count[l] > 0
+            num_occ = occ.sum().item()
             
             if num_occ > 0:
-                c_eff_vals = self.eff_voxel_count[l][occ_mask].float()
-                avg_c_eff = c_eff_vals.mean().item()
-                max_c_eff = c_eff_vals.max().item()
-                total_grad = self.grad_sum[l].sum().item()
-                
-                # Conflict is variance where samples > 1 AND spatial aliasing (C_eff > 1) exists
-                conflict_mask = (self.sample_count[l] > 1) & (self.eff_voxel_count[l] > 1)
-                if conflict_mask.any():
-                    n = self.sample_count[l][conflict_mask]
-                    mean_g = self.grad_sum[l][conflict_mask] / n
-                    var_g = (self.grad_sq_sum[l][conflict_mask] / n) - (mean_g ** 2)
-                    avg_conflict = var_g.mean().item()
+                c_eff = self.eff_voxel_count[l][occ].float()
+                # R_dom = max_voxel_grad / total_bin_grad
+                # We calculate dominance specifically for bins with collisions (C_eff > 1)
+                coll_mask = occ & (self.eff_voxel_count[l] > 1)
+                if coll_mask.any():
+                    r_dom = self.max_voxel_grad[l][coll_mask] / self.total_bin_grad[l][coll_mask].clamp(min=1e-6)
+                    avg_r_dom = r_dom.mean().item()
                 else:
-                    avg_conflict = 0.0
+                    avg_r_dom = 1.0 # No collisions means perfect dominance
+                
+                print(f"{l+1:<3} | {res:<5} | {num_occ:<10,} | {c_eff.mean():<10.2f} | {c_eff.max():<10.0f} | "
+                      f"{self.total_bin_grad[l].sum():<12.2e} | {avg_r_dom:.4f}")
             else:
-                avg_c_eff, max_c_eff, total_grad, avg_conflict = 0, 0, 0, 0
+                print(f"{l+1:<3} | {res:<5} | {'0':<10} | {'0.00':<10} | {'0':<10} | {'0.00e+00':<12} | {'1.0000'}")
 
-            print(f"{l+1:<3} | {N_l:<5} | {num_occ:<10,} | {avg_c_eff:<10.2f} | {max_c_eff:<10} | {total_grad:<14.2e} | {avg_conflict:.6f}")
+        util = (self.eff_voxel_count > 0).sum().item() / (self.L * self.T)
+        print("="*115)
+        print(f"Overall Hash Table Utilization: {util:.2%}")
+        print("="*115 + "\n")
 
-        # Final table-wide stats
-        active_bins = (self.eff_voxel_count > 0).sum().item()
-        total_bins = self.L * self.T
-        print("="*105)
-        print(f"Overall Hash Table Utilization: {active_bins:,} / {total_bins:,} ({active_bins/total_bins:.2%})")
-        print("="*105 + "\n")
+    def save(self, path):
+        torch.save({
+            "eff_voxel_count": self.eff_voxel_count.cpu(),
+            "max_voxel_grad": self.max_voxel_grad.cpu(),
+            "total_bin_grad": self.total_bin_grad.cpu(),
+            "config": {"L": self.L, "T": self.T, "b": self.b, "N_min": self.N_min}
+        }, path)
 
 class OccupancyGrid:
     """ A lightweight/simple occupancy grid. """
