@@ -72,26 +72,25 @@ class CollisionTracker:
             # 2. Map to Hash Indices
             h_idx_all = self.get_hash(all_v)
 
-            # --- C_grad logic ---
-            g_rep = g.repeat_interleave(8)
-            self.grad_sum[l].index_add_(0, h_idx_all, g_rep)
-            self.grad_sq_sum[l].index_add_(0, h_idx_all, g_rep**2)
-            self.sample_count[l].index_add_(0, h_idx_all, torch.ones_like(h_idx_all, dtype=torch.float32))
-
             # --- C_eff logic (Count unique voxels per bin) ---
-            # torch.unique on 1D is fast. Let's get unique v_idxs in this batch:
-            v_idx_batch_unique, unique_subset_idx = torch.unique(v_idx_all, return_inverse=False, return_counts=False, dim=0)
+            # 1. Find unique voxel IDs within this specific batch
+            v_idx_batch_unique, inverse_indices = torch.unique(v_idx_all, return_inverse=True)
+            
+            # 2. Get one representative hash index for each unique voxel found in the batch
+            perm = torch.arange(inverse_indices.size(0), dtype=inverse_indices.dtype, device=inverse_indices.device)
+            unique_subset_idx = torch.empty(v_idx_batch_unique.size(0), dtype=inverse_indices.dtype, device=inverse_indices.device)
+            unique_subset_idx.scatter_(0, inverse_indices, perm)
             h_idx_batch_unique = h_idx_all[unique_subset_idx]
 
-            # Now check which of these are new to the GLOBAL bitfield
+            # 3. Check which of these are new to the GLOBAL bitfield
             already_seen = self.voxel_bitfields[l][v_idx_batch_unique]
             is_globally_new = (already_seen == 0)
             
             if is_globally_new.any():
                 new_v_indices = h_idx_batch_unique[is_globally_new]
-                # Now this strictly increments by 1 per unique voxel coordinate
+                # Increment C_eff by 1 for every bin receiving a NEW unique voxel
                 self.eff_voxel_count[l].index_add_(0, new_v_indices, torch.ones_like(new_v_indices, dtype=torch.long))
-                # Mark as seen globally
+                # Mark as seen globally to prevent re-counting in future batches
                 self.voxel_bitfields[l][v_idx_batch_unique[is_globally_new]] = 1
 
     def save(self, path):
