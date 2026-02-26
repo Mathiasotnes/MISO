@@ -193,8 +193,11 @@ def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
     print("Calculating ACI for predicted vertices...")
     verts_torch = torch.from_numpy(verts_pred).float()
     
-    # Normalize to [0, 1] based on training bounds
-    x = (verts_torch - bound[0]) / (bound[1] - bound[0])
+    # Correct Normalization:
+    b_min = bound[:, 0]
+    b_max = bound[:, 1]
+    
+    x = (verts_torch - b_min) / (b_max - b_min)
     x = torch.clamp(x, 0.0, 1.0 - 1e-6)
     
     aci_scores = torch.zeros(len(verts_pred))
@@ -259,7 +262,7 @@ def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
 if __name__ == "__main__":
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print_config()
+    # print_config()
     
     ####################################
     # Collision Analysis
