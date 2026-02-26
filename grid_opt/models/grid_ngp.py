@@ -20,21 +20,20 @@ class CollisionTracker:
         self.N_min, self.b = base_res, per_level_scale
         self.PI = torch.tensor([1, 2654435761, 805459861], device='cuda', dtype=torch.long)
         
-        # C_eff: Count of unique vertices per hash bin
+        # C_eff: Unique vertices per hash bin
         self.eff_voxel_count = torch.zeros((self.L, self.T), dtype=torch.long, device='cuda')
         
-        # Dominance tracking: Max G(l,v) per bin and Total G(l,v) per bin
+        # Dominance tracking buffers
         self.max_voxel_grad = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
         self.total_bin_grad = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
 
-        # Accumulators for voxel-level importance G(l,v)
         self.voxel_grads = []
         self.voxel_bitfields = []
         
         for l in range(self.L):
             res = math.floor(self.N_min * (self.b ** l))
             num_verts = (res + 1) ** 3
-            # Stores G(l, v) for every active voxel
+            # Accumulate G(l, v) per unique voxel
             self.voxel_grads.append(torch.zeros(num_verts, dtype=torch.float32, device='cuda'))
             self.voxel_bitfields.append(torch.zeros(num_verts, dtype=torch.uint8, device='cuda'))
 
@@ -56,40 +55,37 @@ class CollisionTracker:
         for l in range(self.L):
             res = math.floor(self.N_min * (self.b ** l))
             stride = res + 1
-            
             base_v = torch.floor(x * res).long()
             all_v = (base_v.unsqueeze(0) + self.offsets.unsqueeze(1)).reshape(-1, 3)
             v_idx = all_v[:,0] + stride*(all_v[:,1] + stride*all_v[:,2])
             h_idx = self.get_hash(all_v)
 
-            # 1. Update Voxel-Level Importance G(l, v)
+            # 1. Update G(l, v) and Bin Totals
             g_rep = g.repeat_interleave(8)
             self.voxel_grads[l].index_add_(0, v_idx, g_rep)
-
-            # 2. Update Global Bin Total (Denominator of R_dom)
             self.total_bin_grad[l].index_add_(0, h_idx, g_rep)
 
-            # 3. Update C_eff (Unique Voxel Count)
+            # 2. C_eff logic: Identify unique voxels in batch
             v_idx_batch, inv = torch.unique(v_idx, return_inverse=True)
             perm = torch.arange(inv.size(0), dtype=inv.dtype, device=inv.device)
             first_idx = torch.empty(v_idx_batch.size(0), dtype=inv.dtype, device=inv.device).scatter_(0, inv, perm)
             h_idx_batch = h_idx[first_idx]
 
+            # Update C_eff globally
             new_mask = (self.voxel_bitfields[l][v_idx_batch] == 0)
             if new_mask.any():
                 self.eff_voxel_count[l].index_add_(0, h_idx_batch[new_mask], torch.ones_like(h_idx_batch[new_mask]))
                 self.voxel_bitfields[l][v_idx_batch[new_mask]] = 1
 
-            # 4. Update Max Voxel Importance per Bin (Numerator of R_dom)
-            # We take the updated G(l,v) of voxels in this batch and update the bin's max
+            # 3. Update Max Voxel Importance per Bin (Winner-takes-all tracking)
             current_v_grads = self.voxel_grads[l][v_idx_batch]
             self.max_voxel_grad[l].index_reduce_(0, h_idx_batch, current_v_grads, reduce='amax', include_self=True)
 
     def print_collision_summary(self):
-        print("\n" + "="*115)
-        print(f"{'MHE SPATIAL COLLISION DENSITY & DOMINANCE ANALYSIS':^115}")
-        print("="*115)
-        header = f"{'L':<3} | {'Res':<5} | {'Bins (Occ)':<10} | {'Avg C_eff':<10} | {'Max C_eff':<10} | {'Total G':<12} | {'Avg R_dom'}"
+        print("\n" + "="*125)
+        print(f"{'MHE SPATIAL COLLISION DENSITY & DOMINANCE ANALYSIS':^125}")
+        print("="*125)
+        header = f"{'L':<3} | {'Res':<5} | {'Bins (Occ)':<10} | {'C_eff (Min/Avg/Max)':<25} | {'R_dom (Min/Avg/Max)':<25}"
         print(header)
         print("-" * len(header))
 
@@ -100,24 +96,24 @@ class CollisionTracker:
             
             if num_occ > 0:
                 c_eff = self.eff_voxel_count[l][occ].float()
-                # R_dom = max_voxel_grad / total_bin_grad
-                # We calculate dominance specifically for bins with collisions (C_eff > 1)
+                c_eff_str = f"{c_eff.min():.0f} / {c_eff.mean():.2f} / {c_eff.max():.0f}"
+                
+                # R_dom for bins with actual collisions (C_eff > 1)
                 coll_mask = occ & (self.eff_voxel_count[l] > 1)
                 if coll_mask.any():
                     r_dom = self.max_voxel_grad[l][coll_mask] / self.total_bin_grad[l][coll_mask].clamp(min=1e-6)
-                    avg_r_dom = r_dom.mean().item()
+                    r_dom_str = f"{r_dom.min():.4f} / {r_dom.mean():.4f} / {r_dom.max():.4f}"
                 else:
-                    avg_r_dom = 1.0 # No collisions means perfect dominance
+                    r_dom_str = "1.0000 / 1.0000 / 1.0000"
                 
-                print(f"{l+1:<3} | {res:<5} | {num_occ:<10,} | {c_eff.mean():<10.2f} | {c_eff.max():<10.0f} | "
-                      f"{self.total_bin_grad[l].sum():<12.2e} | {avg_r_dom:.4f}")
+                print(f"{l+1:<3} | {res:<5} | {num_occ:<10,} | {c_eff_str:<25} | {r_dom_str:<25}")
             else:
-                print(f"{l+1:<3} | {res:<5} | {'0':<10} | {'0.00':<10} | {'0':<10} | {'0.00e+00':<12} | {'1.0000'}")
+                print(f"{l+1:<3} | {res:<5} | {'0':<10} | {'-':<25} | {'-':<25}")
 
         util = (self.eff_voxel_count > 0).sum().item() / (self.L * self.T)
-        print("="*115)
+        print("="*125)
         print(f"Overall Hash Table Utilization: {util:.2%}")
-        print("="*115 + "\n")
+        print("="*125 + "\n")
 
     def save(self, path):
         torch.save({
