@@ -54,43 +54,45 @@ class CollisionTracker:
     def track_step(self, coords_world: torch.Tensor, bound: torch.Tensor, loss_vec: torch.Tensor):
         x = (coords_world - bound[:, 0]) / (bound[:, 1] - bound[:, 0])
         valid_mask = (x >= 0).all(dim=-1) & (x < 1).all(dim=-1)
-        if not valid_mask.any():
-            return
+        if not valid_mask.any(): return
             
         x = x[valid_mask]
         g = loss_vec.detach().reshape(-1)[valid_mask]
-        
-        eps = 1e-6
-        x = torch.clamp(x, 0.0, 1.0 - eps)
+        x = torch.clamp(x, 0.0, 1.0 - 1e-6)
         
         for l in range(self.L):
             res = math.floor(self.N_min * (self.b ** l))
             base_v = torch.floor(x * res).long()
-            
-            # 8 corners per sample
             all_v = (base_v.unsqueeze(0) + self.offsets.unsqueeze(1)).reshape(-1, 3)
-            indices = self.get_hash(all_v) # (8*B)
             
-            # --- C_grad: Total Gradient Magnitude ---
-            g_rep = g.repeat_interleave(8)
-            self.grad_sum[l].index_add_(0, indices, g_rep)
-            self.grad_sq_sum[l].index_add_(0, indices, g_rep**2)
-            self.sample_count[l].index_add_(0, indices, torch.ones_like(g_rep))
+            # 1. Map to 1D voxel IDs
+            stride = res + 1
+            v_idx_all = all_v[:,0] + stride*(all_v[:,1] + stride*all_v[:,2])
+            
+            # 2. Map to Hash Indices
+            h_idx_all = self.get_hash(all_v)
 
-            # --- C_eff: Unique Voxel Counting ---
-            # Map 3D coords to 1D index: x + N(y + N*z)
-            v_idx = all_v[:,0] + (res+1)*(all_v[:,1] + (res+1)*all_v[:,2])
+            # --- C_grad logic ---
+            g_rep = g.repeat_interleave(8)
+            self.grad_sum[l].index_add_(0, h_idx_all, g_rep)
+            self.grad_sq_sum[l].index_add_(0, h_idx_all, g_rep**2)
+            self.sample_count[l].index_add_(0, h_idx_all, torch.ones_like(h_idx_all, dtype=torch.float32))
+
+            # --- C_eff logic (Count unique voxels per bin) ---
+            # torch.unique on 1D is fast. Let's get unique v_idxs in this batch:
+            v_idx_batch_unique, unique_subset_idx = torch.unique(v_idx_all, return_inverse=False, return_counts=False, dim=0)
+            h_idx_batch_unique = h_idx_all[unique_subset_idx]
+
+            # Now check which of these are new to the GLOBAL bitfield
+            already_seen = self.voxel_bitfields[l][v_idx_batch_unique]
+            is_globally_new = (already_seen == 0)
             
-            # Find which voxels in this batch are new to this level
-            already_seen = self.voxel_bitfields[l][v_idx] 
-            is_new = (already_seen == 0)
-            
-            if is_new.any():
-                new_v_indices = indices[is_new]
-                # Increment C_eff for every bin that just received a NEW unique voxel
+            if is_globally_new.any():
+                new_v_indices = h_idx_batch_unique[is_globally_new]
+                # Now this strictly increments by 1 per unique voxel coordinate
                 self.eff_voxel_count[l].index_add_(0, new_v_indices, torch.ones_like(new_v_indices, dtype=torch.long))
-                # Mark as seen
-                self.voxel_bitfields[l][v_idx[is_new]] = 1
+                # Mark as seen globally
+                self.voxel_bitfields[l][v_idx_batch_unique[is_globally_new]] = 1
 
     def save(self, path):
         data = {
