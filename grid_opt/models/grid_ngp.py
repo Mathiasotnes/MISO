@@ -94,7 +94,7 @@ class CollisionTracker:
 
     def save(self, path):
         data = {
-            "eff_bin_mask": self.eff_bin_mask.cpu(),
+            "eff_voxel_count": self.eff_voxel_count.cpu(),
             "grad_sum": self.grad_sum.cpu(),
             "grad_sq_sum": self.grad_sq_sum.cpu(),
             "sample_count": self.sample_count.cpu(),
@@ -106,16 +106,14 @@ class CollisionTracker:
         print("\n" + "="*105)
         print(f"{'MHE SPATIAL COLLISION DENSITY ANALYSIS SUMMARY':^105}")
         print("="*105)
-        # Bins (Occ): Unique hash indices touched
-        # Avg C_eff: Unique voxels mapped to a single hash index
-        # Total C_grad: Total gradient magnitude (importance)
-        # Avg Conflict: Variance of gradients in bins with >1 unique voxel
         header = f"{'L':<3} | {'Res':<5} | {'Bins (Occ)':<10} | {'Avg C_eff':<10} | {'Max C_eff':<10} | {'Total C_grad':<14} | {'Avg Conflict'}"
         print(header)
         print("-" * len(header))
 
         for l in range(self.L):
             N_l = int(math.floor(self.N_min * (self.b ** l)))
+            
+            # Use eff_voxel_count to determine occupied bins
             occ_mask = self.eff_voxel_count[l] > 0
             num_occ = occ_mask.sum().item()
             
@@ -125,7 +123,7 @@ class CollisionTracker:
                 max_c_eff = c_eff_vals.max().item()
                 total_grad = self.grad_sum[l].sum().item()
                 
-                # Conflict is only relevant where C_eff > 1 (actual collisions)
+                # Conflict is variance where samples > 1 AND spatial aliasing (C_eff > 1) exists
                 conflict_mask = (self.sample_count[l] > 1) & (self.eff_voxel_count[l] > 1)
                 if conflict_mask.any():
                     n = self.sample_count[l][conflict_mask]
@@ -138,6 +136,13 @@ class CollisionTracker:
                 avg_c_eff, max_c_eff, total_grad, avg_conflict = 0, 0, 0, 0
 
             print(f"{l+1:<3} | {N_l:<5} | {num_occ:<10,} | {avg_c_eff:<10.2f} | {max_c_eff:<10} | {total_grad:<14.2e} | {avg_conflict:.6f}")
+
+        # Final table-wide stats
+        active_bins = (self.eff_voxel_count > 0).sum().item()
+        total_bins = self.L * self.T
+        print("="*105)
+        print(f"Overall Hash Table Utilization: {active_bins:,} / {total_bins:,} ({active_bins/total_bins:.2%})")
+        print("="*105 + "\n")
 
 class OccupancyGrid:
     """ A lightweight/simple occupancy grid. """
