@@ -21,7 +21,7 @@ class CollisionTracker:
         self.T = hashmap_size
         self.N_min = base_res
         self.b = per_level_scale
-        self.PI = [1, 2654435761, 805459861] # InstantNGP hash
+        self.PI = torch.tensor([1, 2654435761, 805459861], device='cuda', dtype=torch.long)
         
         # Tracking buffers
         self.eff_bin_mask   = torch.zeros((self.L, self.T), dtype=torch.bool, device='cuda')
@@ -38,6 +38,7 @@ class CollisionTracker:
 
     @torch.no_grad()
     def track_step(self, coords_world: torch.Tensor, bound: torch.Tensor, loss_val: torch.Tensor):
+        # Normalize world coords to [0, 1]
         x = (coords_world - bound[:, 0]) / (bound[:, 1] - bound[:, 0])
         g = loss_val.detach().view(-1) # (Batch,)
 
@@ -46,25 +47,24 @@ class CollisionTracker:
             base_v = torch.floor(x * res).long() # (Batch, 3)
             
             # Broadcast corners: (8, Batch, 3)
-            all_v = base_v.unsqueeze(0) + self.offsets.unsqueeze(1)
-            all_v = all_v.view(-1, 3) # (8 * Batch, 3)
+            all_v = (base_v.unsqueeze(0) + self.offsets.unsqueeze(1)).reshape(-1, 3)
             
             indices = self.get_hash(all_v) # (8 * Batch,)
             
             # Repeat gradients 8 times to match index count
             g_rep = g.repeat(8)
             
-            # Use index_add_ for atomic GPU updates (Much faster than loops)
+            # Atomic GPU updates avoid CPU-sync bottlenecks 
             self.grad_sum[l].index_add_(0, indices, g_rep)
             self.grad_sq_sum[l].index_add_(0, indices, g_rep**2)
             self.sample_count[l].index_add_(0, indices, torch.ones_like(g_rep))
             
-            # Efficiently mark bins as "Touched"
+            # Mark bins as "Touched" to calculate Effective Occupancy
             self.eff_bin_mask[l, indices] = True
 
     def save(self, path):
         data = {
-            "eff_voxel_count": self.eff_voxel_count.cpu(),
+            "eff_bin_mask": self.eff_bin_mask.cpu(),
             "grad_sum": self.grad_sum.cpu(),
             "grad_sq_sum": self.grad_sq_sum.cpu(),
             "sample_count": self.sample_count.cpu(),
@@ -73,43 +73,35 @@ class CollisionTracker:
         torch.save(data, path)
         
     def print_collision_summary(self):
-        """
-        Summarizes the collision landscape of the model after training.
-        Compares Effective vs. Informational load across levels.
-        """
         print("\n" + "="*80)
         print(f"{'LEVEL-WISE COLLISION ANALYSIS (EPOCH SUMMARY)':^80}")
         print("="*80)
-        header = f"{'L':<3} | {'Res':<6} | {'Eff. Voxels':<12} | {'Eff. Coll%':<10} | {'Conflict (Var)':<15} | {'Avg Grad'}"
+        header = f"{'L':<3} | {'Res':<6} | {'Touched Bins':<12} | {'Avg Samples/Bin':<16} | {'Conflict (Var)'}"
         print(header)
         print("-" * len(header))
 
         for l in range(self.L):
-            # Calculate Resolution for display
             N_l = int(math.floor(self.N_min * (self.b ** l)))
             
-            # 1. Effective Collision Percentage
-            # (How many bins have more than 1 unique coordinate mapped to them)
-            eff_collided_bins = (self.eff_voxel_count[l] > 1).sum().item()
-            occupied_bins = (self.eff_voxel_count[l] > 0).sum().item()
-            eff_coll_pct = (eff_collided_bins / occupied_bins * 100) if occupied_bins > 0 else 0
+            # Count occupied bins from the mask [cite: 191]
+            occupied_bins = self.eff_bin_mask[l].sum().item()
             
-            # 2. Informational Conflict (Variance of Gradients)
-            # Var = (Sum_Sq / N) - (Sum / N)^2
-            n = self.sample_count[l].float()
-            mask = n > 1 # Only calculate variance for bins with multiple samples
+            # Informational Conflict (Variance of Gradients) [cite: 55, 307]
+            n = self.sample_count[l]
+            mask = n > 1 
             
-            mean_grad = self.grad_sum[l] / n
-            variance = (self.grad_sq_sum[l] / n) - (mean_grad ** 2)
+            mean_grad = self.grad_sum[l] / n.clamp(min=1)
+            # Variance formula for conflict tracking
+            variance = (self.grad_sq_sum[l] / n.clamp(min=1)) - (mean_grad ** 2)
+            
             avg_conflict = variance[mask].mean().item() if mask.any() else 0.0
+            avg_samples = n[n > 0].mean().item() if (n > 0).any() else 0.0
             
-            # 3. Overall Voxel Sparsity
-            total_eff_voxels = sum(len(s) for s in self.visited_voxels) if hasattr(self, 'visited_voxels') else 0
-            
-            print(f"{l+1:<3} | {N_l:<6} | {len(self.visited_voxels[l]):<12,} | {eff_coll_pct:<10.2f}% | {avg_conflict:<15.6f} | {mean_grad[mask].mean().item():.6f}")
+            print(f"{l+1:<3} | {N_l:<6} | {occupied_bins:<12,} | {avg_samples:<16.2f} | {avg_conflict:<15.6f}")
 
+        total_touched = self.eff_bin_mask.any(dim=0).sum().item()
         print("="*80)
-        print(f"Total Unique Voxels Touched: {total_eff_voxels:,}")
+        print(f"Total Unique Hash Bins Touched: {total_touched:,}")
 
 class OccupancyGrid:
     """ A lightweight/simple occupancy grid. """
