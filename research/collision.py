@@ -215,6 +215,10 @@ def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
     # 4. Statistical Analysis
     aci_np = aci_scores.numpy()
     
+    if len(aci_np) != len(dist_p):
+        print(f"Warning: Size mismatch. ACI: {len(aci_np)}, Dist: {len(dist_p)}. Slicing ACI to match.")
+        aci_np = aci_np[:len(dist_p)]
+    
     # Filter out extreme outliers (if any) to keep the plot readable
     mask = dist_p < 0.10 # Ignore errors > 10cm for the trend analysis
     aci_filtered = aci_np[mask]
