@@ -1,5 +1,9 @@
 import torch
+import math
+import numpy as np
 import matplotlib.pyplot as plt
+from grid_opt.utils.utils_eval import nn_correspondance, sample_points_from_mesh
+
 
 ###############################################################
 # Constants / Configuration
@@ -12,6 +16,12 @@ L       = 16
 N_min   = 16
 N_max   = 2048
 b       = torch.exp((torch.log(torch.tensor(N_max)) - torch.log(torch.tensor(N_min))) / (L - 1)).item()
+
+# Data
+BOUNDS                  = torch.tensor([[-0.02,  10.38], [-0.01, 8.74], [-0.01,  3.03]])
+COLLISION_STATS_PATH    = "./collision_stats.pt"
+MESH_PATH               = "./results/mapping/hash_pred_mesh.ply"
+GT_MESH_PATH            = "../../data/ScanNet/scans/ scene0000_00/scene0000_00_vh_clean.ply"
 
 def print_config() -> None:
     print("\n" + "="*40)
@@ -147,6 +157,99 @@ def potential_collisions(h_func, N_min: int, T: int, L: int, b: float) -> None:
 
         print(f"{l_idx+1:<6} | {N_l:<10} | {total_vertices:<14} | {collision_ratio:>12.2%} | {avg_load:.4f}")
 
+def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
+    """
+    Correlates per-vertex Chamfer Error (Accuracy) with the Aggregated Conflict Index (ACI).
+    """
+    # 1. Load Collision Stats
+    print("Loading collision statistics...")
+    data = torch.load(stats_path)
+    cfg = data["config"]
+    L, T = cfg["L"], cfg["T"]
+    PI = [1, 2654435761, 805459861]
+    
+    # Pre-compute the R_dom table (L, T)
+    r_dom_table = torch.ones((L, T))
+    for l in range(L):
+        total_g = data["total_bin_grad"][l]
+        max_g = data["max_voxel_grad"][l]
+        # Only compute for occupied bins with actual collisions
+        occ = data["eff_voxel_count"][l] > 1 
+        r_dom_table[l, occ] = max_g[occ] / total_g[occ].clamp(min=1e-6)
+
+    # 2. Extract Geometry and Calculate Per-Point Error
+    print("Sampling meshes and calculating correspondence...")
+    # Using your existing sampling logic
+    verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
+    verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
+    
+    # Use your verified correspondence function (we need the raw dist_p vector)
+    # dist_p[i] is the distance from predicted vertex i to the nearest GT point
+    _, dist_p = nn_correspondance(verts_pred, verts_trgt, truncation=0.50, forward=True)
+    dist_p = np.array(dist_p) # Shape: (N,)
+
+    # 3. Calculate ACI for every Predicted Vertex
+    print("Calculating ACI for predicted vertices...")
+    verts_torch = torch.from_numpy(verts_pred).float()
+    
+    # Normalize to [0, 1] based on training bounds
+    x = (verts_torch - bound[0]) / (bound[1] - bound[0])
+    x = torch.clamp(x, 0.0, 1.0 - 1e-6)
+    
+    aci_scores = torch.zeros(len(verts_pred))
+    
+    for l in range(L):
+        res = math.floor(cfg["N_min"] * (cfg["b"] ** l))
+        v_base = torch.floor(x * res).long()
+        h_idx = (v_base[:, 0] * PI[0] ^ v_base[:, 1] * PI[1] ^ v_base[:, 2] * PI[2]) % T
+        
+        # Conflict = (1 - Dominance Ratio)
+        aci_scores += (1.0 - r_dom_table[l, h_idx])
+
+    # 4. Statistical Analysis
+    aci_np = aci_scores.numpy()
+    
+    # Filter out extreme outliers (if any) to keep the plot readable
+    mask = dist_p < 0.10 # Ignore errors > 10cm for the trend analysis
+    aci_filtered = aci_np[mask]
+    error_filtered = dist_p[mask]
+
+    # Create the Disambiguation Power Plot
+    plt.figure(figsize=(10, 6))
+    plt.hexbin(aci_filtered, error_filtered, gridsize=50, cmap='YlOrRd', mincnt=1)
+    
+    # Calculate Trendline (Disambiguation Power)
+    bins = np.linspace(aci_filtered.min(), aci_filtered.max(), 40)
+    bin_centers = (bins[:-1] + bins[1:]) / 2
+    bin_idx = np.digitize(aci_filtered, bins)
+    
+    bin_means = []
+    for i in range(1, len(bins)):
+        if np.any(bin_idx == i):
+            bin_means.append(error_filtered[bin_idx == i].mean())
+        else:
+            bin_means.append(np.nan)
+    
+    valid = ~np.isnan(bin_means)
+    plt.plot(bin_centers[valid], np.array(bin_means)[valid], color='blue', lw=3, label='Disambiguation Slope')
+    
+    plt.xlabel("Aggregated Conflict Index (Theoretical Hash Noise)")
+    plt.ylabel("Chamfer Accuracy Error (meters)")
+    plt.title("Decoder Disambiguation Analysis: Conflict vs. Geometric Accuracy")
+    plt.colorbar(label='Point Density')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Linear Fit to get the "Sensitivity Number"
+    slope, intercept = np.polyfit(bin_centers[valid], np.array(bin_means)[valid], 1)
+    print(f"\n--- DISAMBIGUATION POWER METRIC ---")
+    print(f"Sensitivity Slope: {slope:.8f} (Error increase per conflict unit)")
+    print(f"Base Error (Intercept): {intercept:.4f} m")
+    print("------------------------------------\n")
+    
+    # Save plot
+    plt.savefig("disambiguation_analysis.png", dpi=300)
+
 ###############################################################
 # Main Program Entry
 ###############################################################
@@ -165,4 +268,11 @@ if __name__ == "__main__":
     
     # analyze_hottest_bins(spatial_hash, N_l=2048)
     # analyze_hottest_bins(spatial_hash, N_l=406)
+    
+    analyze_disambiguation(
+        stats_path=COLLISION_STATS_PATH, 
+        mesh_path=MESH_PATH, 
+        gt_mesh_path=GT_MESH_PATH, 
+        bound=BOUNDS
+    )
     
