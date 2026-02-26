@@ -23,67 +23,44 @@ class CollisionTracker:
         self.b = per_level_scale
         self.PI = [1, 2654435761, 805459861] # InstantNGP hash
         
-        # Tracking buffers (L, T)
-        self.eff_voxel_count = torch.zeros((self.L, self.T), dtype=torch.long, device='cuda')
-        self.grad_sum        = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
-        self.grad_sq_sum     = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
-        self.sample_count    = torch.zeros((self.L, self.T), dtype=torch.long, device='cuda')
-        
-        # To track unique voxels per bin during an epoch
-        self.visited_voxels = [set() for _ in range(self.L)]
+        # Tracking buffers
+        self.eff_bin_mask   = torch.zeros((self.L, self.T), dtype=torch.bool, device='cuda')
+        self.grad_sum       = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
+        self.grad_sq_sum    = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
+        self.sample_count   = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
+        self.offsets        = torch.stack(torch.meshgrid([torch.tensor([0, 1])] * 3, indexing='ij')).reshape(3, -1).t().to('cuda')
 
     def get_hash(self, coords: torch.Tensor) -> torch.Tensor:
         # TODO: Make sure this is consistent with tcnn implementation. We might need to change the computer precision to match.
-        h = (coords[:, 0].long() * self.PI[0]) ^ \
-            (coords[:, 1].long() * self.PI[1]) ^ \
-            (coords[:, 2].long() * self.PI[2])
+        # coords shape: (8 * Batch, 3)
+        h = (coords[:, 0] * self.PI[0]) ^ (coords[:, 1] * self.PI[1]) ^ (coords[:, 2] * self.PI[2])
         return h % self.T
 
     @torch.no_grad()
     def track_step(self, coords_world: torch.Tensor, bound: torch.Tensor, loss_val: torch.Tensor):
-        """ 
-        Replicates trilinear interpolation vertex selection.
-        Calculates 8 indices per level for every coordinate in the batch.
-        """
-        # Normalize world coords to [0, 1]
         x = (coords_world - bound[:, 0]) / (bound[:, 1] - bound[:, 0])
-        batch_size = x.shape[0]
-        
-        # Magnitude of the gradient (simplified as scalar loss here)
-        g = loss_val.detach()
+        g = loss_val.detach().view(-1) # (Batch,)
 
         for l in range(self.L):
             res = math.floor(self.N_min * (self.b ** l))
-            x_l = x * res
+            base_v = torch.floor(x * res).long() # (Batch, 3)
             
-            # Find the 'integer' floor of the coordinates
-            base_v = torch.floor(x_l).long()
+            # Broadcast corners: (8, Batch, 3)
+            all_v = base_v.unsqueeze(0) + self.offsets.unsqueeze(1)
+            all_v = all_v.view(-1, 3) # (8 * Batch, 3)
             
-            # Generate the 8 corners of the voxel
-            # Offset vectors for 2^3=8 corners: [0,0,0], [0,0,1], ..., [1,1,1]
-            offsets = torch.tensor([
-                [0,0,0], [0,0,1], [0,1,0], [0,1,1],
-                [1,0,0], [1,0,1], [1,1,0], [1,1,1]
-            ], device='cuda')
+            indices = self.get_hash(all_v) # (8 * Batch,)
             
-            # For each corner, calculate indices and update trackers
-            for offset in offsets:
-                v_corner = base_v + offset
-                indices = self.get_hash(v_corner)
-                
-                # 1. Update Informational Load (C_grad)
-                self.grad_sum[l].index_add_(0, indices, torch.full((batch_size,), g, device='cuda'))
-                self.grad_sq_sum[l].index_add_(0, indices, torch.full((batch_size,), g**2, device='cuda'))
-                self.sample_count[l].index_add_(0, indices, torch.ones(batch_size, dtype=torch.long, device='cuda'))
-
-                # 2. Update Effective Voxel Count (C_eff)
-                # Note: This set-based tracking is slow for large batches. 
-                # For research, only sample every Nth batch if performance drops.
-                for idx, v in zip(indices.cpu().numpy(), v_corner.cpu().numpy()):
-                    v_tuple = tuple(v)
-                    if v_tuple not in self.visited_voxels[l]:
-                        self.visited_voxels[l].add(v_tuple)
-                        self.eff_voxel_count[l, idx] += 1
+            # Repeat gradients 8 times to match index count
+            g_rep = g.repeat(8)
+            
+            # Use index_add_ for atomic GPU updates (Much faster than loops)
+            self.grad_sum[l].index_add_(0, indices, g_rep)
+            self.grad_sq_sum[l].index_add_(0, indices, g_rep**2)
+            self.sample_count[l].index_add_(0, indices, torch.ones_like(g_rep))
+            
+            # Efficiently mark bins as "Touched"
+            self.eff_bin_mask[l, indices] = True
 
     def save(self, path):
         data = {
