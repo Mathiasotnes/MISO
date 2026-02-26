@@ -21,7 +21,7 @@ b       = torch.exp((torch.log(torch.tensor(N_max)) - torch.log(torch.tensor(N_m
 BOUNDS                  = torch.tensor([[-0.02,  10.38], [-0.01, 8.74], [-0.01,  3.03]])
 COLLISION_STATS_PATH    = "./collision_stats.pt"
 MESH_PATH               = "./results/mapping/hash_pred_mesh.ply"
-GT_MESH_PATH            = "../../data/ScanNet/scans/ scene0000_00/scene0000_00_vh_clean.ply"
+GT_MESH_PATH            = "../../data/ScanNet/scans/scene0000_00/scene0000_00_vh_clean.ply"
 
 def print_config() -> None:
     print("\n" + "="*40)
@@ -248,7 +248,8 @@ def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
     print("------------------------------------\n")
     
     # Save plot
-    plt.savefig("disambiguation_analysis.png", dpi=300)
+    plt.savefig("./disambiguation_analysis.png", dpi=300)
+    print("Disambiguation analysis plot saved as 'disambiguation_analysis.png'.")
 
 ###############################################################
 # Main Program Entry
