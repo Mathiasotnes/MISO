@@ -185,7 +185,8 @@ def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
     
     # Use your verified correspondence function (we need the raw dist_p vector)
     # dist_p[i] is the distance from predicted vertex i to the nearest GT point
-    _, dist_p = nn_correspondance(verts_pred, verts_trgt, truncation=0.50, forward=True)
+    truncation_acc = 0.5
+    _, dist_p = nn_correspondance(verts_pred, verts_trgt, truncation_acc, True)  # Pred -> GT
     dist_p = np.array(dist_p) # Shape: (N,)
 
     # 3. Calculate ACI for every Predicted Vertex
