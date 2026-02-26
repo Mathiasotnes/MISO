@@ -14,10 +14,128 @@ import tinycudann as tcnn
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+class CollisionTracker:
+    """ Utility class to track collision statistics during training of the GridNGP. """
+    def __init__(self, n_levels=16, hashmap_size=2**15, base_res=16, per_level_scale=1.26):
+        self.L = n_levels
+        self.T = hashmap_size
+        self.N_min = base_res
+        self.b = per_level_scale
+        self.PI = [1, 2654435761, 805459861] # InstantNGP hash
+        
+        # Tracking buffers (L, T)
+        self.eff_voxel_count = torch.zeros((self.L, self.T), dtype=torch.long, device='cuda')
+        self.grad_sum        = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
+        self.grad_sq_sum     = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
+        self.sample_count    = torch.zeros((self.L, self.T), dtype=torch.long, device='cuda')
+        
+        # To track unique voxels per bin during an epoch
+        self.visited_voxels = [set() for _ in range(self.L)]
+
+    def get_hash(self, coords: torch.Tensor) -> torch.Tensor:
+        # TODO: Make sure this is consistent with tcnn implementation. We might need to change the computer precision to match.
+        h = (coords[:, 0].long() * self.PI[0]) ^ \
+            (coords[:, 1].long() * self.PI[1]) ^ \
+            (coords[:, 2].long() * self.PI[2])
+        return h % self.T
+
+    @torch.no_grad()
+    def track_step(self, coords_world: torch.Tensor, bound: torch.Tensor, loss_val: torch.Tensor):
+        """ 
+        Replicates trilinear interpolation vertex selection.
+        Calculates 8 indices per level for every coordinate in the batch.
+        """
+        # Normalize world coords to [0, 1]
+        x = (coords_world - bound[:, 0]) / (bound[:, 1] - bound[:, 0])
+        batch_size = x.shape[0]
+        
+        # Magnitude of the gradient (simplified as scalar loss here)
+        g = loss_val.detach()
+
+        for l in range(self.L):
+            res = math.floor(self.N_min * (self.b ** l))
+            x_l = x * res
+            
+            # Find the 'integer' floor of the coordinates
+            base_v = torch.floor(x_l).long()
+            
+            # Generate the 8 corners of the voxel
+            # Offset vectors for 2^3=8 corners: [0,0,0], [0,0,1], ..., [1,1,1]
+            offsets = torch.tensor([
+                [0,0,0], [0,0,1], [0,1,0], [0,1,1],
+                [1,0,0], [1,0,1], [1,1,0], [1,1,1]
+            ], device='cuda')
+            
+            # For each corner, calculate indices and update trackers
+            for offset in offsets:
+                v_corner = base_v + offset
+                indices = self.get_hash(v_corner)
+                
+                # 1. Update Informational Load (C_grad)
+                self.grad_sum[l].index_add_(0, indices, torch.full((batch_size,), g, device='cuda'))
+                self.grad_sq_sum[l].index_add_(0, indices, torch.full((batch_size,), g**2, device='cuda'))
+                self.sample_count[l].index_add_(0, indices, torch.ones(batch_size, dtype=torch.long, device='cuda'))
+
+                # 2. Update Effective Voxel Count (C_eff)
+                # Note: This set-based tracking is slow for large batches. 
+                # For research, only sample every Nth batch if performance drops.
+                for idx, v in zip(indices.cpu().numpy(), v_corner.cpu().numpy()):
+                    v_tuple = tuple(v)
+                    if v_tuple not in self.visited_voxels[l]:
+                        self.visited_voxels[l].add(v_tuple)
+                        self.eff_voxel_count[l, idx] += 1
+
+    def save(self, path):
+        data = {
+            "eff_voxel_count": self.eff_voxel_count.cpu(),
+            "grad_sum": self.grad_sum.cpu(),
+            "grad_sq_sum": self.grad_sq_sum.cpu(),
+            "sample_count": self.sample_count.cpu(),
+            "config": {"L": self.L, "T": self.T, "b": self.b, "N_min": self.N_min}
+        }
+        torch.save(data, path)
+        
+    def print_collision_summary(self):
+        """
+        Summarizes the collision landscape of the model after training.
+        Compares Effective vs. Informational load across levels.
+        """
+        print("\n" + "="*80)
+        print(f"{'LEVEL-WISE COLLISION ANALYSIS (EPOCH SUMMARY)':^80}")
+        print("="*80)
+        header = f"{'L':<3} | {'Res':<6} | {'Eff. Voxels':<12} | {'Eff. Coll%':<10} | {'Conflict (Var)':<15} | {'Avg Grad'}"
+        print(header)
+        print("-" * len(header))
+
+        for l in range(self.L):
+            # Calculate Resolution for display
+            N_l = int(math.floor(self.N_min * (self.b ** l)))
+            
+            # 1. Effective Collision Percentage
+            # (How many bins have more than 1 unique coordinate mapped to them)
+            eff_collided_bins = (self.eff_voxel_count[l] > 1).sum().item()
+            occupied_bins = (self.eff_voxel_count[l] > 0).sum().item()
+            eff_coll_pct = (eff_collided_bins / occupied_bins * 100) if occupied_bins > 0 else 0
+            
+            # 2. Informational Conflict (Variance of Gradients)
+            # Var = (Sum_Sq / N) - (Sum / N)^2
+            n = self.sample_count[l].float()
+            mask = n > 1 # Only calculate variance for bins with multiple samples
+            
+            mean_grad = self.grad_sum[l] / n
+            variance = (self.grad_sq_sum[l] / n) - (mean_grad ** 2)
+            avg_conflict = variance[mask].mean().item() if mask.any() else 0.0
+            
+            # 3. Overall Voxel Sparsity
+            total_eff_voxels = sum(len(s) for s in self.visited_voxels) if hasattr(self, 'visited_voxels') else 0
+            
+            print(f"{l+1:<3} | {N_l:<6} | {len(self.visited_voxels[l]):<12,} | {eff_coll_pct:<10.2f}% | {avg_conflict:<15.6f} | {mean_grad[mask].mean().item():.6f}")
+
+        print("="*80)
+        print(f"Total Unique Voxels Touched: {total_eff_voxels:,}")
+
 class OccupancyGrid:
-    """
-    A very lightweight/simple occupancy grid for testing purposes. 
-    """
+    """ A lightweight/simple occupancy grid. """
     def __init__(self, bound, res=0.1, device='cuda:0'):
         self.bound = bound
         self.res = res
@@ -97,23 +215,23 @@ class OccupancyGrid:
 class GridNGP(BaseNet):
     """
     An implementation similar to grid_net, but with the regular grid
-    replaced by a hash grid implemented using tiny-cuda-nn instantNGP
+    replaced by a hash grid implemented using tiny-cuda-nn / instantNGP
     hash grids. It only contains a subset of the functionality of grid_net.
-
-    # FIXME: Implement occupancy grid on top of hash grid!
     """
     def __init__(self,
         cfg: dict, 
         device = 'cuda:0',
-        dtype = torch.float32, # Use FP16?
+        dtype = torch.float32,
+        track_collisions = False
     ):
         super(GridNGP, self).__init__(cfg, device, dtype)    
         self.device = device
         self.dtype = dtype
+        self.track_collisions = track_collisions
         self.init_ngp(cfg)
         self.init_occupancy_grid(cfg)
         self.init_poses(cfg)
-    
+        
     def init_ngp(self, cfg):
         
         # TODO: Move config to another location.
@@ -177,6 +295,15 @@ class GridNGP(BaseNet):
         
         self.model = torch.nn.Sequential(self.encoding, self.network)
         self.print_trainable_params()
+        
+        # Collision tracker
+        if self.track_collisions:
+            self.tracker = CollisionTracker(
+                n_levels=config_encoding["n_levels"],
+                hashmap_size=2**config_encoding["log2_hashmap_size"],
+                base_res=config_encoding["base_resolution"],
+                per_level_scale=config_encoding["per_level_scale"]
+            )
         
     def init_occupancy_grid(self, cfg):
         self.occupancy_grid = OccupancyGrid(device=self.device, bound=self.bound)

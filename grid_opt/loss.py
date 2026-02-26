@@ -838,7 +838,11 @@ class MisoLossMappingBase(BaseLoss):
                     sdf_v = gt_sdf[valid_mask]
                     model.init_neural_points(coords_v, sdf_v)
 
-            
+        # NGP Grid collision tracking:
+        if isinstance(model, GridNGP):
+            if model.track_collisions:
+                model.tracker.track_step(coords_world, model.bound, sdf_loss)
+        
         return loss_dict
 
     def compute_clip(self, model, model_input: dict, gt: dict) -> dict:

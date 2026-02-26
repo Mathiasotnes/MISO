@@ -58,7 +58,7 @@ def initialize_scannet(args):
     dataset = utils_scannet.create_scannet_dataset(args.scannet_root, args.scene, n_rays=cfg['sample']['n_rays'], frame_downsample=1)
     cfg = create_configs_scannet(args, dataset)
 
-    hash_grid = GridNGP(cfg['model'], device=cfg['device'], dtype=torch.float32) 
+    hash_grid = GridNGP(cfg['model'], device=cfg['device'], dtype=torch.float32, track_collisions=True) 
     hash_grid.to(cfg['device'])
     
     return cfg, hash_grid, dataset
@@ -168,6 +168,11 @@ def main_scannet():
     cfg, hash_grid, dataset = initialize_scannet(args)
     
     mapping(cfg, hash_grid, dataset)
+    
+    # Save collision statistics
+    if hash_grid.track_collisions:
+        hash_grid.tracker.save("collision_stats.pt")
+        hash_grid.tracker.print_collision_summary()
     
     # Check Sparsity
     sparsity = calculate_model_sparsity(hash_grid)
