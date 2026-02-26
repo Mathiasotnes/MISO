@@ -53,14 +53,22 @@ class CollisionTracker:
     @torch.no_grad()
     def track_step(self, coords_world: torch.Tensor, bound: torch.Tensor, loss_vec: torch.Tensor):
         x = (coords_world - bound[:, 0]) / (bound[:, 1] - bound[:, 0])
-        g = loss_vec.detach().reshape(-1) # (Batch,)
+        valid_mask = (x >= 0).all(dim=-1) & (x < 1).all(dim=-1)
+        if not valid_mask.any():
+            return
+            
+        x = x[valid_mask]
+        g = loss_vec.detach().reshape(-1)[valid_mask]
+        
+        eps = 1e-6
+        x = torch.clamp(x, 0.0, 1.0 - eps)
         
         for l in range(self.L):
             res = math.floor(self.N_min * (self.b ** l))
-            base_v = torch.floor(x * res).long().clamp(min=0, max=res-1) # (Batch, 3)
+            base_v = torch.floor(x * res).long()
             
             # 8 corners per sample
-            all_v = (base_v.unsqueeze(0) + self.offsets.unsqueeze(1)).reshape(-1, 3) # (8*B, 3)
+            all_v = (base_v.unsqueeze(0) + self.offsets.unsqueeze(1)).reshape(-1, 3)
             indices = self.get_hash(all_v) # (8*B)
             
             # --- C_grad: Total Gradient Magnitude ---
@@ -95,62 +103,41 @@ class CollisionTracker:
         torch.save(data, path)
         
     def print_collision_summary(self):
-        """
-        Summarizes the collision landscape based on the spatial collision density analysis.
-        Calculates C_eff (Effective Collisions) and C_grad (Informational Load).
-        """
         print("\n" + "="*105)
         print(f"{'MHE SPATIAL COLLISION DENSITY ANALYSIS SUMMARY':^105}")
         print("="*105)
-        # Bins (Occ): Number of hash bins with C_eff > 0
-        # Avg C_eff: Mean number of unique active voxels per occupied bin
-        # Max C_eff: Worst-case aliasing at this level
-        # Total C_grad: Cumulative gradient magnitude (Informational Load)
-        # Avg Conflict: Mean variance in bins with C_eff > 1
+        # Bins (Occ): Unique hash indices touched
+        # Avg C_eff: Unique voxels mapped to a single hash index
+        # Total C_grad: Total gradient magnitude (importance)
+        # Avg Conflict: Variance of gradients in bins with >1 unique voxel
         header = f"{'L':<3} | {'Res':<5} | {'Bins (Occ)':<10} | {'Avg C_eff':<10} | {'Max C_eff':<10} | {'Total C_grad':<14} | {'Avg Conflict'}"
         print(header)
         print("-" * len(header))
 
         for l in range(self.L):
             N_l = int(math.floor(self.N_min * (self.b ** l)))
-            
-            # 1. Effective Collision Stats (C_eff)
-            # Find indices that are active at this level
             occ_mask = self.eff_voxel_count[l] > 0
-            occupied_bins = occ_mask.sum().item()
+            num_occ = occ_mask.sum().item()
             
-            if occupied_bins > 0:
-                c_eff_occ = self.eff_voxel_count[l][occ_mask].float()
-                avg_c_eff = c_eff_occ.mean().item()
-                max_c_eff = c_eff_occ.max().item()
+            if num_occ > 0:
+                c_eff_vals = self.eff_voxel_count[l][occ_mask].float()
+                avg_c_eff = c_eff_vals.mean().item()
+                max_c_eff = c_eff_vals.max().item()
+                total_grad = self.grad_sum[l].sum().item()
+                
+                # Conflict is only relevant where C_eff > 1 (actual collisions)
+                conflict_mask = (self.sample_count[l] > 1) & (self.eff_voxel_count[l] > 1)
+                if conflict_mask.any():
+                    n = self.sample_count[l][conflict_mask]
+                    mean_g = self.grad_sum[l][conflict_mask] / n
+                    var_g = (self.grad_sq_sum[l][conflict_mask] / n) - (mean_g ** 2)
+                    avg_conflict = var_g.mean().item()
+                else:
+                    avg_conflict = 0.0
             else:
-                avg_c_eff, max_c_eff = 0.0, 0
-            
-            # 2. Informational Load (C_grad)
-            total_c_grad = self.grad_sum[l].sum().item()
-            
-            # 3. Conflict Analysis (Variance)
-            # Var = E[X^2] - (E[X])^2
-            n = self.sample_count[l]
-            # We only care about conflict in bins that have samples and aliasing
-            conflict_mask = (n > 1) & (self.eff_voxel_count[l] > 1)
-            
-            if conflict_mask.any():
-                n_m = n[conflict_mask]
-                mean_g = self.grad_sum[l][conflict_mask] / n_m
-                var_g = (self.grad_sq_sum[l][conflict_mask] / n_m) - (mean_g ** 2)
-                avg_conflict = var_g.mean().item()
-            else:
-                avg_conflict = 0.0
+                avg_c_eff, max_c_eff, total_grad, avg_conflict = 0, 0, 0, 0
 
-            print(f"{l+1:<3} | {N_l:<5} | {occupied_bins:<10,} | {avg_c_eff:<10.2f} | {max_c_eff:<10} | {total_c_grad:<14.2e} | {avg_conflict:.6f}")
-
-        # Global Metadata
-        total_params = self.L * self.T
-        active_bins = (self.eff_voxel_count > 0).sum().item()
-        print("="*105)
-        print(f"Overall Hash Table Utilization: {active_bins:,} / {total_params:,} ({active_bins/total_params:.2%})")
-        print("="*105 + "\n")
+            print(f"{l+1:<3} | {N_l:<5} | {num_occ:<10,} | {avg_c_eff:<10.2f} | {max_c_eff:<10} | {total_grad:<14.2e} | {avg_conflict:.6f}")
 
 class OccupancyGrid:
     """ A lightweight/simple occupancy grid. """
