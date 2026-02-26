@@ -1,6 +1,8 @@
 import torch
 import math
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from grid_opt.utils.utils_eval import nn_correspondance, sample_points_from_mesh
 
@@ -205,7 +207,7 @@ def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
     for l in range(L):
         res = math.floor(cfg["N_min"] * (cfg["b"] ** l))
         v_base = torch.floor(x * res).long()
-        h_idx = (v_base[:, 0] * PI[0] ^ v_base[:, 1] * PI[1] ^ v_base[:, 2] * PI[2]) % T
+        h_idx = ((v_base[:, 0] * PI[0]) ^ (v_base[:, 1] * PI[1]) ^ (v_base[:, 2] * PI[2])) % T
         
         # Conflict = (1 - Dominance Ratio)
         aci_scores += (1.0 - r_dom_table[l, h_idx])
@@ -252,7 +254,9 @@ def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
     print("------------------------------------\n")
     
     # Save plot
-    plt.savefig("./disambiguation_analysis.png", dpi=300)
+    plt.tight_layout()
+    plt.savefig("./disambiguation_analysis.png", dpi=300, bbox_inches='tight')
+    plt.close() # Good practice to free memory on the cluster
     print("Disambiguation analysis plot saved as 'disambiguation_analysis.png'.")
 
 ###############################################################
