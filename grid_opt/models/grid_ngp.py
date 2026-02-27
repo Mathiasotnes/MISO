@@ -76,7 +76,6 @@ class CollisionTracker:
         x_valid, g = x[valid], loss_vec.detach().reshape(-1)[valid]
         x_valid = torch.clamp(x_valid, 0.0, 1.0 - 1e-6)
         
-        # Identify active hash bins via the library's internal logic
         with torch.enable_grad():
             h_indices_list = self._get_tcnn_indices(encoding, x_valid)
 
@@ -84,7 +83,7 @@ class CollisionTracker:
             res = math.floor(self.N_min * (self.b ** l))
             stride = res + 1
             
-            # 1. Update Geometric Voxel Importance (Manual grid math)
+            # Update Geometric Voxel Importance
             base_v = torch.floor(x_valid * res).long()
             all_v = (base_v.unsqueeze(0) + self.offsets_3d.unsqueeze(1)).reshape(-1, 3)
             v_idx = all_v[:, 0] + stride * (all_v[:, 1] + stride * all_v[:, 2])
@@ -92,16 +91,15 @@ class CollisionTracker:
             g_rep = g.repeat_interleave(8)
             v_idx_unique, v_inv = torch.unique(v_idx, return_inverse=True)
             
-            # Reduce importance to unique voxels in this batch
             batch_v_grads = torch.zeros(v_idx_unique.size(0), device='cuda')
             batch_v_grads.index_add_(0, v_inv, g_rep)
             self.voxel_grads[l].index_add_(0, v_idx_unique, batch_v_grads)
 
-            # 2. Update Hash Bin Statistics (TCNN Probed Indices)
+            # Update Hash Bin Statistics
             h_idx_batch = h_indices_list[l]
             if h_idx_batch.numel() == 0: continue
 
-            # Update C_eff: Attribute newly discovered voxels to the active bins
+            # Update C_eff
             new_mask = (self.voxel_bitfields[l][v_idx_unique] == 0)
             if new_mask.any():
                 num_new = new_mask.sum()
@@ -109,12 +107,13 @@ class CollisionTracker:
                 self.eff_voxel_count[l].index_add_(0, h_idx_batch, inc)
                 self.voxel_bitfields[l][v_idx_unique[new_mask]] = 1
 
-            # Attribute batch importance to the active hash bins
-            mean_g = batch_v_grads.mean()
-            max_g = batch_v_grads.max()
+            # Attribute batch importance
+            mean_g = batch_v_grads.mean().item()
+            max_g = batch_v_grads.max().item()
             
-            self.total_bin_grad[l].index_add_(0, h_idx_batch, torch.full_like(h_idx_batch, mean_g.item()))
-            self.max_voxel_grad[l].index_reduce_(0, h_idx_batch, torch.full_like(h_idx_batch, max_g.item()), reduce='amax', include_self=True)
+            # Use .float() to match total_bin_grad and max_voxel_grad
+            self.total_bin_grad[l].index_add_(0, h_idx_batch, torch.full_like(h_idx_batch, mean_g, dtype=torch.float32))
+            self.max_voxel_grad[l].index_reduce_(0, h_idx_batch, torch.full_like(h_idx_batch, max_g, dtype=torch.float32), reduce='amax', include_self=True)
 
     def save(self, path):
         torch.save({
