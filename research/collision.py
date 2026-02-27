@@ -161,110 +161,65 @@ def potential_collisions(h_func, N_min: int, T: int, L: int, b: float) -> None:
 
 def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
     """
-    Correlates per-vertex Chamfer Error (Accuracy) with the Aggregated Conflict Index (ACI).
+    Correlates per-vertex geometric error with the Spatial Conflict Index (C_grad).
     """
-    # 1. Load Collision Stats
-    print("Loading collision statistics...")
+    # 1. Load collision statistics and pre-compute R_dom table
     data = torch.load(stats_path)
-    cfg = data["config"]
-    L, T = cfg["L"], cfg["T"]
+    cfg, L, T = data["config"], data["config"]["L"], data["config"]["T"]
     PI = [1, 2654435761, 805459861]
     
-    # Pre-compute the R_dom table (L, T)
     r_dom_table = torch.ones((L, T))
     for l in range(L):
-        total_g = data["total_bin_grad"][l]
-        max_g = data["max_voxel_grad"][l]
-        # Only compute for occupied bins with actual collisions
         occ = data["eff_voxel_count"][l] > 1 
-        r_dom_table[l, occ] = max_g[occ] / total_g[occ].clamp(min=1e-6)
+        r_dom_table[l, occ] = data["max_voxel_grad"][l][occ] / data["total_bin_grad"][l][occ].clamp(min=1e-6)
 
-    # 2. Extract Geometry and Calculate Per-Point Error
-    print("Sampling meshes and calculating correspondence...")
-    # Using your existing sampling logic
+    # 2. Extract surface points and calculate per-vertex Chamfer Accuracy
     verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
     verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
     
-    # Use your verified correspondence function (we need the raw dist_p vector)
-    # dist_p[i] is the distance from predicted vertex i to the nearest GT point
-    truncation_acc = 0.5
-    _, dist_p = nn_correspondance(verts_pred, verts_trgt, truncation_acc, True)  # Pred -> GT
-    dist_p = np.array(dist_p) # Shape: (N,)
+    # Forward correspondence: distance from each predicted vertex to nearest GT point
+    _, dist_p = nn_correspondance(verts_pred, verts_trgt, truncation=0.5, forward=True)
+    dist_p = np.array(dist_p)
 
-    # 3. Calculate ACI for every Predicted Vertex (using ACI_max)
-    print("Calculating ACI_max for predicted vertices...")
+    # 3. Calculate C_grad scores (Sum of 1-R_dom across all layers)
     verts_torch = torch.from_numpy(verts_pred).float()
-    
-    b_min = bound[:, 0]
-    b_max = bound[:, 1]
-    
-    x = (verts_torch - b_min) / (b_max - b_min)
+    x = (verts_torch - bound[:, 0]) / (bound[:, 1] - bound[:, 0])
     x = torch.clamp(x, 0.0, 1.0 - 1e-6)
     
-    # Initialize with zeros; we will take the element-wise maximum across levels
-    aci_scores = torch.zeros(len(verts_pred))
-    
+    c_grad_scores = torch.zeros(len(verts_pred))
     for l in range(L):
         res = math.floor(cfg["N_min"] * (cfg["b"] ** l))
         v_base = torch.floor(x * res).long()
         h_idx = ((v_base[:, 0] * PI[0]) ^ (v_base[:, 1] * PI[1]) ^ (v_base[:, 2] * PI[2])) % T
-        
-        # Conflict = (1 - Dominance Ratio)
-        level_conflict = (1.0 - r_dom_table[l, h_idx])
-        
-        # Take the maximum conflict encountered across all resolutions for each point
-        aci_scores = torch.maximum(aci_scores, level_conflict)
+        c_grad_scores += (1.0 - r_dom_table[l, h_idx])
 
-    # 4. Statistical Analysis
-    aci_np = aci_scores.numpy()
-    
-    if len(aci_np) != len(dist_p):
-        print(f"Warning: Size mismatch. ACI: {len(aci_np)}, Dist: {len(dist_p)}. Slicing ACI to match.")
-        aci_np = aci_np[:len(dist_p)]
-    
-    # Filter out extreme outliers (if any) to keep the plot readable
-    mask = dist_p < 0.10 # Ignore errors > 10cm for the trend analysis
-    aci_filtered = aci_np[mask]
-    error_filtered = dist_p[mask]
+    # 4. Statistical Analysis and Visualization
+    c_grad_np = c_grad_scores.numpy()[:len(dist_p)]
+    mask = dist_p < 0.10  # Filter outliers > 10cm for trend clarity
+    c_grad_f, error_f = c_grad_np[mask], dist_p[mask]
 
-    # Create the Disambiguation Power Plot
     plt.figure(figsize=(10, 6))
-    plt.hexbin(aci_filtered, error_filtered, gridsize=50, cmap='YlOrRd', mincnt=1)
+    plt.hexbin(c_grad_f, error_f, gridsize=50, cmap='YlOrRd', mincnt=1)
     
-    # Calculate Trendline (Disambiguation Power)
-    bins = np.linspace(aci_filtered.min(), aci_filtered.max(), 40)
+    # Compute trendline via binned averages
+    bins = np.linspace(c_grad_f.min(), c_grad_f.max(), 40)
     bin_centers = (bins[:-1] + bins[1:]) / 2
-    bin_idx = np.digitize(aci_filtered, bins)
-    
-    bin_means = []
-    for i in range(1, len(bins)):
-        if np.any(bin_idx == i):
-            bin_means.append(error_filtered[bin_idx == i].mean())
-        else:
-            bin_means.append(np.nan)
+    bin_means = np.array([error_f[np.digitize(c_grad_f, bins) == i].mean() for i in range(1, len(bins))])
     
     valid = ~np.isnan(bin_means)
-    plt.plot(bin_centers[valid], np.array(bin_means)[valid], color='blue', lw=3, label='Disambiguation Slope')
+    plt.plot(bin_centers[valid], bin_means[valid], color='blue', lw=3, label='Disambiguation Slope')
     
-    plt.xlabel("Aggregated Conflict Index (Theoretical Hash Noise)")
-    plt.ylabel("Chamfer Accuracy Error (meters)")
+    # Sensitivity Metric (Linear Fit)
+    slope, intercept = np.polyfit(bin_centers[valid], bin_means[valid], 1)
+    print(f"\nSensitivity Slope: {slope:.8f} | Base Error: {intercept:.4f}m")
+
+    plt.xlabel("Spatial Conflict Index C_grad(x)"); plt.ylabel("Chamfer Accuracy (m)")
     plt.title("Decoder Disambiguation Analysis: Conflict vs. Geometric Accuracy")
-    plt.colorbar(label='Point Density')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    plt.colorbar(label='Point Density'); plt.legend(); plt.grid(True, alpha=0.3)
     
-    # Linear Fit to get the "Sensitivity Number"
-    slope, intercept = np.polyfit(bin_centers[valid], np.array(bin_means)[valid], 1)
-    print(f"\n--- DISAMBIGUATION POWER METRIC ---")
-    print(f"Sensitivity Slope: {slope:.8f} (Error increase per conflict unit)")
-    print(f"Base Error (Intercept): {intercept:.4f} m")
-    print("------------------------------------\n")
-    
-    # Save plot
     plt.tight_layout()
     plt.savefig("./disambiguation_analysis.png", dpi=300, bbox_inches='tight')
-    plt.close() # Good practice to free memory on the cluster
-    print("Disambiguation analysis plot saved as 'disambiguation_analysis.png'.")
+    plt.close()
 
 ###############################################################
 # Main Program Entry
