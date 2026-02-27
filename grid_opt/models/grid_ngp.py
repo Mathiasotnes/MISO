@@ -20,7 +20,7 @@ class CollisionTracker:
         self.N_min, self.b = base_res, per_level_scale
         self.n_feats = n_feats
         
-        # Performance buffers
+        # Accumulators
         self.eff_voxel_count = torch.zeros((self.L, self.T), dtype=torch.long, device='cuda')
         self.max_voxel_grad = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
         self.total_bin_grad = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
@@ -29,7 +29,6 @@ class CollisionTracker:
         self.voxel_bitfields = []
         self.level_offsets = []
         
-        # Calculate memory offsets matching TCNN's contiguous parameter layout
         current_offset = 0
         alignment = 16 
         for l in range(self.L):
@@ -46,36 +45,54 @@ class CollisionTracker:
 
     def _get_tcnn_indices(self, encoding, x):
         """
-        Extracts the active hash indices for the current batch via gradient probing.
+        Non-intrusive gradient probing. 
+        Backs up, clears, probes, and restores gradients.
         """
-        x_probe = x.detach().requires_grad_(True)
-        features = encoding(x_probe)
+        # 1. Detach coordinate to ensure no graph-leakage to the rest of the model
+        x_probe = x.detach().clone().requires_grad_(True)
         
+        # 2. Backup current gradients
+        original_grads = None
+        if encoding.params.grad is not None:
+            original_grads = encoding.params.grad.clone()
+        
+        # 3. Isolated Probe
         encoding.params.grad = None
+        features = encoding(x_probe)
         features.sum().backward()
         
         all_indices = []
-        global_grad = encoding.params.grad
+        probe_grad = encoding.params.grad
         
-        for l in range(self.L):
-            start = self.level_offsets[l]
-            level_slice = global_grad[start : start + (self.T * self.n_feats)]
-            
-            # Identify unique bins with non-zero gradients in this step
-            bin_usage = (level_slice.reshape(-1, self.n_feats) != 0).any(dim=1)
-            all_indices.append(torch.where(bin_usage)[0])
-            
+        if probe_grad is not None:
+            for l in range(self.L):
+                start = self.level_offsets[l]
+                level_slice = probe_grad[start : start + (self.T * self.n_feats)]
+                bin_usage = (level_slice.reshape(-1, self.n_feats) != 0).any(dim=1)
+                all_indices.append(torch.where(bin_usage)[0])
+        else:
+            # Fallback for empty batch
+            all_indices = [torch.tensor([], device='cuda', dtype=torch.long) for _ in range(self.L)]
+
+        # 4. Restore original gradients
+        encoding.params.grad = original_grads
+        
         return all_indices
 
     @torch.no_grad()
     def track_step(self, coords_world, bound, loss_vec, encoding):
+        # Detach everything immediately
+        coords_world = coords_world.detach()
+        loss_vec = loss_vec.detach()
+
         x = (coords_world - bound[:, 0]) / (bound[:, 1] - bound[:, 0])
         valid = (x >= 0).all(dim=-1) & (x < 1).all(dim=-1)
         if not valid.any(): return
             
-        x_valid, g = x[valid], loss_vec.detach().reshape(-1)[valid]
-        x_valid = torch.clamp(x_valid, 0.0, 1.0 - 1e-6)
+        x_valid = torch.clamp(x[valid], 0.0, 1.0 - 1e-6)
+        g = loss_vec.reshape(-1)[valid]
         
+        # Run probe with gradient isolation
         with torch.enable_grad():
             h_indices_list = self._get_tcnn_indices(encoding, x_valid)
 
@@ -83,7 +100,6 @@ class CollisionTracker:
             res = math.floor(self.N_min * (self.b ** l))
             stride = res + 1
             
-            # Update Geometric Voxel Importance
             base_v = torch.floor(x_valid * res).long()
             all_v = (base_v.unsqueeze(0) + self.offsets_3d.unsqueeze(1)).reshape(-1, 3)
             v_idx = all_v[:, 0] + stride * (all_v[:, 1] + stride * all_v[:, 2])
@@ -91,11 +107,10 @@ class CollisionTracker:
             g_rep = g.repeat_interleave(8)
             v_idx_unique, v_inv = torch.unique(v_idx, return_inverse=True)
             
-            batch_v_grads = torch.zeros(v_idx_unique.size(0), device='cuda')
+            batch_v_grads = torch.zeros(v_idx_unique.size(0), device='cuda', dtype=torch.float32)
             batch_v_grads.index_add_(0, v_inv, g_rep)
             self.voxel_grads[l].index_add_(0, v_idx_unique, batch_v_grads)
 
-            # Update Hash Bin Statistics
             h_idx_batch = h_indices_list[l]
             if h_idx_batch.numel() == 0: continue
 
@@ -107,11 +122,10 @@ class CollisionTracker:
                 self.eff_voxel_count[l].index_add_(0, h_idx_batch, inc)
                 self.voxel_bitfields[l][v_idx_unique[new_mask]] = 1
 
-            # Attribute batch importance
+            # Update importance
             mean_g = batch_v_grads.mean().item()
             max_g = batch_v_grads.max().item()
             
-            # Use .float() to match total_bin_grad and max_voxel_grad
             self.total_bin_grad[l].index_add_(0, h_idx_batch, torch.full_like(h_idx_batch, mean_g, dtype=torch.float32))
             self.max_voxel_grad[l].index_reduce_(0, h_idx_batch, torch.full_like(h_idx_batch, max_g, dtype=torch.float32), reduce='amax', include_self=True)
 
