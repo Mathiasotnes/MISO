@@ -191,17 +191,17 @@ def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
     _, dist_p = nn_correspondance(verts_pred, verts_trgt, truncation_acc, True)  # Pred -> GT
     dist_p = np.array(dist_p) # Shape: (N,)
 
-    # 3. Calculate ACI for every Predicted Vertex
-    print("Calculating ACI for predicted vertices...")
+    # 3. Calculate ACI for every Predicted Vertex (using ACI_max)
+    print("Calculating ACI_max for predicted vertices...")
     verts_torch = torch.from_numpy(verts_pred).float()
     
-    # Correct Normalization:
     b_min = bound[:, 0]
     b_max = bound[:, 1]
     
     x = (verts_torch - b_min) / (b_max - b_min)
     x = torch.clamp(x, 0.0, 1.0 - 1e-6)
     
+    # Initialize with zeros; we will take the element-wise maximum across levels
     aci_scores = torch.zeros(len(verts_pred))
     
     for l in range(L):
@@ -210,7 +210,10 @@ def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
         h_idx = ((v_base[:, 0] * PI[0]) ^ (v_base[:, 1] * PI[1]) ^ (v_base[:, 2] * PI[2])) % T
         
         # Conflict = (1 - Dominance Ratio)
-        aci_scores += (1.0 - r_dom_table[l, h_idx])
+        level_conflict = (1.0 - r_dom_table[l, h_idx])
+        
+        # Take the maximum conflict encountered across all resolutions for each point
+        aci_scores = torch.maximum(aci_scores, level_conflict)
 
     # 4. Statistical Analysis
     aci_np = aci_scores.numpy()
