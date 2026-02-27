@@ -160,30 +160,48 @@ def potential_collisions(h_func, N_min: int, T: int, L: int, b: float) -> None:
         print(f"{l_idx+1:<6} | {N_l:<10} | {total_vertices:<14} | {collision_ratio:>12.2%} | {avg_load:.4f}")
 
 def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
-    """
-    Correlates per-vertex geometric error with the Spatial Conflict Index (C_grad).
-    """
-    # 1. Load collision statistics and pre-compute R_dom table
+    """ Correlates per-vertex Accuracy with C_grad and prints layer-wise conflict stats. """
     data = torch.load(stats_path)
     cfg, L, T = data["config"], data["config"]["L"], data["config"]["T"]
     PI = [1, 2654435761, 805459861]
     
     r_dom_table = torch.ones((L, T))
-    for l in range(L):
-        occ = data["eff_voxel_count"][l] > 1 
-        r_dom_table[l, occ] = data["max_voxel_grad"][l][occ] / data["total_bin_grad"][l][occ].clamp(min=1e-6)
+    
+    print("\n" + "="*100)
+    print(f"{'LAYER-WISE SPATIAL CONFLICT ANALYSIS (1 - R_dom)':^100}")
+    print("="*100)
+    print(f"{'L':<3} | {'Res':<6} | {'Bins (Occ)':<12} | {'C_grad (Min / Avg / Max)':<35}")
+    print("-" * 100)
 
-    # 2. Extract surface points and calculate per-vertex Chamfer Accuracy
+    for l in range(L):
+        # Calculate R_dom for bins with effective collisions (C_eff > 1)
+        # Bins with C_eff <= 1 have R_dom = 1.0 (no conflict)
+        occ = data["eff_voxel_count"][l] > 1 
+        num_occ = occ.sum().item()
+        res = math.floor(cfg["N_min"] * (cfg["b"] ** l))
+        
+        if num_occ > 0:
+            r_dom_vals = data["max_voxel_grad"][l][occ] / data["total_bin_grad"][l][occ].clamp(min=1e-6)
+            r_dom_table[l, occ] = r_dom_vals
+            
+            # Level Conflict = 1 - R_dom
+            conflicts = 1.0 - r_dom_vals
+            c_str = f"{conflicts.min():.4f} / {conflicts.mean():.4f} / {conflicts.max():.4f}"
+            print(f"{l+1:<3} | {res:<6} | {num_occ:<12,} | {c_str:<35}")
+        else:
+            print(f"{l+1:<3} | {res:<6} | {'0':<12} | {'0.0000 / 0.0000 / 0.0000':<35}")
+
+    # Calculate distance to closest point in GT as error
     verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
     verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
     
-    # Forward correspondence: distance from each predicted vertex to nearest GT point
-    _, dist_p = nn_correspondance(verts_pred, verts_trgt, truncation=0.5, forward=True)
+    _, dist_p = nn_correspondance(verts_pred, verts_trgt, 0.50, True) 
     dist_p = np.array(dist_p)
 
-    # 3. Calculate C_grad scores (Sum of 1-R_dom across all layers)
+    # Calculate conflict C_grad(x)
     verts_torch = torch.from_numpy(verts_pred).float()
-    x = (verts_torch - bound[:, 0]) / (bound[:, 1] - bound[:, 0])
+    b_min, b_max = bound[:, 0], bound[:, 1]
+    x = (verts_torch - b_min) / (b_max - b_min)
     x = torch.clamp(x, 0.0, 1.0 - 1e-6)
     
     c_grad_scores = torch.zeros(len(verts_pred))
@@ -193,29 +211,38 @@ def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
         h_idx = ((v_base[:, 0] * PI[0]) ^ (v_base[:, 1] * PI[1]) ^ (v_base[:, 2] * PI[2])) % T
         c_grad_scores += (1.0 - r_dom_table[l, h_idx])
 
-    # 4. Statistical Analysis and Visualization
+    # 4. Filter and Analyze Trends
     c_grad_np = c_grad_scores.numpy()[:len(dist_p)]
-    mask = dist_p < 0.10  # Filter outliers > 10cm for trend clarity
-    c_grad_f, error_f = c_grad_np[mask], dist_p[mask]
+    mask = dist_p < 0.10 # Filter outliers for cleaner trendline
+    c_f, e_f = c_grad_np[mask], dist_p[mask]
 
+    # Initialize Plot
     plt.figure(figsize=(10, 6))
-    plt.hexbin(c_grad_f, error_f, gridsize=50, cmap='YlOrRd', mincnt=1)
+    plt.hexbin(c_f, e_f, gridsize=60, cmap='YlOrRd', mincnt=1)
     
-    # Compute trendline via binned averages
-    bins = np.linspace(c_grad_f.min(), c_grad_f.max(), 40)
+    # Compute Trendline via Binned Averages
+    bins = np.linspace(c_f.min(), c_f.max(), 40)
     bin_centers = (bins[:-1] + bins[1:]) / 2
-    bin_means = np.array([error_f[np.digitize(c_grad_f, bins) == i].mean() for i in range(1, len(bins))])
+    bin_means = np.array([e_f[np.digitize(c_f, bins) == i].mean() for i in range(1, len(bins))])
     
     valid = ~np.isnan(bin_means)
     plt.plot(bin_centers[valid], bin_means[valid], color='blue', lw=3, label='Disambiguation Slope')
     
     # Sensitivity Metric (Linear Fit)
     slope, intercept = np.polyfit(bin_centers[valid], bin_means[valid], 1)
-    print(f"\nSensitivity Slope: {slope:.8f} | Base Error: {intercept:.4f}m")
+    print("="*100)
+    print(f"OVERALL DISAMBIGUATION POWER")
+    print(f" * Sensitivity Slope: {slope:.8f} (m per conflict unit)")
+    print(f" * Intercept (Base):  {intercept:.4f} m")
+    print("="*100 + "\n")
 
-    plt.xlabel("Spatial Conflict Index C_grad(x)"); plt.ylabel("Chamfer Accuracy (m)")
+    # Finalize and Save Plot
+    plt.xlabel("Spatial Conflict Index $C_{grad}(\mathbf{x})$")
+    plt.ylabel("Accuracy Error (m)")
     plt.title("Decoder Disambiguation Analysis: Conflict vs. Geometric Accuracy")
-    plt.colorbar(label='Point Density'); plt.legend(); plt.grid(True, alpha=0.3)
+    plt.colorbar(label='Point Density')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig("./disambiguation_analysis.png", dpi=300, bbox_inches='tight')
