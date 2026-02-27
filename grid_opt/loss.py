@@ -890,7 +890,7 @@ class MisoLossMappingBase(BaseLoss):
                     sample_weights=sample_weights,
                     loss_type=self.loss_type
                 )
-                model.tracker.track_step(coords_world, model.bound, sdf_loss_vector)
+                model.tracker.track_step(coords_world, model.bound, sdf_loss_vector, model.encoding)
         
         return loss_dict
 

@@ -15,71 +15,111 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 class CollisionTracker:
-    def __init__(self, n_levels=16, hashmap_size=2**15, base_res=16, per_level_scale=1.26):
+    def __init__(self, n_levels=16, hashmap_size=2**15, base_res=16, per_level_scale=1.26, n_feats=2):
         self.L, self.T = n_levels, hashmap_size
         self.N_min, self.b = base_res, per_level_scale
-        self.PI = torch.tensor([1, 2654435761, 805459861], device='cuda', dtype=torch.long)
+        self.n_feats = n_feats
         
-        # C_eff: Unique vertices per hash bin
+        # Tracking buffers
         self.eff_voxel_count = torch.zeros((self.L, self.T), dtype=torch.long, device='cuda')
-        
-        # Dominance tracking buffers
         self.max_voxel_grad = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
         self.total_bin_grad = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
 
         self.voxel_grads = []
         self.voxel_bitfields = []
+        self.level_offsets = []
         
+        # Calculate level offsets matching TCNN memory alignment
+        current_offset = 0
+        alignment = 16 
         for l in range(self.L):
             res = math.floor(self.N_min * (self.b ** l))
             num_verts = (res + 1) ** 3
-            # Accumulate G(l, v) per unique voxel
             self.voxel_grads.append(torch.zeros(num_verts, dtype=torch.float32, device='cuda'))
             self.voxel_bitfields.append(torch.zeros(num_verts, dtype=torch.uint8, device='cuda'))
+            
+            self.level_offsets.append(current_offset)
+            params_in_level = min(self.T, num_verts) * self.n_feats
+            current_offset += math.ceil(params_in_level / alignment) * alignment
 
-        self.offsets = torch.stack(torch.meshgrid([torch.tensor([0, 1])] * 3, indexing='ij')).reshape(3, -1).t().to('cuda')
+        self.offsets_3d = torch.stack(torch.meshgrid([torch.tensor([0, 1])] * 3, indexing='ij')).reshape(3, -1).t().to('cuda')
 
-    def get_hash(self, coords: torch.Tensor) -> torch.Tensor:
-        h = (coords[:, 0] * self.PI[0]) ^ (coords[:, 1] * self.PI[1]) ^ (coords[:, 2] * self.PI[2])
-        return h % self.T
-    
+    def _get_tcnn_indices(self, encoding, x):
+        """
+        Extracts the hash indices for all levels simultaneously via gradient probing.
+        Returns a list of 1D tensors, one for each level.
+        """
+        # Ensure gradients are enabled for probing
+        x_probe = x.detach().requires_grad_(True)
+        features = encoding(x_probe)
+        
+        encoding.params.grad = None
+        features.sum().backward()
+        
+        # Identify non-zero indices in the parameter gradient buffer
+        all_indices = []
+        global_grad = encoding.params.grad
+        
+        for l in range(self.L):
+            start = self.level_offsets[l]
+            level_slice = global_grad[start : start + (self.T * self.n_feats)]
+            
+            # Reshape to (T, n_feats) to identify which bins were accessed
+            bin_usage = (level_slice.reshape(-1, self.n_feats) != 0).any(dim=1)
+            all_indices.append(torch.where(bin_usage)[0])
+            
+        return all_indices
+
     @torch.no_grad()
-    def track_step(self, coords_world: torch.Tensor, bound: torch.Tensor, loss_vec: torch.Tensor):
+    def track_step(self, coords_world, bound, loss_vec, encoding):
         x = (coords_world - bound[:, 0]) / (bound[:, 1] - bound[:, 0])
         valid = (x >= 0).all(dim=-1) & (x < 1).all(dim=-1)
         if not valid.any(): return
             
-        x, g = x[valid], loss_vec.detach().reshape(-1)[valid]
-        x = torch.clamp(x, 0.0, 1.0 - 1e-6)
+        x_valid, g = x[valid], loss_vec.detach().reshape(-1)[valid]
+        x_valid = torch.clamp(x_valid, 0.0, 1.0 - 1e-6)
         
+        # Get ground-truth indices from TCNN
+        with torch.enable_grad():
+            h_indices_list = self._get_tcnn_indices(encoding, x_valid)
+
         for l in range(self.L):
             res = math.floor(self.N_min * (self.b ** l))
             stride = res + 1
-            base_v = torch.floor(x * res).long()
-            all_v = (base_v.unsqueeze(0) + self.offsets.unsqueeze(1)).reshape(-1, 3)
-            v_idx = all_v[:,0] + stride*(all_v[:,1] + stride*all_v[:,2])
-            h_idx = self.get_hash(all_v)
-
-            # 1. Update G(l, v) and Bin Totals
+            
+            # Geometric vertex tracking (Manual grid math)
+            base_v = torch.floor(x_valid * res).long()
+            all_v = (base_v.unsqueeze(0) + self.offsets_3d.unsqueeze(1)).reshape(-1, 3)
+            v_idx = all_v[:, 0] + stride * (all_v[:, 1] + stride * all_v[:, 2])
+            
             g_rep = g.repeat_interleave(8)
             self.voxel_grads[l].index_add_(0, v_idx, g_rep)
-            self.total_bin_grad[l].index_add_(0, h_idx, g_rep)
 
-            # 2. C_eff logic: Identify unique voxels in batch
-            v_idx_batch, inv = torch.unique(v_idx, return_inverse=True)
-            perm = torch.arange(inv.size(0), dtype=inv.dtype, device=inv.device)
-            first_idx = torch.empty(v_idx_batch.size(0), dtype=inv.dtype, device=inv.device).scatter_(0, inv, perm)
-            h_idx_batch = h_idx[first_idx]
+            # Hash bin tracking (TCNN indices)
+            h_idx_batch = h_indices_list[l]
+            if h_idx_batch.numel() == 0: continue
 
-            # Update C_eff globally
-            new_mask = (self.voxel_bitfields[l][v_idx_batch] == 0)
-            if new_mask.any():
-                self.eff_voxel_count[l].index_add_(0, h_idx_batch[new_mask], torch.ones_like(h_idx_batch[new_mask]))
-                self.voxel_bitfields[l][v_idx_batch[new_mask]] = 1
+            # Update C_eff and Total Bin Importance
+            # We attribute batch energy to the identified active bins
+            self.total_bin_grad[l].index_add_(0, h_idx_batch, g_rep[:h_idx_batch.size(0)])
 
-            # 3. Update Max Voxel Importance per Bin (Winner-takes-all tracking)
-            current_v_grads = self.voxel_grads[l][v_idx_batch]
-            self.max_voxel_grad[l].index_reduce_(0, h_idx_batch, current_v_grads, reduce='amax', include_self=True)
+            v_idx_unique = torch.unique(v_idx)
+            new_voxels = (self.voxel_bitfields[l][v_idx_unique] == 0)
+            if new_voxels.any():
+                self.eff_voxel_count[l].index_add_(0, h_idx_batch, torch.ones_like(h_idx_batch))
+                self.voxel_bitfields[l][v_idx_unique[new_voxels]] = 1
+
+            # Update winner-takes-all importance
+            current_v_grads = self.voxel_grads[l][v_idx_unique]
+            self.max_voxel_grad[l].index_reduce_(0, h_idx_batch, current_v_grads[:h_idx_batch.size(0)], reduce='amax', include_self=True)
+
+    def save(self, path):
+        torch.save({
+            "eff_voxel_count": self.eff_voxel_count.cpu(),
+            "max_voxel_grad": self.max_voxel_grad.cpu(),
+            "total_bin_grad": self.total_bin_grad.cpu(),
+            "config": {"L": self.L, "T": self.T, "b": self.b, "N_min": self.N_min}
+        }, path)
 
     def print_collision_summary(self):
         print("\n" + "="*125)

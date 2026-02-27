@@ -28,6 +28,53 @@ def manual_spatial_hash(coords, T, res):
     h = h_x ^ h_y ^ h_z
     return h.to(torch.uint32).long() % T
 
+def verify_probing_strategy(n_levels=16, log2_T=15, base_res=16, scale=1.26):
+    T = 2**log2_T
+    tcnn_config = {
+        "otype": "HashGrid",
+        "n_levels": n_levels,
+        "n_features_per_level": 1,
+        "log2_hashmap_size": log2_T,
+        "base_resolution": base_res,
+        "per_level_scale": scale,
+    }
+    encoding = tcnn.Encoding(3, tcnn_config).cuda()
+    
+    # 1. Choose a target level and a coordinate inside a voxel
+    target_level = n_levels - 1
+    res_l = math.floor(base_res * (scale ** target_level))
+    test_voxel = torch.tensor([5, 5, 5], device='cuda') 
+    normalized_input = (test_voxel.float() + 0.5) / res_l # Center of the voxel
+    
+    # 2. Extract indices via Gradient Probing
+    encoding.params.grad = None
+    input_batch = normalized_input.view(1, 3).requires_grad_(True)
+    
+    output = encoding(input_batch)
+    loss = output[0, target_level].sum()
+    loss.backward()
+    
+    # These are the "Truth" indices according to the library
+    tcnn_indices = torch.where(encoding.params.grad != 0)[0]
+    
+    # 3. Perform the Round-Trip Test
+    with torch.no_grad():
+        encoding.params.fill_(0.0) # Reset everything
+        encoding.params[tcnn_indices] = 1.0 # Set probed indices to 1.0
+        
+        # New forward pass
+        verified_output = encoding(normalized_input.view(1, 3))
+        target_val = verified_output[0, target_level].item()
+
+    # 4. Results
+    print(f"\nVerification for Resolution: {res_l}")
+    print(f"Number of indices identified: {len(tcnn_indices)}")
+    
+    if math.isclose(target_val, 1.0, rel_tol=1e-3):
+        print(f"✅ ROUND-TRIP SUCCESS: Probed indices produced {target_val:.4f}")
+    else:
+        print(f"❌ ROUND-TRIP FAILURE: Probed indices produced {target_val:.4f}")
+
 def verify_tcnn_hash(n_levels=16, log2_T=15, base_res=16, scale=1.26):
     T = 2**log2_T
     tcnn_config = {
@@ -89,4 +136,5 @@ def verify_tcnn_hash(n_levels=16, log2_T=15, base_res=16, scale=1.26):
 if __name__ == "__main__":
     verify_tcnn_hash(n_levels=1, log2_T=15, base_res=16, scale=1.26)
     verify_tcnn_hash(n_levels=16, log2_T=15, base_res=16, scale=1.26)
+    verify_probing_strategy(n_levels=16, log2_T=15, base_res=16, scale=1.26)
     
