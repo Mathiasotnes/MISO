@@ -13,12 +13,15 @@ import math
 # Verification Implementations
 ###############################################################
 
-def manual_spatial_hash(coords, T):
-    """ Matches TCNN bitwise XOR hashing logic using long for math to avoid CUDA errors. """
-    PI = [1, 2654435761, 805459861]
+def manual_spatial_hash(coords, T, res):
+    """ Matches TCNN bitwise XOR hashing logic using long for math to avoid CUDA errors. 
+    Uses linear indexing when the grid size is small enough to fit in the hash table. """
+    if (res + 1)**3 <= T:
+        return coords[:, 0] + coords[:, 1] * (res + 1) + coords[:, 2] * (res + 1)**2
     
     # Perform multiplication in 64-bit to avoid PyTorch uint32 errors
     # then cast to 32-bit to simulate the 32-bit overflow TCNN expects
+    PI = [1, 2654435761, 805459861]
     h_x = (coords[:, 0].long() * PI[0]).to(torch.int32)
     h_y = (coords[:, 1].long() * PI[1]).to(torch.int32)
     h_z = (coords[:, 2].long() * PI[2]).to(torch.int32)
@@ -37,55 +40,53 @@ def verify_tcnn_hash(n_levels=16, log2_T=15, base_res=16, scale=1.26):
     }
     encoding = tcnn.Encoding(3, tcnn_config).cuda()
     
-    with torch.no_grad():
-        encoding.params.fill_(0.0)
-
-    # Targeting the finest layer (l = L - 1)
+    # Targeting the finest layer for validation
     target_level = n_levels - 1
     res_l = math.floor(base_res * (scale ** target_level))
     
-    # Test coordinate
+    # Test coordinate in the center of a voxel
     test_voxel = torch.tensor([5, 5, 5], device='cuda') 
     normalized_input = (test_voxel.float() + 0.5) / res_l
     
-    # Calculate the 8 corners of this voxel
+    # Predict indices manually
     offsets = torch.stack(torch.meshgrid([torch.tensor([0, 1])] * 3, indexing='ij')).reshape(3, -1).t().cuda()
-    corners = test_voxel + offsets # Shape: (8, 3)
-    
-    # Compute manual hash indices for these 8 corners
-    local_indices = manual_spatial_hash(corners, T)
+    corners = test_voxel + offsets
+    local_indices = manual_spatial_hash(corners, T, res_l)
 
-    # Calculate the global offset in the TCNN parameter vector
-    # Level l params start after all params of levels 0 through l-1.
-    # Each level has T parameters if (res+1)^3 > T, otherwise it has (res+1)^3.
     global_offset = 0
     for l in range(target_level):
         lvl_res = math.floor(base_res * (scale ** l))
-        # TCNN chooses the minimum of the grid size and the hash table size
         global_offset += min(T, (lvl_res + 1)**3)
 
-    # Set these 8 specific memory locations to 1.0
-    with torch.no_grad():
-        global_indices = global_offset + local_indices
-        encoding.params[global_indices] = 1.0
-    
-    # TCNN output will be the trilinear interpolation of these 8 corners.
-    # Since we set all 8 to 1.0, the result should be 1.0.
-    output = encoding(normalized_input.view(1, 3))
-    
-    # Extract only the target level's feature (TCNN concatenates all level outputs)
-    target_level_output = output[0, target_level] 
+    manual_indices = (global_offset + local_indices).sort().values
 
-    if torch.allclose(target_level_output, torch.tensor(1.0).cuda(), atol=1e-3):
-        print(f"✅ SUCCESS: Finest Level ({target_level}) hash verified.")
-        print(f"   Resolution: {res_l}, Global Offset: {global_offset}")
+    # Extract indices from TCNN via Gradients
+    encoding.params.grad = None # Ensure clean gradients
+    input_batch = normalized_input.view(1, 3).requires_grad_(True)
+    
+    output = encoding(input_batch)
+    # Sum only the feature of our target level to avoid noise from other layers
+    loss = output[0, target_level].sum()
+    loss.backward()
+
+    # The indices with non-zero gradients are the ones TCNN actually used
+    tcnn_indices = torch.where(encoding.params.grad != 0)[0].sort().values
+
+    # Results
+    print(f"\nMode: {'Linear' if (res_l+1)**3 <= T else 'Hash'} | Resolution: {res_l}")
+    print(f"Manual Indices: {manual_indices.tolist()}")
+    print(f"TCNN   Indices: {tcnn_indices.tolist()}")
+
+    if torch.equal(manual_indices, tcnn_indices):
+        print("✅ SUCCESS: Manual indices match TCNN exactly.")
     else:
-        print(f"❌ FAILURE: Expected 1.0, got {target_level_output.item()}. Check indexing logic.")
-
+        print("❌ FAILURE: Index mismatch detected.")
 
 ###############################################################
 # Verification Implementations
 ###############################################################
 
 if __name__ == "__main__":
-    verify_tcnn_hash()
+    verify_tcnn_hash(n_levels=1, log2_T=15, base_res=16, scale=1.26)
+    verify_tcnn_hash(n_levels=16, log2_T=15, base_res=16, scale=1.26)
+    
