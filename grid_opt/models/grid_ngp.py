@@ -15,93 +15,84 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 class CollisionTracker:
-    def __init__(self, n_levels=16, hashmap_size=2**15, base_res=16, per_level_scale=1.26, n_feats=2):
+    def __init__(self, encoding, n_levels=16, hashmap_size=2**15, base_res=16, per_level_scale=1.26):
         self.L, self.T = n_levels, hashmap_size
         self.N_min, self.b = base_res, per_level_scale
-        self.n_feats = n_feats
+        self.n_feats = encoding.n_features_per_level
         
+        # Importance: G(l, v) and Voxel-to-Bin Mapping: V(l, v) -> i
         self.voxel_grads = []
         self.voxel_to_bin = [] 
-        self.level_offsets = [] # ADDED: Initializing the missing attribute
         
-        current_offset = 0
-        alignment = 16 
         for l in range(self.L):
             res = math.floor(self.N_min * (self.b ** l))
             num_verts = (res + 1) ** 3
             self.voxel_grads.append(torch.zeros(num_verts, dtype=torch.float32, device='cuda'))
             self.voxel_to_bin.append(torch.full((num_verts,), -1, dtype=torch.long, device='cuda'))
-            
-            # Store the start index for each level in the TCNN parameter vector
-            self.level_offsets.append(current_offset)
-            
-            params_in_level = min(self.T, num_verts) * self.n_feats
-            current_offset += math.ceil(params_in_level / alignment) * alignment
 
+        # Try to probe memory offset between layers to calculate stats.
+        # I'm not partitioning layers during tracking in case this offset
+        # detection is not perfectly aligned with the cuda implementation.
+        self.level_offsets = self._detect_offsets(encoding)
         self.offsets_3d = torch.stack(torch.meshgrid([torch.tensor([0, 1])] * 3, indexing='ij')).reshape(3, -1).t().to('cuda')
 
+    def _detect_offsets(self, encoding):
+        """ Discovery of where TCNN layers live in memory. """
+        offsets = []
+        zero_coord = torch.zeros((1, 3), device='cuda', requires_grad=True)
+        for l in range(self.L):
+            if encoding.params.grad is not None: encoding.params.grad.zero_()
+            encoding(zero_coord)[:, l*self.n_feats : (l+1)*self.n_feats].sum().backward()
+            offsets.append(torch.where(encoding.params.grad != 0)[0].min().item())
+        encoding.params.grad = None
+        return offsets
+
     def _get_tcnn_indices(self, encoding, x):
-        """ Non-intrusive gradient probing to find actual TCNN hash indices. """
+        """ Returns all indices touched by the batch, across all levels. """
         x_probe = x.detach().clone().requires_grad_(True)
-        
-        # Backup and clear gradients
-        original_grads = encoding.params.grad.clone() if encoding.params.grad is not None else None
+        orig_grad = encoding.params.grad.clone() if encoding.params.grad is not None else None
         encoding.params.grad = None
         
-        # Forward and backward pass to flag active bins
         encoding(x_probe).sum().backward()
+        # This is a single 1D tensor of index touched by this batch across all layers:
+        touched_indices = torch.where(encoding.params.grad != 0)[0]
         
-        all_indices = []
-        probe_grad = encoding.params.grad
-        
-        if probe_grad is not None:
-            for l in range(self.L):
-                start = self.level_offsets[l]
-                level_slice = probe_grad[start : start + (self.T * self.n_feats)]
-                # Identify which bins were accessed (TCNN interleave: features are contiguous for each index)
-                bin_usage = (level_slice.reshape(-1, self.n_feats) != 0).any(dim=1)
-                all_indices.append(torch.where(bin_usage)[0])
-        else:
-            all_indices = [torch.tensor([], device='cuda', dtype=torch.long) for _ in range(self.L)]
-
-        # Restore original training gradients
-        encoding.params.grad = original_grads
-        return all_indices
+        # Restore original gradients to make the probe non-intrusive to training:
+        encoding.params.grad = orig_grad
+        return touched_indices
 
     @torch.no_grad()
     def track_step(self, coords_world, bound, loss_vec, encoding):
         """ Record G(l, v) and the voxel-to-bin mapping. """
-        # Normalize coordinates
         x = (coords_world.detach() - bound[:, 0]) / (bound[:, 1] - bound[:, 0])
         valid = (x >= 0).all(dim=-1) & (x < 1).all(dim=-1)
         if not valid.any(): return
-            
         x_valid = torch.clamp(x[valid], 0.0, 1.0 - 1e-6)
         g = loss_vec.detach().reshape(-1)[valid]
         
-        # Probe TCNN for hash indices
         with torch.enable_grad():
-            h_indices_list = self._get_tcnn_indices(encoding, x_valid)
+            touched_indices = self._get_tcnn_indices(encoding, x_valid)
 
         for l in range(self.L):
             res = math.floor(self.N_min * (self.b ** l))
             stride = res + 1
             
-            # 1. Map samples to voxel vertices
+            # Identify Voxels v
             base_v = torch.floor(x_valid * res).long()
             all_v = (base_v.unsqueeze(0) + self.offsets_3d.unsqueeze(1)).reshape(-1, 3)
             v_idx = all_v[:, 0] + stride * (all_v[:, 1] + stride * all_v[:, 2])
             
-            # 2. Accumulate G(l, v)
-            g_rep = g.repeat_interleave(8)
-            self.voxel_grads[l].index_add_(0, v_idx, g_rep)
+            # Accumulate G(l, v)
+            self.voxel_grads[l].index_add_(0, v_idx, g.repeat_interleave(8))
 
-            # 3. Update Voxel-to-Bin Mapping
-            h_idx_batch = h_indices_list[l]
-            if h_idx_batch.numel() > 0:
-                # To maintain a stable mapping, we update the bin index for these vertices.
-                # In most steps, h_idx_batch[0] is the correct representative for the local cluster.
-                self.voxel_to_bin[l][v_idx] = h_idx_batch[0]
+            # Store the physical memory address for these voxels
+            start = self.level_offsets[l]
+            end = self.level_offsets[l+1] if l < self.L-1 else encoding.params.shape[0]
+            
+            level_indices = touched_indices[(touched_indices >= start) & (touched_indices < end)]
+            if level_indices.numel() > 0:
+                # Store the absolute global index
+                self.voxel_to_bin[l][v_idx] = level_indices.min()
 
     def _compute_final_stats(self):
         """ Implementation of the formal metrics: C_eff, Total_Bin_Grad, and R_dom. """
@@ -326,6 +317,7 @@ class GridNGP(BaseNet):
         # Collision tracker
         if self.track_collisions:
             self.tracker = CollisionTracker(
+                encoding=self.encoding,
                 n_levels=config_encoding["n_levels"],
                 hashmap_size=2**config_encoding["log2_hashmap_size"],
                 base_res=config_encoding["base_resolution"],
