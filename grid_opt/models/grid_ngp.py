@@ -151,13 +151,13 @@ class CollisionTracker:
                 self.voxel_to_bin[l][v_unique[:num_to_map]] = h_unique[:num_to_map] * self.n_feats
 
     def _compute_final_stats(self):
-        """ Implementation of the formal metrics: C_eff, Total_Bin_Grad, and R_dom. """
         final_eff = torch.zeros((self.L, self.T), device='cuda')
         final_max = torch.zeros((self.L, self.T), device='cuda')
         final_sum = torch.zeros((self.L, self.T), device='cuda')
 
         for l in range(self.L):
-            active_mask = self.voxel_to_bin[l] != -1
+            # Only consider voxels that have been mapped to a bin AND have received gradients
+            active_mask = (self.voxel_to_bin[l] != -1) & (self.voxel_grads[l] > 1e-9)
             if not active_mask.any(): continue
             
             v_indices = torch.where(active_mask)[0]
@@ -165,14 +165,14 @@ class CollisionTracker:
             
             global_bins = self.voxel_to_bin[l][v_indices]
             local_bins = (global_bins - self.level_offsets[l]) // self.n_feats
+            local_bins = torch.clamp(local_bins, 0, self.T - 1)
             
-            num_bins_this_level = self.actual_level_sizes[l] // self.n_feats
-            local_bins = torch.clamp(local_bins, 0, num_bins_this_level - 1)
+            # Use unique voxels to count C_eff correctly
+            # We want to know how many unique v_idx map to each local_bin
+            # To do this perfectly, we use index_add with ones
+            ones = torch.ones_like(local_bins, dtype=torch.float32)
+            final_eff[l].index_add_(0, local_bins, ones)
             
-            # C_eff: unique voxels per hash bin
-            final_eff[l].index_add_(0, local_bins, torch.ones_like(local_bins, dtype=torch.float32))
-            
-            # G(l, v) totals
             final_sum[l].index_add_(0, local_bins, v_grads)
             final_max[l].index_reduce_(0, local_bins, v_grads, reduce='amax', include_self=False)
 
@@ -197,14 +197,14 @@ class CollisionTracker:
         print("-" * len(header))
 
         for l in range(self.L):
-            occ = eff[l] > 0
+            occ = (sm[l] > 1e-9) 
             num_occ = occ.sum().item()
             if num_occ > 0:
                 c_eff_occ = eff[l][occ]
                 c_eff_str = f"{c_eff_occ.min():.0f} / {c_eff_occ.mean():.2f} / {c_eff_occ.max():.0f}"
                 
                 # R_dom calculation: Max/Sum
-                r_dom = mx[l][occ] / sm[l][occ].clamp(min=1e-6)
+                r_dom = mx[l][occ] / sm[l][occ].clamp(min=1e-9)
                 r_dom_str = f"{r_dom.min():.4f} / {r_dom.mean():.4f} / {r_dom.max():.4f}"
                 
                 res = math.floor(self.N_min * (self.b ** l))
