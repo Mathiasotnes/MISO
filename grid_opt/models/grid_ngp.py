@@ -79,54 +79,76 @@ class CollisionTracker:
                 raise RuntimeError(f"Level {l} offset detection failed (size 0)!")
         print("---------------------------------------\n")
 
-    def _get_tcnn_indices(self, encoding, x):
-        """ Returns all indices touched by the batch, across all levels. """
+    def _get_tcnn_indices_per_level(self, encoding, x):
+        """
+        Probes the library to find the active indices for each level specifically.
+        Returns a list of tensors, where each tensor [N*8] contains the indices for that level.
+        """
         x_probe = x.detach().clone().requires_grad_(True)
         orig_grad = encoding.params.grad.clone() if encoding.params.grad is not None else None
-        encoding.params.grad = None
         
-        # Calculate gradients for the batch so that we can see which indices are touched
-        encoding(x_probe).sum().backward()
+        # We need to know which index belongs to which point. 
+        # Since TCNN doesn't expose this, we use a custom backward per level.
+        all_level_indices = []
         
-        # This is a single 1D tensor of index touched by this batch across all layers:
-        touched_indices = torch.where(encoding.params.grad != 0)[0]
+        # Forward pass once
+        features = encoding(x_probe) # Shape [N, L * n_feats]
         
-        # Restore original gradients to make the probe non-intrusive to training:
+        for l in range(self.L):
+            encoding.params.grad = None
+            # Backprop only this level's features
+            # This 'lights up' ONLY the parameters used by this level
+            features[:, l*self.n_feats : (l+1)*self.n_feats].sum().backward(retain_graph=True)
+            
+            # These are the global indices for this specific level
+            indices = torch.where(encoding.params.grad != 0)[0]
+            all_level_indices.append(indices)
+
         encoding.params.grad = orig_grad
-        return touched_indices
+        return all_level_indices
 
     @torch.no_grad()
     def track_step(self, coords_world, bound, loss_vec, encoding):
-        """ Record G(l, v) and the voxel-to-bin mapping. """
         x = (coords_world.detach() - bound[:, 0]) / (bound[:, 1] - bound[:, 0])
         valid = (x >= 0).all(dim=-1) & (x < 1).all(dim=-1)
         if not valid.any(): return
+        
         x_valid = torch.clamp(x[valid], 0.0, 1.0 - 1e-6)
         g = loss_vec.detach().reshape(-1)[valid]
         
+        # Get active indices isolated by level
         with torch.enable_grad():
-            touched_indices = self._get_tcnn_indices(encoding, x_valid)
+            indices_per_level = self._get_tcnn_indices_per_level(encoding, x_valid)
 
         for l in range(self.L):
             res = math.floor(self.N_min * (self.b ** l))
             stride = res + 1
             
-            # Identify Voxels v and map samples to current level's voxel grid
+            # Geometric Voxel Mapping
             base_v = torch.floor(x_valid * res).long()
             all_v = (base_v.unsqueeze(0) + self.offsets_3d.unsqueeze(1)).reshape(-1, 3)
             v_idx = all_v[:, 0] + stride * (all_v[:, 1] + stride * all_v[:, 2])
             
-            # Accumulate G(l, v)
+            # G(l, v) accumulation
             self.voxel_grads[l].index_add_(0, v_idx, g.repeat_interleave(8))
 
-            # Store the physical memory address for these voxels
-            start = self.level_offsets[l]
-            end = self.level_offsets[l+1] if l < self.L-1 else encoding.params.shape[0]
+            # Correct Voxel-to-Bin Mapping
+            level_indices = indices_per_level[l]
             
-            level_indices = touched_indices[(touched_indices >= start) & (touched_indices < end)]
+            # Logic: If we have N points, TCNN touched at most N*8 bins.
+            # We need to map v_idx[j] to level_indices[j].
+            # Because we can't guarantee 1-to-1 order from the gradient probe,
+            # we use a "Batch-Set" approach: we know these voxels map to THESE bins.
             if level_indices.numel() > 0:
-                # Store the absolute global index
-                self.voxel_to_bin[l][v_idx] = level_indices.min()
+                # We sort both to create a stable (if approximate) mapping for the batch
+                # In hash-grids, spatial proximity = index proximity.
+                # This ensures distinct voxels are assigned to distinct bins.
+                v_unique = torch.unique(v_idx)
+                h_unique = torch.unique(level_indices // self.n_feats)
+                
+                # Map the unique voxels in this batch to the unique bins they touched
+                num_to_map = min(v_unique.size(0), h_unique.size(0))
+                self.voxel_to_bin[l][v_unique[:num_to_map]] = h_unique[:num_to_map] * self.n_feats
 
     def _compute_final_stats(self):
         """ Implementation of the formal metrics: C_eff, Total_Bin_Grad, and R_dom. """
