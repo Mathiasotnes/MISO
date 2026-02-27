@@ -63,23 +63,20 @@ class CollisionTracker:
         """
         print("\n--- TCNN Memory Layout Verification Report ---")
         total_params = encoding.params.shape[0]
+        self.actual_level_sizes = [] # Store these for later indexing
         
         for l in range(self.L):
             start = self.level_offsets[l]
             end = self.level_offsets[l+1] if l < self.L-1 else total_params
-            
-            # Theoretical bucket size based on your config
-            expected_size = self.T * self.n_feats
             actual_size = end - start
+            self.actual_level_sizes.append(actual_size)
             
-            # Check for alignment padding (TCNN often aligns to 16 or 32 bytes)
-            padding = actual_size - expected_size
-            
-            status = "PASS" if actual_size >= expected_size else "FAIL"
-            print(f"L{l+1:02} | Start: {start:10} | Gap: {actual_size:8} | Padding: {padding:4} | {status}")
+            # The only real "FAIL" is if the gap is 0 or negative
+            status = "PASS" if actual_size > 0 else "FAIL"
+            print(f"L{l+1:02} | Start: {start:10} | Actual Params: {actual_size:8} | {status}")
             
             if status == "FAIL":
-                raise RuntimeError(f"Level {l} offset detection is smaller than hashmap size!")
+                raise RuntimeError(f"Level {l} offset detection failed (size 0)!")
         print("---------------------------------------\n")
 
     def _get_tcnn_indices(self, encoding, x):
@@ -144,13 +141,11 @@ class CollisionTracker:
             v_indices = torch.where(active_mask)[0]
             v_grads = self.voxel_grads[l][v_indices]
             
-            # Convert Global Memory Address -> Local Bin ID (0 to T-1)
-            # Dividing by n_feats accounts for the fact that each bin has 2 features
             global_bins = self.voxel_to_bin[l][v_indices]
             local_bins = (global_bins - self.level_offsets[l]) // self.n_feats
             
-            # Clamp to table size T just in case of detection epsilon
-            local_bins = torch.clamp(local_bins, 0, self.T - 1)
+            num_bins_this_level = self.actual_level_sizes[l] // self.n_feats
+            local_bins = torch.clamp(local_bins, 0, num_bins_this_level - 1)
             
             # C_eff: unique voxels per hash bin
             final_eff[l].index_add_(0, local_bins, torch.ones_like(local_bins, dtype=torch.float32))
