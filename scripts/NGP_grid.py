@@ -7,6 +7,7 @@ from grid_opt.slam.mapper import Mapper
 from grid_opt.utils.utils_sdf import *
 from grid_opt.configs import *
 from os.path import join
+from research.collision import analyze_disambiguation
 import grid_opt.utils.utils_scannet as utils_scannet
 import grid_opt.utils.utils_sdf as utils_sdf
 import open3d as o3d
@@ -185,6 +186,9 @@ def main_scannet():
     
     verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
     verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
+    
+    BOUNDS = torch.tensor([[-0.02,  10.38], [-0.01, 8.74], [-0.01,  3.03]]) # NOTE: Hardcoded for scene0000_00!
+    analyze_disambiguation(stats_path="./collision_stats.pt", mesh_path=mesh_path, gt_mesh_path=gt_mesh_path, bounds=BOUNDS)
     
     metrics_results = compute_chamfer_metrics(verts_pred, verts_trgt, threshold=0.05)
     print(json.dumps(metrics_results, indent=4))
