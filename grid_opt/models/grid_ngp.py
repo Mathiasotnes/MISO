@@ -15,14 +15,16 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 class CollisionTracker:
-    def __init__(self, encoding, n_levels=16, hashmap_size=2**15, base_res=16, per_level_scale=1.26):
-        self.L, self.T = n_levels, hashmap_size
-        self.N_min, self.b = base_res, per_level_scale
-        self.n_feats = encoding.n_features_per_level
+    def __init__(self, encoding, n_feats=2, n_levels=16, hashmap_size=2**15, base_res=16, per_level_scale=1.26):
+        self.n_feats    = n_feats
+        self.L          = n_levels
+        self.T          = hashmap_size
+        self.N_min      = base_res
+        self.b          = per_level_scale
         
         # Importance: G(l, v) and Voxel-to-Bin Mapping: V(l, v) -> i
-        self.voxel_grads = []
-        self.voxel_to_bin = [] 
+        self.voxel_grads    = []
+        self.voxel_to_bin   = [] 
         
         for l in range(self.L):
             res = math.floor(self.N_min * (self.b ** l))
@@ -34,18 +36,51 @@ class CollisionTracker:
         # I'm not partitioning layers during tracking in case this offset
         # detection is not perfectly aligned with the cuda implementation.
         self.level_offsets = self._detect_offsets(encoding)
+        self._verify_offsets(encoding)
         self.offsets_3d = torch.stack(torch.meshgrid([torch.tensor([0, 1])] * 3, indexing='ij')).reshape(3, -1).t().to('cuda')
 
     def _detect_offsets(self, encoding):
-        """ Discovery of where TCNN layers live in memory. """
+        """ Probes the TCNN parameter vector to find the physical start of each layer. """
         offsets = []
         zero_coord = torch.zeros((1, 3), device='cuda', requires_grad=True)
         for l in range(self.L):
             if encoding.params.grad is not None: encoding.params.grad.zero_()
+            # We isolate the backward pass to a specific feature slice
             encoding(zero_coord)[:, l*self.n_feats : (l+1)*self.n_feats].sum().backward()
-            offsets.append(torch.where(encoding.params.grad != 0)[0].min().item())
+            
+            grad_indices = torch.where(encoding.params.grad != 0)[0]
+            if grad_indices.numel() > 0:
+                offsets.append(grad_indices.min().item())
+            else:
+                raise RuntimeError(f"Probe failed at level {l}. Is the model initialized?")
         encoding.params.grad = None
         return offsets
+
+    def _verify_offsets(self, encoding):
+        """ 
+        Self-Correction Test: Ensures that detected offsets 
+        consistently yield indices within [0, T-1].
+        """
+        print("\n--- TCNN Memory Layout Verification Report ---")
+        total_params = encoding.params.shape[0]
+        
+        for l in range(self.L):
+            start = self.level_offsets[l]
+            end = self.level_offsets[l+1] if l < self.L-1 else total_params
+            
+            # Theoretical bucket size based on your config
+            expected_size = self.T * self.n_feats
+            actual_size = end - start
+            
+            # Check for alignment padding (TCNN often aligns to 16 or 32 bytes)
+            padding = actual_size - expected_size
+            
+            status = "PASS" if actual_size >= expected_size else "FAIL"
+            print(f"L{l+1:02} | Start: {start:10} | Gap: {actual_size:8} | Padding: {padding:4} | {status}")
+            
+            if status == "FAIL":
+                raise RuntimeError(f"Level {l} offset detection is smaller than hashmap size!")
+        print("---------------------------------------\n")
 
     def _get_tcnn_indices(self, encoding, x):
         """ Returns all indices touched by the batch, across all levels. """
@@ -53,7 +88,9 @@ class CollisionTracker:
         orig_grad = encoding.params.grad.clone() if encoding.params.grad is not None else None
         encoding.params.grad = None
         
+        # Calculate gradients for the batch so that we can see which indices are touched
         encoding(x_probe).sum().backward()
+        
         # This is a single 1D tensor of index touched by this batch across all layers:
         touched_indices = torch.where(encoding.params.grad != 0)[0]
         
@@ -77,7 +114,7 @@ class CollisionTracker:
             res = math.floor(self.N_min * (self.b ** l))
             stride = res + 1
             
-            # Identify Voxels v
+            # Identify Voxels v and map samples to current level's voxel grid
             base_v = torch.floor(x_valid * res).long()
             all_v = (base_v.unsqueeze(0) + self.offsets_3d.unsqueeze(1)).reshape(-1, 3)
             v_idx = all_v[:, 0] + stride * (all_v[:, 1] + stride * all_v[:, 2])
@@ -106,17 +143,21 @@ class CollisionTracker:
             
             v_indices = torch.where(active_mask)[0]
             v_grads = self.voxel_grads[l][v_indices]
-            v_bins = self.voxel_to_bin[l][v_indices]
             
-            # C_eff: number of unique active voxels per hash bin
-            ones = torch.ones_like(v_bins, dtype=torch.float32)
-            final_eff[l].index_add_(0, v_bins, ones)
+            # Convert Global Memory Address -> Local Bin ID (0 to T-1)
+            # Dividing by n_feats accounts for the fact that each bin has 2 features
+            global_bins = self.voxel_to_bin[l][v_indices]
+            local_bins = (global_bins - self.level_offsets[l]) // self.n_feats
             
-            # Sum of all voxel importance in bin
-            final_sum[l].index_add_(0, v_bins, v_grads)
+            # Clamp to table size T just in case of detection epsilon
+            local_bins = torch.clamp(local_bins, 0, self.T - 1)
             
-            # Importance of the single most dominant voxel in bin
-            final_max[l].index_reduce_(0, v_bins, v_grads, reduce='amax', include_self=False)
+            # C_eff: unique voxels per hash bin
+            final_eff[l].index_add_(0, local_bins, torch.ones_like(local_bins, dtype=torch.float32))
+            
+            # G(l, v) totals
+            final_sum[l].index_add_(0, local_bins, v_grads)
+            final_max[l].index_reduce_(0, local_bins, v_grads, reduce='amax', include_self=False)
 
         return final_eff, final_max, final_sum
 
@@ -318,6 +359,7 @@ class GridNGP(BaseNet):
         if self.track_collisions:
             self.tracker = CollisionTracker(
                 encoding=self.encoding,
+                n_feats=config_encoding["n_features_per_level"],
                 n_levels=config_encoding["n_levels"],
                 hashmap_size=2**config_encoding["log2_hashmap_size"],
                 base_res=config_encoding["base_resolution"],
