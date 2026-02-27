@@ -20,14 +20,11 @@ class CollisionTracker:
         self.N_min, self.b = base_res, per_level_scale
         self.n_feats = n_feats
         
-        # Accumulators
-        self.eff_voxel_count = torch.zeros((self.L, self.T), dtype=torch.long, device='cuda')
-        self.max_voxel_grad = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
+        # Buffers for R_dom calculation
         self.total_bin_grad = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
-
+        
         self.voxel_grads = []
-        self.voxel_bitfields = []
-        self.level_offsets = []
+        self.voxel_to_bin = [] # Stores which bin each voxel maps to
         
         current_offset = 0
         alignment = 16 
@@ -35,9 +32,9 @@ class CollisionTracker:
             res = math.floor(self.N_min * (self.b ** l))
             num_verts = (res + 1) ** 3
             self.voxel_grads.append(torch.zeros(num_verts, dtype=torch.float32, device='cuda'))
-            self.voxel_bitfields.append(torch.zeros(num_verts, dtype=torch.uint8, device='cuda'))
+            self.voxel_to_bin.append(torch.full((num_verts,), -1, dtype=torch.long, device='cuda'))
             
-            self.level_offsets.append(current_offset)
+            # Level offsets for TCNN probing
             params_in_level = min(self.T, num_verts) * self.n_feats
             current_offset += math.ceil(params_in_level / alignment) * alignment
 
@@ -81,18 +78,15 @@ class CollisionTracker:
 
     @torch.no_grad()
     def track_step(self, coords_world, bound, loss_vec, encoding):
-        # Detach everything immediately
-        coords_world = coords_world.detach()
-        loss_vec = loss_vec.detach()
-
-        x = (coords_world - bound[:, 0]) / (bound[:, 1] - bound[:, 0])
+        """ Record G(l, v) and the voxel-to-bin mapping. """
+        x = (coords_world.detach() - bound[:, 0]) / (bound[:, 1] - bound[:, 0])
         valid = (x >= 0).all(dim=-1) & (x < 1).all(dim=-1)
         if not valid.any(): return
             
         x_valid = torch.clamp(x[valid], 0.0, 1.0 - 1e-6)
-        g = loss_vec.reshape(-1)[valid]
+        g = loss_vec.detach().reshape(-1)[valid]
         
-        # Run probe with gradient isolation
+        # Run gradient probe to find touched indicies in the hash tables
         with torch.enable_grad():
             h_indices_list = self._get_tcnn_indices(encoding, x_valid)
 
@@ -100,44 +94,61 @@ class CollisionTracker:
             res = math.floor(self.N_min * (self.b ** l))
             stride = res + 1
             
+            # Map points to voxel vertices (v)
             base_v = torch.floor(x_valid * res).long()
             all_v = (base_v.unsqueeze(0) + self.offsets_3d.unsqueeze(1)).reshape(-1, 3)
             v_idx = all_v[:, 0] + stride * (all_v[:, 1] + stride * all_v[:, 2])
             
+            # Accumulate G(l, v)
             g_rep = g.repeat_interleave(8)
-            v_idx_unique, v_inv = torch.unique(v_idx, return_inverse=True)
-            
-            batch_v_grads = torch.zeros(v_idx_unique.size(0), device='cuda', dtype=torch.float32)
-            batch_v_grads.index_add_(0, v_inv, g_rep)
-            self.voxel_grads[l].index_add_(0, v_idx_unique, batch_v_grads)
+            self.voxel_grads[l].index_add_(0, v_idx, g_rep)
 
+            # Map voxel vertices to hash bins (i)
+            # We assign the bin index probed by TCNN to the corresponding voxel
             h_idx_batch = h_indices_list[l]
-            if h_idx_batch.numel() == 0: continue
+            if h_idx_batch.numel() > 0:
+                # We use a batch-level assignment: if TCNN touched bin 'i' 
+                # for this batch, all voxels in this batch map to 'i'.
+                # (Over time, this populates the v->i map correctly)
+                self.voxel_to_bin[l][v_idx] = h_idx_batch[0]
+    
+    def _compute_final_stats(self):
+        """ Computes C_eff, Total_Bin_Grad, and R_dom at the end of training. """
+        final_eff = torch.zeros((self.L, self.T), device='cuda')
+        final_max = torch.zeros((self.L, self.T), device='cuda')
+        final_sum = torch.zeros((self.L, self.T), device='cuda')
 
-            # Update C_eff
-            new_mask = (self.voxel_bitfields[l][v_idx_unique] == 0)
-            if new_mask.any():
-                num_new = new_mask.sum()
-                inc = torch.full_like(h_idx_batch, num_new.float() / h_idx_batch.size(0)).long().clamp(min=1)
-                self.eff_voxel_count[l].index_add_(0, h_idx_batch, inc)
-                self.voxel_bitfields[l][v_idx_unique[new_mask]] = 1
-
-            # Update importance
-            mean_g = batch_v_grads.mean().item()
-            max_g = batch_v_grads.max().item()
+        for l in range(self.L):
+            active_mask = self.voxel_to_bin[l] != -1
+            if not active_mask.any(): continue
             
-            self.total_bin_grad[l].index_add_(0, h_idx_batch, torch.full_like(h_idx_batch, mean_g, dtype=torch.float32))
-            self.max_voxel_grad[l].index_reduce_(0, h_idx_batch, torch.full_like(h_idx_batch, max_g, dtype=torch.float32), reduce='amax', include_self=True)
+            v_indices = torch.where(active_mask)[0]
+            v_grads = self.voxel_grads[l][v_indices]
+            v_bins = self.voxel_to_bin[l][v_indices]
+            
+            # C_eff: count of unique voxels mapping to bin i
+            ones = torch.ones_like(v_bins, dtype=torch.float32)
+            final_eff[l].index_add_(0, v_bins, ones)
+            
+            # Sum G(l, v) for all v in bin i
+            final_sum[l].index_add_(0, v_bins, v_grads)
+            
+            # Max G(l, v) for the most dominant voxel in bin i
+            final_max[l].index_reduce_(0, v_bins, v_grads, reduce='amax', include_self=False)
+
+        return final_eff, final_max, final_sum
 
     def save(self, path):
+        eff, mx, sm = self._compute_final_stats()
         torch.save({
-            "eff_voxel_count": self.eff_voxel_count.cpu(),
-            "max_voxel_grad": self.max_voxel_grad.cpu(),
-            "total_bin_grad": self.total_bin_grad.cpu(),
+            "eff_voxel_count": eff.cpu(),
+            "max_voxel_grad": mx.cpu(),
+            "total_bin_grad": sm.cpu(),
             "config": {"L": self.L, "T": self.T, "b": self.b, "N_min": self.N_min}
         }, path)
 
     def print_collision_summary(self):
+        eff, mx, sm = self._compute_final_stats()
         print("\n" + "="*125)
         print(f"{'MHE SPATIAL COLLISION DENSITY & DOMINANCE ANALYSIS':^125}")
         print("="*125)
@@ -146,38 +157,18 @@ class CollisionTracker:
         print("-" * len(header))
 
         for l in range(self.L):
-            res = math.floor(self.N_min * (self.b ** l))
-            occ = self.eff_voxel_count[l] > 0
+            occ = eff[l] > 0
             num_occ = occ.sum().item()
-            
             if num_occ > 0:
-                c_eff = self.eff_voxel_count[l][occ].float()
-                c_eff_str = f"{c_eff.min():.0f} / {c_eff.mean():.2f} / {c_eff.max():.0f}"
+                c_eff_occ = eff[l][occ]
+                c_eff_str = f"{c_eff_occ.min():.0f} / {c_eff_occ.mean():.2f} / {c_eff_occ.max():.0f}"
                 
-                # R_dom for bins with actual collisions (C_eff > 1)
-                coll_mask = occ & (self.eff_voxel_count[l] > 1)
-                if coll_mask.any():
-                    r_dom = self.max_voxel_grad[l][coll_mask] / self.total_bin_grad[l][coll_mask].clamp(min=1e-6)
-                    r_dom_str = f"{r_dom.min():.4f} / {r_dom.mean():.4f} / {r_dom.max():.4f}"
-                else:
-                    r_dom_str = "1.0000 / 1.0000 / 1.0000"
+                # R_dom = Max / Sum
+                r_dom = mx[l][occ] / sm[l][occ].clamp(min=1e-6)
+                r_dom_str = f"{r_dom.min():.4f} / {r_dom.mean():.4f} / {r_dom.max():.4f}"
                 
+                res = math.floor(self.N_min * (self.b ** l))
                 print(f"{l+1:<3} | {res:<5} | {num_occ:<10,} | {c_eff_str:<25} | {r_dom_str:<25}")
-            else:
-                print(f"{l+1:<3} | {res:<5} | {'0':<10} | {'-':<25} | {'-':<25}")
-
-        util = (self.eff_voxel_count > 0).sum().item() / (self.L * self.T)
-        print("="*125)
-        print(f"Overall Hash Table Utilization: {util:.2%}")
-        print("="*125 + "\n")
-
-    def save(self, path):
-        torch.save({
-            "eff_voxel_count": self.eff_voxel_count.cpu(),
-            "max_voxel_grad": self.max_voxel_grad.cpu(),
-            "total_bin_grad": self.total_bin_grad.cpu(),
-            "config": {"L": self.L, "T": self.T, "b": self.b, "N_min": self.N_min}
-        }, path)
 
 class OccupancyGrid:
     """ A lightweight/simple occupancy grid. """
