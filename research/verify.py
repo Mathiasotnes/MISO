@@ -14,11 +14,16 @@ import math
 ###############################################################
 
 def manual_spatial_hash(coords, T):
-    """ Matches TCNN bitwise XOR hashing logic using unsigned 32-bit primes. """
-    PI = torch.tensor([1, 2654435761, 805459861], dtype=torch.uint32, device='cuda')
-    x = coords.to(torch.uint32)
-    h = (x[:, 0] * PI[0]) ^ (x[:, 1] * PI[1]) ^ (x[:, 2] * PI[2])
-    return h % T
+    """ Matches TCNN bitwise XOR hashing logic using long for math to avoid CUDA errors. """
+    PI = [1, 2654435761, 805459861]
+    
+    # Perform multiplication in 64-bit to avoid PyTorch uint32 errors
+    # then cast to 32-bit to simulate the 32-bit overflow TCNN expects
+    h_x = (coords[:, 0].long() * PI[0]).to(torch.int32)
+    h_y = (coords[:, 1].long() * PI[1]).to(torch.int32)
+    h_z = (coords[:, 2].long() * PI[2]).to(torch.int32)
+    h = h_x ^ h_y ^ h_z
+    return h.to(torch.uint32).long() % T
 
 def verify_tcnn_hash(n_levels=16, log2_T=15, base_res=16, scale=1.26):
     T = 2**log2_T
