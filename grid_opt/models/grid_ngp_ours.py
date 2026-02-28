@@ -13,10 +13,25 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 def spatial_hash(coords_int: torch.Tensor, T: int) -> torch.Tensor:
-    PI = [1, 2_654_435_761, 805_459_861]
     x, y, z = coords_int[:, 0], coords_int[:, 1], coords_int[:, 2]
-    h = x ^ (y * PI[1]) ^ (z * PI[2])
-    return h % T
+    MASK = 0xFFFFFFFF # Cast to uint32 range explicitly to mimic TCNN behavior
+    h = (x ^ (y * 2_654_435_761) ^ (z * 805_459_861)) & MASK
+    return (h % T).long()
+
+def normalize_coordinates(x: torch.Tensor, bound: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize world coordinates to [0, 1]^3.
+    tcnn expects inputs in [0, 1], NOT [-1, 1] like utils.normalize_coordinates provides.
+
+    Args:
+        x:     (N, 3) tensor of world coordinates.
+        bound: (3, 2) tensor of [[xmin,xmax],[ymin,ymax],[zmin,zmax]].
+    Returns:
+        (N, 3) tensor with values in [0, 1].
+    """
+    lo = bound[:, 0]  # (3,)
+    hi = bound[:, 1]  # (3,)
+    return (x - lo) / (hi - lo)
 
 class OccupancyGrid:
     """ A lightweight/simple occupancy grid. """
@@ -129,20 +144,16 @@ class MultiResHashEncoding(nn.Module):
 
         self.n_output_dims = n_levels * n_features_per_level
 
-        ### Hash tables
-        # One nn.Embedding per level; each has T entries of size F.
-        self.hash_tables = nn.ModuleList([
-            nn.Embedding(self.T, self.F) for _ in range(n_levels)
-        ])
-        # Initialised with U(-1e-4, 1e-4) as recommended in the paper.
-        for emb in self.hash_tables:
-            nn.init.uniform_(emb.weight, -1e-4, 1e-4)
+        ### Hash table initialized with U(-1e-4, 1e-4) as recommended in the paper.
+        self.hash_table = nn.Parameter(
+            torch.empty(n_levels * self.T, self.F).uniform_(-1e-4, 1e-4)
+        )
 
         ### Per-level grid resolutions
-        resolutions = []
-        for level in range(n_levels):
-            N_l = math.floor(self.N_min * (self.b ** level))
-            resolutions.append(N_l)
+        resolutions = [
+            math.floor(self.N_min * (self.b ** level))
+            for level in range(n_levels)
+        ]
         self.register_buffer("resolutions", torch.tensor(resolutions, dtype=torch.int32))
 
         ### Corner offsets for trilinear interpolation
@@ -185,10 +196,12 @@ class MultiResHashEncoding(nn.Module):
             # corner_offsets: (8, 3) → broadcast to (N, 8, 3)
             corners = x_floor.unsqueeze(1) + self.corner_offsets.unsqueeze(0) # corners: (N, 8, 3)
             corners_flat = corners.reshape(N * 8, 3) # (N*8, 3)
-            indices = spatial_hash(corners_flat, self.T) # (N*8,)
+            
+            # Local index in [0, T), then offset into flat table for this level
+            local_idx = spatial_hash(corners_flat, self.T) # (N*8,)
+            global_idx = local_idx + level_idx * self.T    # (N*8,)
 
-            table = self.hash_tables[level_idx]
-            feats = table(indices) # (N*8, F)
+            feats = self.hash_table[global_idx] # (N*8, F)
             feats = feats.reshape(N, 8, self.F) # (N, 8, F)
 
             ### Trilinear interpolation
@@ -404,11 +417,11 @@ class GridNGPOurs(BaseNet):
         return self.updated_kf_pose(kf_id)
     
     def query_feature(self, x):
-        x = utils.normalize_coordinates(x, self.bound)
+        x = normalize_coordinates(x, self.bound)
         return self.encoding(x)
     
     def forward(self, x):
-        x = utils.normalize_coordinates(x, self.bound)
+        x = normalize_coordinates(x, self.bound)
         return self.model(x)
     
     def params_at_level(self, level):
