@@ -22,19 +22,17 @@ class CollisionTracker:
         self.N_min      = base_res
         self.b          = per_level_scale
         
-        # Importance: G(l, v) and Voxel-to-Bin Mapping: V(l, v) -> i
+        # Importance: G(l, v) 
         self.voxel_grads    = []
-        self.voxel_to_bin   = [] 
+        self.bin_eff_count  = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
+        self.bin_max_grad   = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
+        self.bin_total_grad = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
         
         for l in range(self.L):
             res = math.floor(self.N_min * (self.b ** l))
             num_verts = (res + 1) ** 3
             self.voxel_grads.append(torch.zeros(num_verts, dtype=torch.float32, device='cuda'))
-            self.voxel_to_bin.append(torch.full((num_verts,), -1, dtype=torch.long, device='cuda'))
 
-        # Try to probe memory offset between layers to calculate stats.
-        # I'm not partitioning layers during tracking in case this offset
-        # detection is not perfectly aligned with the cuda implementation.
         self.level_offsets = self._detect_offsets(encoding)
         self._verify_offsets(encoding)
         self.offsets_3d = torch.stack(torch.meshgrid([torch.tensor([0, 1])] * 3, indexing='ij')).reshape(3, -1).t().to('cuda')
@@ -79,33 +77,15 @@ class CollisionTracker:
                 raise RuntimeError(f"Level {l} offset detection failed (size 0)!")
         print("---------------------------------------\n")
 
-    def _get_tcnn_indices_per_level(self, encoding, x):
-        """
-        Probes the library to find the active indices for each level specifically.
-        Returns a list of tensors, where each tensor [N*8] contains the indices for that level.
-        """
+    def _get_tcnn_indices(self, encoding, x):
+        """ Returns all global indices touched by the batch across all layers. """
         x_probe = x.detach().clone().requires_grad_(True)
         orig_grad = encoding.params.grad.clone() if encoding.params.grad is not None else None
-        
-        # We need to know which index belongs to which point. 
-        # Since TCNN doesn't expose this, we use a custom backward per level.
-        all_level_indices = []
-        
-        # Forward pass once
-        features = encoding(x_probe) # Shape [N, L * n_feats]
-        
-        for l in range(self.L):
-            encoding.params.grad = None
-            # Backprop only this level's features
-            # This 'lights up' ONLY the parameters used by this level
-            features[:, l*self.n_feats : (l+1)*self.n_feats].sum().backward(retain_graph=True)
-            
-            # These are the global indices for this specific level
-            indices = torch.where(encoding.params.grad != 0)[0]
-            all_level_indices.append(indices)
-
+        encoding.params.grad = None
+        encoding(x_probe).sum().backward()
+        touched_indices = torch.where(encoding.params.grad != 0)[0]
         encoding.params.grad = orig_grad
-        return all_level_indices
+        return touched_indices
 
     @torch.no_grad()
     def track_step(self, coords_world, bound, loss_vec, encoding):
@@ -115,75 +95,51 @@ class CollisionTracker:
         
         x_valid = torch.clamp(x[valid], 0.0, 1.0 - 1e-6)
         g = loss_vec.detach().reshape(-1)[valid]
-        N = x_valid.shape[0]
         
-        # 1. We need the EXACT mapping. 
-        # Since the fused kernel hides this, we probe one level at a time 
-        # and use the fact that TCNN processes the batch in order.
         with torch.enable_grad():
-            x_probe = x_valid.detach().clone().requires_grad_(True)
-            features = encoding(x_probe)
-            
-            for l in range(self.L):
-                encoding.params.grad = None
-                # Backprop only the specific level
-                features[:, l*self.n_feats : (l+1)*self.n_feats].sum().backward(retain_graph=True)
-                
-                # These are the global indices touched by TCNN for THIS level
-                # Because N points touch 8 corners each, we expect N*8*n_feats indices
-                touched_indices = torch.where(encoding.params.grad != 0)[0]
-                
-                # Logic: Map the Voxel Grid for Level L
-                res = math.floor(self.N_min * (self.b ** l))
-                stride = res + 1
-                base_v = torch.floor(x_valid * res).long()
-                all_v = (base_v.unsqueeze(0) + self.offsets_3d.unsqueeze(1)).reshape(-1, 3)
-                v_idx = all_v[:, 0] + stride * (all_v[:, 1] + stride * all_v[:, 2])
-                
-                # Accumulate Importance G(l, v)
-                self.voxel_grads[l].index_add_(0, v_idx, g.repeat_interleave(8))
-
-                # 2. THE CRITICAL FIX: Distribute the probed indices across the voxels
-                # TCNN interleaves: [Bin_A_f0, Bin_A_f1, Bin_B_f0, Bin_B_f1...]
-                # We extract the unique Bin IDs (Physical addresses)
-                unique_bins = torch.unique(touched_indices // self.n_feats) * self.n_feats
-                
-                if unique_bins.numel() > 0:
-                    # We can't do a 1-to-1 point mapping perfectly without the C++ source, 
-                    # but we can do a "Batch Attribution". 
-                    # Instead of .min(), we attribute the set of bins to the set of voxels.
-                    num_to_map = min(v_idx.unique().size(0), unique_bins.size(0))
-                    v_u = v_idx.unique()[:num_to_map]
-                    h_u = unique_bins[:num_to_map]
-                    self.voxel_to_bin[l][v_u] = h_u
-
-    def _compute_final_stats(self):
-        final_eff = torch.zeros((self.L, self.T), device='cuda')
-        final_max = torch.zeros((self.L, self.T), device='cuda')
-        final_sum = torch.zeros((self.L, self.T), device='cuda')
+            touched_indices = self._get_tcnn_indices(encoding, x_valid)
 
         for l in range(self.L):
-            # Only consider voxels that have been mapped to a bin AND have received gradients
-            active_mask = (self.voxel_to_bin[l] != -1) & (self.voxel_grads[l] > 1e-9)
-            if not active_mask.any(): continue
+            res = math.floor(self.N_min * (self.b ** l))
+            stride = res + 1
             
-            v_indices = torch.where(active_mask)[0]
-            v_grads = self.voxel_grads[l][v_indices]
+            # 1. Geometric Voxel Tracking
+            base_v = torch.floor(x_valid * res).long()
+            all_v = (base_v.unsqueeze(0) + self.offsets_3d.unsqueeze(1)).reshape(-1, 3)
+            v_idx = all_v[:, 0] + stride * (all_v[:, 1] + stride * all_v[:, 2])
             
-            global_bins = self.voxel_to_bin[l][v_indices]
-            local_bins = (global_bins - self.level_offsets[l]) // self.n_feats
-            local_bins = torch.clamp(local_bins, 0, self.T - 1)
+            # Aggregate importance for this batch
+            g_rep = g.repeat_interleave(8)
+            v_idx_unique, v_inv = torch.unique(v_idx, return_inverse=True)
+            batch_v_grads = torch.zeros(v_idx_unique.size(0), device='cuda')
+            batch_v_grads.index_add_(0, v_inv, g_rep)
             
-            # Use unique voxels to count C_eff correctly
-            # We want to know how many unique v_idx map to each local_bin
-            # To do this perfectly, we use index_add with ones
-            ones = torch.ones_like(local_bins, dtype=torch.float32)
-            final_eff[l].index_add_(0, local_bins, ones)
-            
-            final_sum[l].index_add_(0, local_bins, v_grads)
-            final_max[l].index_reduce_(0, local_bins, v_grads, reduce='amax', include_self=False)
+            # Global Importance G(l, v)
+            self.voxel_grads[l].index_add_(0, v_idx_unique, batch_v_grads)
 
-        return final_eff, final_max, final_sum
+            # 2. Hash Bin Tracking
+            start, end = self.level_offsets[l], (self.level_offsets[l+1] if l < self.L-1 else encoding.params.shape[0])
+            level_indices = touched_indices[(touched_indices >= start) & (touched_indices < end)]
+            
+            if level_indices.numel() > 0:
+                bin_indices_unique = torch.unique(level_indices // self.n_feats)
+                local_bins = (bin_indices_unique - (self.level_offsets[l] // self.n_feats))
+                local_bins = torch.clamp(local_bins, 0, self.T - 1)
+                
+                # Update C_eff load: Density = (Unique Voxels in Batch) / (Unique Bins in Batch)
+                load = v_idx_unique.numel() / local_bins.numel()
+                self.bin_eff_count[l].index_add_(0, local_bins, torch.full_like(local_bins, load))
+                
+                # Update Importance Load
+                batch_max = batch_v_grads.max()
+                batch_avg = batch_v_grads.mean()
+                
+                self.bin_total_grad[l].index_add_(0, local_bins, torch.full_like(local_bins, batch_avg))
+                self.bin_max_grad[l].index_reduce_(0, local_bins, torch.full_like(local_bins, batch_max), reduce='amax', include_self=True)
+
+    def _compute_final_stats(self):
+        eff = self.bin_eff_count.clamp(min=1.0)
+        return eff, self.bin_max_grad, self.bin_total_grad
 
     def save(self, path):
         eff, mx, sm = self._compute_final_stats()
@@ -196,26 +152,17 @@ class CollisionTracker:
 
     def print_collision_summary(self):
         eff, mx, sm = self._compute_final_stats()
-        print("\n" + "="*125)
-        print(f"{'MHE SPATIAL COLLISION DENSITY & DOMINANCE ANALYSIS':^125}")
-        print("="*125)
-        header = f"{'L':<3} | {'Res':<5} | {'Bins (Occ)':<10} | {'C_eff (Min/Avg/Max)':<25} | {'R_dom (Min/Avg/Max)':<25}"
-        print(header)
-        print("-" * len(header))
-
+        print("\n" + "="*125 + f"\n{'MHE SPATIAL COLLISION DENSITY & DOMINANCE ANALYSIS':^125}\n" + "="*125)
+        print(f"{'L':<3} | {'Res':<5} | {'Bins (Occ)':<10} | {'C_eff (Min/Avg/Max)':<25} | {'R_dom (Min/Avg/Max)':<25}")
+        
         for l in range(self.L):
-            occ = (sm[l] > 1e-9) 
-            num_occ = occ.sum().item()
-            if num_occ > 0:
-                c_eff_occ = eff[l][occ]
-                c_eff_str = f"{c_eff_occ.min():.0f} / {c_eff_occ.mean():.2f} / {c_eff_occ.max():.0f}"
-                
-                # R_dom calculation: Max/Sum
+            occ = (sm[l] > 1e-9)
+            if occ.any():
+                c_eff = eff[l][occ]
+                # R_dom is defined as Max / Total
                 r_dom = mx[l][occ] / sm[l][occ].clamp(min=1e-9)
-                r_dom_str = f"{r_dom.min():.4f} / {r_dom.mean():.4f} / {r_dom.max():.4f}"
-                
-                res = math.floor(self.N_min * (self.b ** l))
-                print(f"{l+1:<3} | {res:<5} | {num_occ:<10,} | {c_eff_str:<25} | {r_dom_str:<25}")
+                print(f"{l+1:<3} | {math.floor(self.N_min*(self.b**l)):<5} | {occ.sum():<10,} | "
+                      f"{c_eff.min():.0f}/{c_eff.mean():.1f}/{c_eff.max():.0f} | {r_dom.min():.4f}/{r_dom.mean():.4f}/{r_dom.max():.4f}")
 
 class OccupancyGrid:
     """ A lightweight/simple occupancy grid. """
