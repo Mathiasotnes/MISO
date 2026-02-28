@@ -218,7 +218,7 @@ class Trainer(object):
                 self.optimizer.step()
                 if isinstance(self.model, GridNGPOurs):
                     if self.model.track_collisions:
-                        self.model.tracker.update(model_input['coords'])
+                        self.model.tracker.update(model_input)
             else:
                 logger.warning(f"Loss at epoch {epoch} is nan! Skip backward step.")
 
