@@ -185,7 +185,7 @@ class MultiResHashEncoding(nn.Module):
             # corner_offsets: (8, 3) → broadcast to (N, 8, 3)
             corners = x_floor.unsqueeze(1) + self.corner_offsets.unsqueeze(0) # corners: (N, 8, 3)
             corners_flat = corners.reshape(N * 8, 3) # (N*8, 3)
-            indices = spatial_hash(corners_flat) # (N*8,)
+            indices = spatial_hash(corners_flat, self.T) # (N*8,)
 
             table = self.hash_tables[level_idx]
             feats = table(indices) # (N*8, F)
