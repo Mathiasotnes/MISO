@@ -892,10 +892,6 @@ class MisoLossMappingBase(BaseLoss):
                     loss_type=self.loss_type
                 )
                 model.tracker.track_step(coords_world, model.bound, sdf_loss_vector, model.encoding)
-                
-        if isinstance(model, GridNGPOurs):
-            if model.track_collisions:
-                model.tracker.update(model_input['coords'])
         
         return loss_dict
 
