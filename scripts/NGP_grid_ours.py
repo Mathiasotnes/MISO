@@ -59,7 +59,7 @@ def initialize_scannet(args):
     dataset = utils_scannet.create_scannet_dataset(args.scannet_root, args.scene, n_rays=cfg['sample']['n_rays'], frame_downsample=1)
     cfg = create_configs_scannet(args, dataset)
 
-    hash_grid = GridNGPOurs(cfg['model'], device=cfg['device'], dtype=torch.float32, track_collisions=False)
+    hash_grid = GridNGPOurs(cfg['model'], device=cfg['device'], dtype=torch.float32, track_collisions=True)
     hash_grid.to(cfg['device'])
     
     return cfg, hash_grid, dataset
