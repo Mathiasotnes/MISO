@@ -5,6 +5,7 @@ from typing import List
 from grid_opt.configs import *
 from grid_opt.models.grid_net import GridNet
 from grid_opt.models.grid_ngp import GridNGP
+from grid_opt.models.grid_ngp_ours import GridNGPOurs
 from grid_opt.models.neural_points import NeuralPoints
 from grid_opt.models.neural_points_hash import NeuralPointsHash
 from grid_opt.datasets.submap_dataset import SubmapDataset
@@ -39,7 +40,7 @@ class Mapper:
             track_occupancy=False,
             init_neural_points=False,
         ):
-        assert isinstance(model, GridNet) or isinstance(model, GridNGP) or isinstance(model, NeuralPoints) or isinstance(model, NeuralPointsHash), f"Invalid model type {type(model)}."
+        assert isinstance(model, GridNet) or isinstance(model, GridNGP) or isinstance(model, GridNGPOurs) or isinstance(model, NeuralPoints) or isinstance(model, NeuralPointsHash), f"Invalid model type {type(model)}."
         self.grid = model
         self.dataset = dataset
         self.train_loader = DataLoader(dataset, shuffle=True, batch_size=1, num_workers=0)
