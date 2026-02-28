@@ -438,7 +438,12 @@ class GridTrainer(Trainer):
                 self.level_optimizers.append(optimizer)
 
         # Create a joint optimizer for final finetune
-        self.joint_optimizer = optim_class(self.model.parameters(), lr=self.cfg['learning_rate']) 
+        self.joint_optimizer = optim_class(
+            self.model.parameters(),
+            lr=self.cfg['learning_rate'],
+            eps=self.optimizer_eps,
+            betas=self.optimizer_betas
+        )
         
         # Set active optimizer
         self.reset_convergence_check()
