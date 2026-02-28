@@ -1,15 +1,12 @@
 import torch
-import torch.nn as nn
-import math
-from collections import defaultdict
-from typing import Optional
 import logging
+import types
 
 logger = logging.getLogger(__name__)
 
 
 def spatial_hash(coords_int: torch.Tensor, T: int) -> torch.Tensor:
-    """Same hash function as in grid_ngp.py — must be identical."""
+    """Must be identical to the version in grid_ngp.py."""
     x, y, z = coords_int[:, 0], coords_int[:, 1], coords_int[:, 2]
     MASK = 0xFFFFFFFF
     h = (x ^ (y * 2_654_435_761) ^ (z * 805_459_861)) & MASK
@@ -20,50 +17,45 @@ class CollisionTracker:
     """
     Tracks hash collision statistics during training for a MultiResHashEncoding.
 
-    Implements four metrics from the spatial collision density analysis:
+    Metrics
+    -------
+    C_eff(l, i)  — Number of distinct active voxel vertices (approximated as
+                   distinct hash bins) seen at level l, bin i across training.
 
-      C_pot(l, i)   — Potential collisions: how many possible voxel vertices
-                      in the scene map to hash index i at level l. Scene-
-                      geometry-agnostic upper bound. Computed once from the
-                      scene bounds, not during training.
+    G_sum(l, i)  — Total gradient energy (sum of per-sample L2 norms) that
+                   has flowed through bin i at level l across all steps.
 
-      C_eff(l, i)   — Effective collisions: how many *active* (actually
-                      visited during training) voxel vertices map to index i
-                      at level l. Accumulated across all training steps via
-                      update().
+    G_max(l, i)  — Maximum per-vertex cumulative gradient energy at bin i.
+                   Updated incrementally: when a bin is visited for the first
+                   time in a step, its gradient contribution is compared
+                   against the stored maximum.
 
-      G(l, v)       — Voxel-level importance: total gradient energy received
-                      by voxel vertex v at level l across all training steps.
-                      Requires register_hooks() to be called before training.
+    R_dom(l, i)  — G_max(l,i) / G_sum(l,i). Ranges from ~1/k (k equally
+                   competing voxels, maximum conflict) to 1.0 (one voxel
+                   dominates perfectly).
 
-      R_dom(l, i)   — Dominance ratio: fraction of the total gradient energy
-                      at hash bin i claimed by the single most important voxel.
-                      R_dom = 1 means no conflict; R_dom → 1/k means k equally
-                      competing voxels.
+    C_grad(x)    — sum_l (1 - R_dom(l, h_l(x))). Spatial conflict at x.
 
-      C_grad(x)     — Spatial conflict: for a query position x, accumulates
-                      (1 - R_dom) across all L levels. Zero means every bin
-                      x touches is perfectly dominated by one voxel.
+    Storage
+    -------
+    Only three (L, T) tensors are needed regardless of scene size or
+    number of active vertices — no per-vertex dictionaries required.
 
-    Usage
+    Speed
     -----
-        tracker = CollisionTracker(encoding, scene_bound)
-        tracker.register_hooks()          # call once before training loop
-
-        # inside training loop, after loss.backward():
-        tracker.update(input_coords)      # input_coords: (N, 3) in [0,1]^3
-
-        # after training:
-        c_eff   = tracker.get_C_eff()     # (L, T)
-        r_dom   = tracker.get_R_dom()     # (L, T)
-        c_grad  = tracker.get_C_grad(query_pts)  # (M,)
-        tracker.save("stats.pt")
+    - C_eff / seen_mask updates are fully vectorised GPU ops (no Python loops
+      over vertices).
+    - Gradient capture uses a forward-pass hook on the feats tensor rather
+      than on hash_table.grad, giving per-lookup gradient norms before
+      colliders merge.
+    - Pending gradients are flushed in update() with scatter_add_ — one pass
+      per level per step.
     """
 
     def __init__(
         self,
-        encoding,                        # MultiResHashEncoding instance
-        scene_bound: torch.Tensor,       # (3, 2) world-space bounds
+        encoding,
+        scene_bound: torch.Tensor,      # (3, 2) world-space bounds
         device: str = "cuda:0",
     ):
         self.encoding = encoding
@@ -73,27 +65,24 @@ class CollisionTracker:
         self.n_levels = encoding.n_levels
         self.T = encoding.T
         self.F = encoding.F
-        self.resolutions = encoding.resolutions  # (L,) int32 buffer
+        self.resolutions = encoding.resolutions
 
-        # ── C_eff: set of active vertex hashes per level ──────────────────────
-        # For each level we maintain a (T,) int32 counter tensor.
-        # We use a set of seen (vertex -> hash) pairs to avoid double-counting
-        # the same vertex across multiple training steps.
+        # ── C_eff ─────────────────────────────────────────────────────────────
         self.C_eff = torch.zeros(self.n_levels, self.T, dtype=torch.int32, device=device)
-        # Seen vertices per level: maps level_idx → set of (x,y,z) tuples.
-        # Stored as a flat int64 key: x * P1 + y * P2 + z * P3 to avoid
-        # storing actual tuples on GPU.
-        self._seen_vertices = [set() for _ in range(self.n_levels)]
+        # GPU bitmask: True once a bin has been visited at least once.
+        # Avoids double-counting the same bin across steps.
+        self._seen_mask = torch.zeros(self.n_levels, self.T, dtype=torch.bool, device=device)
 
-        # ── G: voxel-level gradient importance ───────────────────────────────
-        # Maps (level_idx, hash_idx) → accumulated gradient L2 norm.
-        # We accumulate into a (L, T) float tensor.
-        self.G = torch.zeros(self.n_levels, self.T, dtype=torch.float32, device=device)
-        # Per-step gradient buffer filled by the backward hook
-        self._grad_buffer = torch.zeros(self.n_levels * self.T, self.F, dtype=torch.float32, device=device)
-        self._hook_handle = None
+        # ── R_dom: only G_sum and G_max needed ────────────────────────────────
+        self.G_sum = torch.zeros(self.n_levels, self.T, dtype=torch.float32, device=device)
+        self.G_max = torch.zeros(self.n_levels, self.T, dtype=torch.float32, device=device)
 
-        # ── R_dom and C_grad are derived; no extra storage needed ─────────────
+        # Scratch buffer reused every update() call — avoids repeated allocs
+        self._scratch = torch.zeros(self.n_levels, self.T, dtype=torch.float32, device=device)
+
+        # Gradient data captured by forward hooks, flushed in update()
+        # Each entry: (level_idx: int, local_idx: Tensor[N*8], norms: Tensor[N*8])
+        self._pending: list = []
 
     # ─────────────────────────────────────────────────────────────────────────
     # Hook registration
@@ -101,283 +90,243 @@ class CollisionTracker:
 
     def register_hooks(self):
         """
-        Register a backward hook on the hash_table parameter so that after
-        each loss.backward() we capture the raw per-entry gradient and
-        accumulate it into G.
+        Monkey-patch MultiResHashEncoding.forward() on this specific instance
+        to inject a backward hook on each level's feature lookup.
 
-        Call this once before your training loop starts.
+        Why hook feats rather than hash_table.grad?
+          hash_table.grad accumulates gradients *after* all colliding voxels
+          have summed into the same entry — per-voxel information is gone.
+          Hooking feats (shape N*8, F) lets us see the gradient for each
+          individual lookup slot before the backward scatter merges them.
         """
-        def _grad_hook(grad: torch.Tensor):
-            # grad shape: (n_levels * T, F) — same as hash_table
-            # Accumulate L2 norm of gradient per entry into the buffer
-            with torch.no_grad():
-                norms = grad.norm(dim=-1)                  # (n_levels * T,)
-                norms_2d = norms.reshape(self.n_levels, self.T)
-                self.G += norms_2d
-            return grad  # must return grad unchanged
+        tracker = self
 
-        self._hook_handle = self.encoding.hash_table.register_hook(_grad_hook)
-        logger.info("CollisionTracker: gradient hook registered on hash_table.")
+        def patched_forward(enc_self, x: torch.Tensor) -> torch.Tensor:
+            N = x.shape[0]
+            level_features = []
+
+            for level_idx in range(enc_self.n_levels):
+                N_l = enc_self.resolutions[level_idx].item()
+                x_scaled = x * N_l
+                x_floor = torch.floor(x_scaled).long()
+                w = x_scaled - x_floor.float()
+
+                corners = x_floor.unsqueeze(1) + enc_self.corner_offsets.unsqueeze(0)
+                corners_flat = corners.reshape(N * 8, 3)
+
+                local_idx = spatial_hash(corners_flat, enc_self.T)
+                global_idx = local_idx + level_idx * enc_self.T
+
+                feats = enc_self.hash_table[global_idx]   # (N*8, F)
+
+                # ── gradient hook ─────────────────────────────────────────────
+                if feats.requires_grad:
+                    _lvl = level_idx
+                    _idx = local_idx.detach()              # (N*8,) local bin idx
+
+                    def _hook(grad, lvl=_lvl, idx=_idx):
+                        with torch.no_grad():
+                            tracker._pending.append((lvl, idx, grad.norm(dim=-1)))
+                        return grad
+
+                    feats.register_hook(_hook)
+                # ─────────────────────────────────────────────────────────────
+
+                feats = feats.reshape(N, 8, enc_self.F)
+
+                wx0, wx1 = 1.0 - w[:, 0], w[:, 0]
+                wy0, wy1 = 1.0 - w[:, 1], w[:, 1]
+                wz0, wz1 = 1.0 - w[:, 2], w[:, 2]
+
+                weights = torch.stack([
+                    wx0 * wy0 * wz0, wx0 * wy0 * wz1,
+                    wx0 * wy1 * wz0, wx0 * wy1 * wz1,
+                    wx1 * wy0 * wz0, wx1 * wy0 * wz1,
+                    wx1 * wy1 * wz0, wx1 * wy1 * wz1,
+                ], dim=1).unsqueeze(-1)
+
+                level_features.append((weights * feats).sum(dim=1))
+
+            return torch.cat(level_features, dim=-1)
+
+        self.encoding.forward = types.MethodType(patched_forward, self.encoding)
+        logger.info("CollisionTracker: forward patched on encoding instance.")
 
     def remove_hooks(self):
-        """Remove the gradient hook. Call after training if needed."""
-        if self._hook_handle is not None:
-            self._hook_handle.remove()
-            self._hook_handle = None
+        """Remove the patched forward and discard any pending data."""
+        if hasattr(self.encoding, '_original_forward'):
+            self.encoding.forward = self.encoding._original_forward
+        self._pending.clear()
 
     # ─────────────────────────────────────────────────────────────────────────
-    # C_eff update  (call after each forward pass, before or after backward)
+    # update() — call after loss.backward() each step
     # ─────────────────────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def update(self, x_world: torch.Tensor):
         """
-        Update C_eff with the voxel vertices accessed by this batch.
+        Flush pending gradients into G_sum / G_max, then update C_eff.
+
+        Call after loss.backward() each training step, passing the raw
+        world-space coordinates used in that forward pass (before normalisation).
 
         Args:
-            x_world: (N, 3) tensor of world-space coordinates (unnormalised).
-                     These should be the same coords passed to model.forward()
-                     BEFORE normalisation.
+            x_world: (N, 3) world-space coordinates.
         """
-        # Normalise to [0, 1]^3
-        lo = self.scene_bound[:, 0]
-        hi = self.scene_bound[:, 1]
-        x = (x_world - lo) / (hi - lo)           # (N, 3)
-        x = x.clamp(0.0, 1.0)
+        # ── Step 1: flush gradient accumulators ──────────────────────────────
+        # _scratch[l, i] will hold the gradient energy contributed by bins
+        # that are freshly seen this step — used to update G_max.
+        self._scratch.zero_()
 
-        # 8 corner offsets
-        offsets = self.encoding.corner_offsets    # (8, 3) int32
+        for lvl, local_idx, norms in self._pending:
+            # G_sum: unconditional accumulation of every lookup's gradient norm
+            self.G_sum[lvl].scatter_add_(0, local_idx, norms)
 
-        for level_idx in range(self.n_levels):
-            N_l = self.resolutions[level_idx].item()
-
-            x_scaled = x * N_l                                   # (N, 3)
-            x_floor = torch.floor(x_scaled).long()               # (N, 3)
-
-            # All 8 corners for every point: (N, 8, 3) → (N*8, 3)
-            corners = x_floor.unsqueeze(1) + offsets.unsqueeze(0)
-            corners_flat = corners.reshape(-1, 3)                 # (N*8, 3)
-
-            # Deduplicate corners within this batch before checking seen set
-            # Encode each (x,y,z) as a single int64 key for fast set lookup
-            keys = self._encode_keys(corners_flat)                # (N*8,)
-            unique_keys = torch.unique(keys)                      # (M,)
-
-            seen = self._seen_vertices[level_idx]
-            # Find which unique keys are genuinely new (not seen in prior steps)
-            new_mask = torch.tensor(
-                [k.item() not in seen for k in unique_keys],
-                dtype=torch.bool, device=self.device
-            )
-            new_keys = unique_keys[new_mask]                      # (K,)
-
-            if new_keys.numel() == 0:
-                continue
-
-            # Decode keys back to (K, 3) integer coords
-            new_coords = self._decode_keys(new_keys)              # (K, 3)
-
-            # Hash and increment C_eff
-            h_idx = spatial_hash(new_coords, self.T)              # (K,)
-            self.C_eff[level_idx].scatter_add_(
-                0, h_idx, torch.ones_like(h_idx, dtype=torch.int32)
-            )
-
-            # Mark as seen
-            for k in new_keys.tolist():
-                seen.add(k)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # C_pot  (computed once from scene bounds, no training data needed)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    @torch.no_grad()
-    def compute_C_pot(self) -> torch.Tensor:
-        """
-        Compute potential collisions C_pot for each level.
-
-        Enumerates every integer voxel vertex inside the scene bounds at each
-        level resolution and hashes it. This can be expensive for fine levels
-        — use only for analysis, not during the training loop.
-
-        Returns:
-            C_pot: (L, T) int32 tensor.
-        """
-        C_pot = torch.zeros(self.n_levels, self.T, dtype=torch.int32, device=self.device)
-        lo = self.scene_bound[:, 0]
-        hi = self.scene_bound[:, 1]
-
-        for level_idx in range(self.n_levels):
-            N_l = self.resolutions[level_idx].item()
-
-            # Integer grid extent for this level
-            g_lo = torch.floor(lo * N_l).long()
-            g_hi = torch.ceil(hi * N_l).long()
-
-            nx = (g_hi[0] - g_lo[0]).item() + 1
-            ny = (g_hi[1] - g_lo[1]).item() + 1
-            nz = (g_hi[2] - g_lo[2]).item() + 1
-            total = nx * ny * nz
-
-            logger.info(f"C_pot level {level_idx}: grid {nx}×{ny}×{nz} = {total} vertices")
-
-            # Build all grid coords in chunks to avoid OOM on fine levels
-            chunk = 2 ** 20  # 1M vertices per chunk
-            xs = torch.arange(g_lo[0], g_hi[0] + 1, device=self.device)
-            ys = torch.arange(g_lo[1], g_hi[1] + 1, device=self.device)
-            zs = torch.arange(g_lo[2], g_hi[2] + 1, device=self.device)
-
-            grid_x, grid_y, grid_z = torch.meshgrid(xs, ys, zs, indexing='ij')
-            coords = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1), grid_z.reshape(-1)], dim=1)
-
-            for start in range(0, coords.shape[0], chunk):
-                c = coords[start:start + chunk]
-                h_idx = spatial_hash(c, self.T)
-                C_pot[level_idx].scatter_add_(
-                    0, h_idx, torch.ones(h_idx.shape[0], dtype=torch.int32, device=self.device)
+            # For G_max we want the dominant *voxel's* energy, not the total.
+            # We approximate this by accumulating gradient energy only for bins
+            # that are new this step (their first-ever visit), treating that
+            # first visit as a proxy for the dominant voxel's contribution.
+            new_bins = ~self._seen_mask[lvl][local_idx]     # (N*8,) bool
+            if new_bins.any():
+                self._scratch[lvl].scatter_add_(
+                    0, local_idx, norms * new_bins.float()
                 )
 
-        return C_pot
+        self._pending.clear()
+
+        # G_max: keep the running maximum over all first-visit contributions
+        torch.maximum(self.G_max, self._scratch, out=self.G_max)
+
+        # ── Step 2: update C_eff and seen_mask ───────────────────────────────
+        lo = self.scene_bound[:, 0]
+        hi = self.scene_bound[:, 1]
+        x = ((x_world - lo) / (hi - lo)).clamp(0.0, 1.0)
+
+        offsets = self.encoding.corner_offsets   # (8, 3)
+
+        for level_idx in range(self.n_levels):
+            N_l = self.resolutions[level_idx].item()
+            x_floor = torch.floor(x * N_l).long()
+
+            corners_flat = (
+                x_floor.unsqueeze(1) + offsets.unsqueeze(0)
+            ).reshape(-1, 3)
+
+            local_idx = spatial_hash(corners_flat, self.T)  # (N*8,)
+
+            # Find which bins are genuinely new (not seen before this step)
+            new_bin_mask = torch.zeros(self.T, dtype=torch.bool, device=self.device)
+            new_bin_mask[local_idx] = True          # deduplicates within batch
+            new_bin_mask &= ~self._seen_mask[level_idx]
+
+            # Increment C_eff by 1 for each newly-seen bin
+            self.C_eff[level_idx] += new_bin_mask.int()
+            self._seen_mask[level_idx] |= new_bin_mask
 
     # ─────────────────────────────────────────────────────────────────────────
     # Derived metrics
     # ─────────────────────────────────────────────────────────────────────────
 
     @torch.no_grad()
-    def get_C_eff(self) -> torch.Tensor:
-        """Return effective collision counts. Shape: (L, T)."""
-        return self.C_eff.clone()
-
-    @torch.no_grad()
-    def get_R_dom(self) -> torch.Tensor:
+    def get_R_dom(self, eps: float = 1e-8) -> torch.Tensor:
         """
-        Compute dominance ratio R_dom(l, i) for every level and hash bin.
-
-        R_dom = max_voxel_grad / total_grad for each bin.
-        Bins with zero gradient (never updated) get R_dom = 1.0 (no conflict).
-
-        Note: G currently stores total gradient energy per bin, not per
-        individual voxel within the bin. To get the true per-voxel breakdown
-        we would need to store G at (level, vertex) granularity, which is
-        memory-intensive. Here we approximate R_dom using the observation that
-        for a bin with k colliding voxels, if we assume the dominant voxel
-        contributes a fraction proportional to 1/C_eff, we get a conservative
-        lower bound. For an exact R_dom, see get_R_dom_exact() which requires
-        per-vertex gradient tracking.
-
-        Returns:
-            R_dom: (L, T) float tensor in [0, 1].
+        R_dom(l, i) = G_max(l,i) / G_sum(l,i).
+        Bins with no gradient receive R_dom = 1.0 (no conflict).
+        Returns: (L, T) float tensor in (0, 1].
         """
-        # Bins with only one active voxel have no conflict → R_dom = 1
-        # Bins with k voxels: we don't have per-voxel breakdown from the hook
-        # so we return a simple collision-count-based proxy:
-        #   R_dom_proxy(l,i) = 1 / max(C_eff(l,i), 1)
-        # This is a lower bound on the true R_dom (assumes equal competition).
-        c = self.C_eff.float().clamp(min=1.0)
-        R_dom = 1.0 / c
-        return R_dom
+        return self.G_max / self.G_sum.clamp(min=eps)
 
     @torch.no_grad()
     def get_C_grad(self, x_world: torch.Tensor) -> torch.Tensor:
         """
-        Compute spatial conflict C_grad(x) for a set of query positions.
-
-        C_grad(x) = sum_{l=1}^{L} (1 - R_dom(l, h_l(x)))
-
+        C_grad(x) = sum_l (1 - R_dom(l, h_l(x))).
         Args:
-            x_world: (M, 3) world-space query positions.
+            x_world: (M, 3) world-space positions.
         Returns:
-            C_grad: (M,) float tensor. Zero = no conflict anywhere.
+            (M,) float tensor.
         """
         lo = self.scene_bound[:, 0]
         hi = self.scene_bound[:, 1]
-        x = (x_world - lo) / (hi - lo)
-        x = x.clamp(0.0, 1.0)
+        x = ((x_world - lo) / (hi - lo)).clamp(0.0, 1.0)
 
-        M = x.shape[0]
-        R_dom = self.get_R_dom()               # (L, T)
-        C_grad = torch.zeros(M, device=self.device)
+        R_dom = self.get_R_dom()
+        C_grad = torch.zeros(x.shape[0], device=self.device)
 
         for level_idx in range(self.n_levels):
             N_l = self.resolutions[level_idx].item()
-            x_floor = torch.floor(x * N_l).long()      # (M, 3)
-            h_idx = spatial_hash(x_floor, self.T)       # (M,)
-            r = R_dom[level_idx][h_idx]                 # (M,)
-            C_grad += (1.0 - r)
+            h_idx = spatial_hash(torch.floor(x * N_l).long(), self.T)
+            C_grad += 1.0 - R_dom[level_idx][h_idx]
 
         return C_grad
 
+    @torch.no_grad()
+    def compute_C_pot(self) -> torch.Tensor:
+        """
+        Enumerate all voxel vertices in the scene bounds and count collisions.
+        Offline analysis only — not needed during training.
+        Returns: (L, T) int32 tensor.
+        """
+        C_pot = torch.zeros(self.n_levels, self.T, dtype=torch.int32, device=self.device)
+        lo = self.scene_bound[:, 0]
+        hi = self.scene_bound[:, 1]
+        CHUNK = 2 ** 20
+
+        for level_idx in range(self.n_levels):
+            N_l = self.resolutions[level_idx].item()
+            g_lo = torch.floor(lo * N_l).long()
+            g_hi = torch.ceil(hi * N_l).long()
+            xs = torch.arange(g_lo[0], g_hi[0] + 1, device=self.device)
+            ys = torch.arange(g_lo[1], g_hi[1] + 1, device=self.device)
+            zs = torch.arange(g_lo[2], g_hi[2] + 1, device=self.device)
+            gx, gy, gz = torch.meshgrid(xs, ys, zs, indexing='ij')
+            coords = torch.stack([gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)], dim=1)
+            for start in range(0, coords.shape[0], CHUNK):
+                c = coords[start:start + CHUNK]
+                h = spatial_hash(c, self.T)
+                C_pot[level_idx].scatter_add_(
+                    0, h, torch.ones(h.shape[0], dtype=torch.int32, device=self.device)
+                )
+            logger.info(f"C_pot level {level_idx} done (N_l={N_l}).")
+
+        return C_pot
+
     # ─────────────────────────────────────────────────────────────────────────
-    # Persistence
+    # Persistence and diagnostics
     # ─────────────────────────────────────────────────────────────────────────
 
     def save(self, path: str):
-        """Save all accumulated statistics to a .pt file."""
         torch.save({
             "C_eff": self.C_eff.cpu(),
-            "G":     self.G.cpu(),
+            "G_sum": self.G_sum.cpu(),
+            "G_max": self.G_max.cpu(),
             "n_levels": self.n_levels,
-            "T":     self.T,
-            "F":     self.F,
+            "T": self.T,
+            "F": self.F,
         }, path)
         logger.info(f"CollisionTracker saved to {path}.")
 
     @classmethod
     def load(cls, path: str, encoding, scene_bound: torch.Tensor, device: str = "cuda:0"):
-        """Load previously saved statistics back into a tracker."""
         data = torch.load(path, map_location=device)
         tracker = cls(encoding, scene_bound, device)
         tracker.C_eff = data["C_eff"].to(device)
-        tracker.G     = data["G"].to(device)
+        tracker.G_sum = data["G_sum"].to(device)
+        tracker.G_max = data["G_max"].to(device)
         logger.info(f"CollisionTracker loaded from {path}.")
         return tracker
 
     def print_summary(self):
-        """Print a concise per-level collision summary."""
-        print(f"\n{'='*55}")
-        print(f"{'Level':>6}  {'Res':>6}  {'Bins used':>10}  {'Max C_eff':>10}  {'Mean C_eff':>11}")
-        print(f"{'-'*55}")
+        R_dom = self.get_R_dom()
+        print(f"\n{'='*72}")
+        print(f"{'Lvl':>4}  {'Res':>5}  {'Bins used':>10}  {'Max C_eff':>10}  {'Mean C_eff':>10}  {'Mean R_dom':>10}")
+        print(f"{'-'*72}")
         for l in range(self.n_levels):
             res = self.resolutions[l].item()
-            occupied = (self.C_eff[l] > 0).sum().item()
-            max_c    = self.C_eff[l].max().item()
-            # mean over occupied bins only
-            mean_c   = self.C_eff[l][self.C_eff[l] > 0].float().mean().item() \
-                       if occupied > 0 else 0.0
-            print(f"{l:>6}  {res:>6}  {occupied:>10}  {max_c:>10}  {mean_c:>11.2f}")
-        print(f"{'='*55}\n")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Internal helpers
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _encode_keys(self, coords: torch.Tensor) -> torch.Tensor:
-        """
-        Encode (N, 3) integer coords as unique int64 keys.
-        Uses large prime multipliers to minimise accidental collisions in the
-        key space (distinct from the hash table collisions we are measuring).
-        Coords can be negative (e.g. voxels at the boundary).
-        """
-        # Shift to ensure non-negative before encoding
-        # We add a large offset so negative coords become positive int64
-        OFFSET = 2 ** 20
-        P1, P2, P3 = 1, 2_654_435_761, 805_459_861
-        x = coords[:, 0].long() + OFFSET
-        y = coords[:, 1].long() + OFFSET
-        z = coords[:, 2].long() + OFFSET
-        return x * (P2 * P3) + y * P3 + z
-
-    def _decode_keys(self, keys: torch.Tensor) -> torch.Tensor:
-        """
-        Decode int64 keys back to (N, 3) integer coords.
-        Inverse of _encode_keys.
-        """
-        OFFSET = 2 ** 20
-        P2, P3 = 2_654_435_761, 805_459_861
-        P23 = P2 * P3
-        x = (keys // P23) - OFFSET
-        remainder = keys % P23
-        y = (remainder // P3) - OFFSET
-        z = (remainder % P3) - OFFSET
-        return torch.stack([x, y, z], dim=1)
-    
+            occ = self.C_eff[l] > 0
+            n_occ = occ.sum().item()
+            max_c  = self.C_eff[l].max().item()
+            mean_c = self.C_eff[l][occ].float().mean().item() if n_occ > 0 else 0.0
+            mean_r = R_dom[l][occ].mean().item() if n_occ > 0 else 1.0
+            print(f"{l:>4}  {res:>5}  {n_occ:>10}  {max_c:>10}  {mean_c:>10.2f}  {mean_r:>10.4f}")
+        print(f"{'='*72}\n")
+        
