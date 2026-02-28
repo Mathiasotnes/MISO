@@ -70,7 +70,7 @@ class Mapper:
         )
 
 
-    def mapping(self, mapping_kfs, iterations=10, level_iterations=5):
+    def mapping(self, mapping_kfs, iterations=10, level_iterations=5, optimizer_eps=1e-8, optimizer_betas=(0.9, 0.999)):
         """
         Map the specified keyframes in the SLAM system.
         """
@@ -95,6 +95,8 @@ class Mapper:
             self.train_loader,
             None,
             self.cfg['device'],
+            optimizer_eps,
+            optimizer_betas,
             torch.float32
         )
         if self.verbose:

@@ -81,7 +81,9 @@ def mapping(cfg, hash_grid:BaseNet, dataset:SubmapDataset):
     mapper.mapping(
         mapping_kfs=range(frame_start, frame_end),
         iterations=cfg['train']['epochs'],
-        level_iterations=cfg['train']['max_epochs_in_level']
+        level_iterations=cfg['train']['max_epochs_in_level'],
+        optimizer_eps=1e-15,
+        optimizer_betas=(0.9, 0.99)
     )
     
 def calculate_model_sparsity(model: torch.nn.Module):
@@ -187,8 +189,9 @@ def main_scannet():
     verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
     verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
     
-    BOUNDS = torch.tensor([[-0.02,  10.38], [-0.01, 8.74], [-0.01,  3.03]]) # NOTE: Hardcoded for scene0000_00!
-    analyze_disambiguation(stats_path="./collision_stats.pt", mesh_path=mesh_path, gt_mesh_path=gt_mesh_path, bound=BOUNDS)
+    # Disambiguation Analysis
+    # BOUNDS = torch.tensor([[-0.02,  10.38], [-0.01, 8.74], [-0.01,  3.03]]) # NOTE: Hardcoded for scene0000_00!
+    # analyze_disambiguation(stats_path="./collision_stats.pt", mesh_path=mesh_path, gt_mesh_path=gt_mesh_path, bound=BOUNDS)
     
     metrics_results = compute_chamfer_metrics(verts_pred, verts_trgt, threshold=0.05)
     print(json.dumps(metrics_results, indent=4))
