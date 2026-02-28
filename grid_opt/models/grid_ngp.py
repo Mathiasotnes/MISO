@@ -127,15 +127,15 @@ class CollisionTracker:
                 local_bins = torch.clamp(local_bins, 0, self.T - 1)
                 
                 # Update C_eff load: Density = (Unique Voxels in Batch) / (Unique Bins in Batch)
-                load = v_idx_unique.numel() / local_bins.numel()
-                self.bin_eff_count[l].index_add_(0, local_bins, torch.full_like(local_bins, load))
+                load = float(v_idx_unique.numel()) / float(local_bins.numel())
+                self.bin_eff_count[l].index_add_(0, local_bins, torch.full_like(local_bins, load, dtype=torch.float32))
                 
                 # Update Importance Load
                 batch_max = batch_v_grads.max()
                 batch_avg = batch_v_grads.mean()
                 
-                self.bin_total_grad[l].index_add_(0, local_bins, torch.full_like(local_bins, batch_avg))
-                self.bin_max_grad[l].index_reduce_(0, local_bins, torch.full_like(local_bins, batch_max), reduce='amax', include_self=True)
+                self.bin_total_grad[l].index_add_(0, local_bins, torch.full_like(local_bins, batch_avg, dtype=torch.float32))
+                self.bin_max_grad[l].index_reduce_(0, local_bins, torch.full_like(local_bins, batch_max, dtype=torch.float32), reduce='amax', include_self=True)
 
     def _compute_final_stats(self):
         eff = self.bin_eff_count.clamp(min=1.0)
