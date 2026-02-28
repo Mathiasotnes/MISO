@@ -115,40 +115,47 @@ class CollisionTracker:
         
         x_valid = torch.clamp(x[valid], 0.0, 1.0 - 1e-6)
         g = loss_vec.detach().reshape(-1)[valid]
+        N = x_valid.shape[0]
         
-        # Get active indices isolated by level
+        # 1. We need the EXACT mapping. 
+        # Since the fused kernel hides this, we probe one level at a time 
+        # and use the fact that TCNN processes the batch in order.
         with torch.enable_grad():
-            indices_per_level = self._get_tcnn_indices_per_level(encoding, x_valid)
-
-        for l in range(self.L):
-            res = math.floor(self.N_min * (self.b ** l))
-            stride = res + 1
+            x_probe = x_valid.detach().clone().requires_grad_(True)
+            features = encoding(x_probe)
             
-            # Geometric Voxel Mapping
-            base_v = torch.floor(x_valid * res).long()
-            all_v = (base_v.unsqueeze(0) + self.offsets_3d.unsqueeze(1)).reshape(-1, 3)
-            v_idx = all_v[:, 0] + stride * (all_v[:, 1] + stride * all_v[:, 2])
-            
-            # G(l, v) accumulation
-            self.voxel_grads[l].index_add_(0, v_idx, g.repeat_interleave(8))
-
-            # Correct Voxel-to-Bin Mapping
-            level_indices = indices_per_level[l]
-            
-            # Logic: If we have N points, TCNN touched at most N*8 bins.
-            # We need to map v_idx[j] to level_indices[j].
-            # Because we can't guarantee 1-to-1 order from the gradient probe,
-            # we use a "Batch-Set" approach: we know these voxels map to THESE bins.
-            if level_indices.numel() > 0:
-                # We sort both to create a stable (if approximate) mapping for the batch
-                # In hash-grids, spatial proximity = index proximity.
-                # This ensures distinct voxels are assigned to distinct bins.
-                v_unique = torch.unique(v_idx)
-                h_unique = torch.unique(level_indices // self.n_feats)
+            for l in range(self.L):
+                encoding.params.grad = None
+                # Backprop only the specific level
+                features[:, l*self.n_feats : (l+1)*self.n_feats].sum().backward(retain_graph=True)
                 
-                # Map the unique voxels in this batch to the unique bins they touched
-                num_to_map = min(v_unique.size(0), h_unique.size(0))
-                self.voxel_to_bin[l][v_unique[:num_to_map]] = h_unique[:num_to_map] * self.n_feats
+                # These are the global indices touched by TCNN for THIS level
+                # Because N points touch 8 corners each, we expect N*8*n_feats indices
+                touched_indices = torch.where(encoding.params.grad != 0)[0]
+                
+                # Logic: Map the Voxel Grid for Level L
+                res = math.floor(self.N_min * (self.b ** l))
+                stride = res + 1
+                base_v = torch.floor(x_valid * res).long()
+                all_v = (base_v.unsqueeze(0) + self.offsets_3d.unsqueeze(1)).reshape(-1, 3)
+                v_idx = all_v[:, 0] + stride * (all_v[:, 1] + stride * all_v[:, 2])
+                
+                # Accumulate Importance G(l, v)
+                self.voxel_grads[l].index_add_(0, v_idx, g.repeat_interleave(8))
+
+                # 2. THE CRITICAL FIX: Distribute the probed indices across the voxels
+                # TCNN interleaves: [Bin_A_f0, Bin_A_f1, Bin_B_f0, Bin_B_f1...]
+                # We extract the unique Bin IDs (Physical addresses)
+                unique_bins = torch.unique(touched_indices // self.n_feats) * self.n_feats
+                
+                if unique_bins.numel() > 0:
+                    # We can't do a 1-to-1 point mapping perfectly without the C++ source, 
+                    # but we can do a "Batch Attribution". 
+                    # Instead of .min(), we attribute the set of bins to the set of voxels.
+                    num_to_map = min(v_idx.unique().size(0), unique_bins.size(0))
+                    v_u = v_idx.unique()[:num_to_map]
+                    h_u = unique_bins[:num_to_map]
+                    self.voxel_to_bin[l][v_u] = h_u
 
     def _compute_final_stats(self):
         final_eff = torch.zeros((self.L, self.T), device='cuda')
