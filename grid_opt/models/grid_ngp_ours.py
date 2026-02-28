@@ -300,7 +300,7 @@ class GridNGPOurs(BaseNet):
         self.print_trainable_params()
         
         if self.track_collisions:
-            self.tracker = CollisionTracker(self.model.encoding, self.model.bound, device=cfg['device'])
+            self.tracker = CollisionTracker(self.encoding, self.bound, device=cfg['device'])
             self.tracker.register_hooks()
         
     def init_occupancy_grid(self, cfg):
