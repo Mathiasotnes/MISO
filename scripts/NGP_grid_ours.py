@@ -174,8 +174,9 @@ def main_scannet():
     
     # Save collision statistics
     if hash_grid.track_collisions:
+        hash_grid.tracker.print_summary()
         hash_grid.tracker.save("collision_stats.pt")
-        hash_grid.tracker.print_collision_summary()
+        # c_grad = hash_grid.tracker.get_C_grad(query_pts)
     
     # Check Sparsity
     sparsity = calculate_model_sparsity(hash_grid)
@@ -188,10 +189,6 @@ def main_scannet():
     
     verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
     verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
-    
-    hash_grid.tracker.print_summary()
-    hash_grid.tracker.save("./collision_stats.pt")
-    # c_grad = hash_grid.tracker.get_C_grad(query_pts)
     
     # Disambiguation Analysis
     # BOUNDS = torch.tensor([[-0.02,  10.38], [-0.01, 8.74], [-0.01,  3.03]]) # NOTE: Hardcoded for scene0000_00!
