@@ -882,7 +882,7 @@ class MisoLossMappingBase(BaseLoss):
                     model.init_neural_points(coords_v, sdf_v)
 
         # NGP Grid collision tracking:
-        if isinstance(model, GridNGP) or isinstance(model, GridNGPOurs):
+        if isinstance(model, GridNGP):
             if model.track_collisions:
                 sdf_loss_vector = miso_loss_regression_vector(
                     pred=pred_sdf,
@@ -892,6 +892,10 @@ class MisoLossMappingBase(BaseLoss):
                     loss_type=self.loss_type
                 )
                 model.tracker.track_step(coords_world, model.bound, sdf_loss_vector, model.encoding)
+                
+        if isinstance(model, GridNGPOurs):
+            if model.track_collisions:
+                model.tracker.update(model_input['coords'])
         
         return loss_dict
 

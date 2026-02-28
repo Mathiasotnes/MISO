@@ -6,6 +6,7 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from .utils.utils import cond_mkdir, PerfTimer, prepare_batch
 import time
+from grid_opt.models.grid_ngp_ours import GridNGPOurs
 
 import logging
 logger = logging.getLogger(__name__)
@@ -215,6 +216,9 @@ class Trainer(object):
             if not torch.isnan(total_loss):
                 total_loss.backward(retain_graph=False)
                 self.optimizer.step()
+                if isinstance(self.model, GridNGPOurs):
+                    if self.model.track_collisions:
+                        self.model.tracker.update(model_input['coords'])
             else:
                 logger.warning(f"Loss at epoch {epoch} is nan! Skip backward step.")
 

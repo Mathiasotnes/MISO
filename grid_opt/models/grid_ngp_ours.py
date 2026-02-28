@@ -3,7 +3,7 @@ import numpy as np
 import math
 import torch
 import torch.nn as nn
-import grid_opt.utils.utils as utils
+from .collision_tracker import CollisionTracker
 from .base_net import BaseNet
 from .grid_modules import *
 import grid_opt.utils.utils_geometry as utils_geometry
@@ -298,6 +298,10 @@ class GridNGPOurs(BaseNet):
         
         self.model = torch.nn.Sequential(self.encoding, self.decoder)
         self.print_trainable_params()
+        
+        if self.track_collisions:
+            self.tracker = CollisionTracker(self.model.encoding, self.model.bound, device=cfg['device'])
+            self.tracker.register_hooks()
         
     def init_occupancy_grid(self, cfg):
         self.occupancy_grid = OccupancyGrid(device=self.device, bound=self.bound)
