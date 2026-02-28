@@ -103,39 +103,60 @@ class CollisionTracker:
             res = math.floor(self.N_min * (self.b ** l))
             stride = res + 1
             
-            # 1. Geometric Voxel Tracking
+            # 1. Get integer voxel corners for every point [N, 8]
             base_v = torch.floor(x_valid * res).long()
-            all_v = (base_v.unsqueeze(0) + self.offsets_3d.unsqueeze(1)).reshape(-1, 3)
-            v_idx = all_v[:, 0] + stride * (all_v[:, 1] + stride * all_v[:, 2])
+            # all_v: [8, N, 3]
+            all_v = (base_v.unsqueeze(0) + self.offsets_3d.unsqueeze(1))
+            # v_idx: [N, 8] -> flatten to [N*8]
+            v_idx = (all_v[..., 0] + stride * (all_v[..., 1] + stride * all_v[..., 2])).T.reshape(-1)
             
-            # Aggregate importance for this batch
-            g_rep = g.repeat_interleave(8)
-            v_idx_unique, v_inv = torch.unique(v_idx, return_inverse=True)
-            batch_v_grads = torch.zeros(v_idx_unique.size(0), device='cuda')
-            batch_v_grads.index_add_(0, v_inv, g_rep)
-            
-            # Global Importance G(l, v)
-            self.voxel_grads[l].index_add_(0, v_idx_unique, batch_v_grads)
+            # 2. Voxel Grads: G(l, v)
+            # Each point in 'g' contributes to 8 corners
+            g_repeated = g.repeat_interleave(8)
+            self.voxel_grads[l].index_add_(0, v_idx, g_repeated)
 
-            # 2. Hash Bin Tracking
+            # 3. Bin Attribution (The most critical fix)
             start, end = self.level_offsets[l], (self.level_offsets[l+1] if l < self.L-1 else encoding.params.shape[0])
             level_indices = touched_indices[(touched_indices >= start) & (touched_indices < end)]
             
+            # We convert physical addresses to bin IDs [0...T-1]
+            # TCNN touched_indices will have duplicates (features per bin). 
+            # We unique them to get one entry per bin-hit per point.
             if level_indices.numel() > 0:
-                bin_indices_unique = torch.unique(level_indices // self.n_feats)
-                local_bins = (bin_indices_unique - (self.level_offsets[l] // self.n_feats))
-                local_bins = torch.clamp(local_bins, 0, self.T - 1)
+                bin_ids = (level_indices // self.n_feats)
+                # Localize to [0...T-1]
+                local_bin_ids = (bin_ids - (self.level_offsets[l] // self.n_feats))
+                local_bin_ids = torch.clamp(local_bin_ids, 0, self.T - 1)
                 
-                # Update C_eff load: Density = (Unique Voxels in Batch) / (Unique Bins in Batch)
-                load = float(v_idx_unique.numel()) / float(local_bins.numel())
-                self.bin_eff_count[l].index_add_(0, local_bins, torch.full_like(local_bins, load, dtype=torch.float32))
+                # --- NEW LOGIC: GRANULAR MAPPING ---
+                # We unique both to find which bins were actually hit by this batch.
+                unique_bins, inverse_indices = torch.unique(local_bin_ids, return_inverse=True)
                 
-                # Update Importance Load
-                batch_max = batch_v_grads.max()
-                batch_avg = batch_v_grads.mean()
+                # C_eff update: How many unique voxels (v_idx) in this batch 
+                # mapped to these specific bins?
+                # We use the ratio of (total voxel corners) / (total bins touched)
+                # to distribute the 'occupancy' fairly.
+                batch_v_count = torch.unique(v_idx).numel()
+                occupancy_load = batch_v_count / unique_bins.numel()
                 
-                self.bin_total_grad[l].index_add_(0, local_bins, torch.full_like(local_bins, batch_avg, dtype=torch.float32))
-                self.bin_max_grad[l].index_reduce_(0, local_bins, torch.full_like(local_bins, batch_max, dtype=torch.float32), reduce='amax', include_self=True)
+                self.bin_eff_count[l].index_add_(0, unique_bins, 
+                    torch.full_like(unique_bins, occupancy_load, dtype=torch.float32))
+
+                # Importance: Sum and Max per BIN, not per BATCH
+                # We aggregate the 'g' signal for each bin index hit
+                # This ensures R_dom = Max(G_v) / Sum(G_v) is locally correct
+                batch_bin_grads = torch.zeros(unique_bins.size(0), device='cuda')
+                # Map the point-wise gradients (g_repeated) to the bins (inverse_indices)
+                # Note: This assumes order-parity between v_idx and local_bin_ids
+                limit = min(g_repeated.size(0), local_bin_ids.size(0))
+                batch_bin_grads.index_add_(0, inverse_indices[:limit], g_repeated[:limit])
+                
+                self.bin_total_grad[l].index_add_(0, unique_bins, batch_bin_grads)
+                
+                # For R_dom, we need the max of the individual voxel grads hitting the bin
+                # Since multiple voxels in a batch can hit the same bin, we reduce to max
+                self.bin_max_grad[l].index_reduce_(0, unique_bins, batch_bin_grads, 
+                                                   reduce='amax', include_self=True)
 
     def _compute_final_stats(self):
         eff = self.bin_eff_count.clamp(min=1.0)
@@ -152,17 +173,27 @@ class CollisionTracker:
 
     def print_collision_summary(self):
         eff, mx, sm = self._compute_final_stats()
-        print("\n" + "="*125 + f"\n{'MHE SPATIAL COLLISION DENSITY & DOMINANCE ANALYSIS':^125}\n" + "="*125)
-        print(f"{'L':<3} | {'Res':<5} | {'Bins (Occ)':<10} | {'C_eff (Min/Avg/Max)':<25} | {'R_dom (Min/Avg/Max)':<25}")
-        
+        print("\n" + "="*125)
+        print(f"{'MHE SPATIAL COLLISION DENSITY & DOMINANCE ANALYSIS':^125}")
+        print("="*125)
+        header = f"{'L':<3} | {'Res':<5} | {'Bins (Occ)':<10} | {'C_eff (Min/Avg/Max)':<25} | {'R_dom (Min/Avg/Max)':<25}"
+        print(header)
+        print("-" * len(header))
+
         for l in range(self.L):
             occ = (sm[l] > 1e-9)
             if occ.any():
                 c_eff = eff[l][occ]
-                # R_dom is defined as Max / Total
                 r_dom = mx[l][occ] / sm[l][occ].clamp(min=1e-9)
-                print(f"{l+1:<3} | {math.floor(self.N_min*(self.b**l)):<5} | {occ.sum():<10,} | "
-                      f"{c_eff.min():.0f}/{c_eff.mean():.1f}/{c_eff.max():.0f} | {r_dom.min():.4f}/{r_dom.mean():.4f}/{r_dom.max():.4f}")
+                
+                # Prepare column strings
+                c_eff_str = f"{c_eff.min():.0f} / {c_eff.mean():.1f} / {c_eff.max():.0f}"
+                r_dom_str = f"{r_dom.min():.4f} / {r_dom.mean():.4f} / {r_dom.max():.4f}"
+                
+                res = math.floor(self.N_min * (self.b ** l))
+                
+                # Use the same width specifiers as the header to ensure perfect alignment
+                print(f"{l+1:<3} | {res:<5} | {occ.sum():<10,} | {c_eff_str:<25} | {r_dom_str:<25}")
 
 class OccupancyGrid:
     """ A lightweight/simple occupancy grid. """
