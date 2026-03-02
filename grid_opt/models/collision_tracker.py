@@ -200,8 +200,13 @@ class CollisionTracker:
             idx = torch.searchsorted(history_voxels, unique_packed)
             
             # Create a mask of which voxels we have genuinely seen before
-            is_present = (idx < len(history_voxels)) & \
-                         (history_voxels[idx.clamp(max=len(history_voxels)-1)] == unique_packed)
+            if len(history_voxels) == 0:
+                # First step ever: nothing is present yet!
+                is_present = torch.zeros_like(unique_packed, dtype=torch.bool)
+            else:
+                # Safely check against existing history
+                is_present = (idx < len(history_voxels)) & \
+                             (history_voxels[idx.clamp(max=len(history_voxels)-1)] == unique_packed)
 
             # --- Update EXISTING voxels ---
             if is_present.any():
