@@ -13,29 +13,6 @@ def spatial_hash(coords_int: torch.Tensor, T: int) -> torch.Tensor:
 
 
 class CollisionTracker:
-    """
-    Tracks hash collision statistics during training for a MultiResHashEncoding.
-
-    Metrics
-    -------
-    C_eff(l, i)  — Number of distinct active voxel vertices (approximated as
-                   distinct hash bins) seen at level l, bin i across training.
-
-    G_sum(l, i)  — Total gradient energy (sum of per-sample L2 norms) that
-                   has flowed through bin i at level l across all steps.
-
-    G_max(l, i)  — Maximum per-vertex cumulative gradient energy at bin i.
-                   Updated incrementally: when a bin is visited for the first
-                   time in a step, its gradient contribution is compared
-                   against the stored maximum.
-
-    R_dom(l, i)  — G_max(l,i) / G_sum(l,i). Ranges from ~1/k (k equally
-                   competing voxels, maximum conflict) to 1.0 (one voxel
-                   dominates perfectly).
-
-    C_grad(x)    — sum_l (1 - R_dom(l, h_l(x))). Spatial conflict at x.
-    """
-
     def __init__(
         self,
         encoding,
@@ -51,7 +28,7 @@ class CollisionTracker:
         self.F = encoding.F
         self.resolutions = encoding.resolutions
         
-        # If finest resolution is above 2**20, the _seen_voxels tensor overflows and breaks down
+        # If finest resolution is above 2**20, the _seen_voxels tensor overflows
         assert self.resolutions[-1].item() <= 2**20, "Finest resolution must be <= 2^20 to avoid overflow in seen_voxels."
         
         # ── C_eff Voxel Tracking ──────────────────────────────────────────────
@@ -76,16 +53,6 @@ class CollisionTracker:
     # ─────────────────────────────────────────────────────────────────────────
 
     def register_hooks(self):
-        """
-        Monkey-patch MultiResHashEncoding.forward() on this specific instance
-        to inject a backward hook on each level's feature lookup.
-
-        Why hook feats rather than hash_table.grad?
-          hash_table.grad accumulates gradients *after* all colliding voxels
-          have summed into the same entry — per-voxel information is gone.
-          Hooking feats (shape N*8, F) lets us see the gradient for each
-          individual lookup slot before the backward scatter merges them.
-        """
         tracker = self
 
         def patched_forward(enc_self, x: torch.Tensor) -> torch.Tensor:
@@ -103,17 +70,26 @@ class CollisionTracker:
 
                 local_idx = spatial_hash(corners_flat, enc_self.T)
                 global_idx = local_idx + level_idx * enc_self.T
+                
+                # --- PACK VOXELS NOW, IN THE FORWARD PASS ---
+                packed_voxels = (
+                    (corners_flat[:, 0] << 42) | 
+                    (corners_flat[:, 1] << 21) | 
+                     corners_flat[:, 2]
+                )
 
                 feats = enc_self.hash_table[global_idx]   # (N*8, F)
 
                 # ── gradient hook ─────────────────────────────────────────────
                 if feats.requires_grad:
                     _lvl = level_idx
-                    _idx = local_idx.detach()              # (N*8,) local bin idx
+                    _idx = local_idx.detach()
+                    _packed = packed_voxels.detach()
 
-                    def _hook(grad, lvl=_lvl, idx=_idx):
+                    # Attach the perfectly aligned packed voxels to the backward hook!
+                    def _hook(grad, lvl=_lvl, idx=_idx, pck=_packed):
                         with torch.no_grad():
-                            tracker._pending.append((lvl, idx, grad.norm(dim=-1)))
+                            tracker._pending.append((lvl, idx, pck, grad.norm(dim=-1)))
                         return grad
 
                     feats.register_hook(_hook)
@@ -140,7 +116,6 @@ class CollisionTracker:
         logger.info("CollisionTracker: forward patched on encoding instance.")
 
     def remove_hooks(self):
-        """Remove the patched forward and discard any pending data."""
         try:
             del self.encoding.forward
             logger.info("CollisionTracker: hooks removed, forward restored.")
@@ -153,58 +128,43 @@ class CollisionTracker:
     # ─────────────────────────────────────────────────────────────────────────
 
     @torch.no_grad()
-    def update(self, x_world: torch.Tensor):
-        lo = self.scene_bound[:, 0]
-        hi = self.scene_bound[:, 1]
-        x_norm = ((x_world - lo) / (hi - lo)).clamp(0.0, 1.0)
-        N = x_norm.shape[0]
-
-        # Pre-group pending gradients by level to avoid looping multiple times
-        pending_by_lvl = {l: ([], []) for l in range(self.n_levels)}
-        for p_lvl, p_idx, p_norms in self._pending:
+    def update(self, x_world: torch.Tensor = None):
+        """
+        x_world is no longer needed since we packed the voxels in the forward pass,
+        but it remains as a parameter to avoid breaking the trainer script.
+        """
+        # Pre-group pending gradients by level 
+        pending_by_lvl = {l: ([], [], []) for l in range(self.n_levels)}
+        for p_lvl, p_idx, p_packed, p_norms in self._pending:
             pending_by_lvl[p_lvl][0].append(p_idx)
-            pending_by_lvl[p_lvl][1].append(p_norms)
+            pending_by_lvl[p_lvl][1].append(p_packed)
+            pending_by_lvl[p_lvl][2].append(p_norms)
 
         for level_idx in range(self.n_levels):
-            # 1. Standardize the batch gradients for this level
             if not pending_by_lvl[level_idx][0]:
                 continue
                 
             local_idx = torch.cat(pending_by_lvl[level_idx][0])
-            norms = torch.cat(pending_by_lvl[level_idx][1])
+            packed_voxels = torch.cat(pending_by_lvl[level_idx][1])
+            norms = torch.cat(pending_by_lvl[level_idx][2])
             
-            # G_sum unconditionally accumulates the bin's total energy
+            # 1. G_sum unconditionally accumulates the bin's total energy
             self.G_sum[level_idx].scatter_add_(0, local_idx, norms)
 
-            # 2. Calculate coordinates and pack exactly as before
-            N_l = self.resolutions[level_idx].item()
-            x_scaled = x_norm * N_l
-            x_floor = torch.floor(x_scaled).long()
-            corners_flat = (x_floor.unsqueeze(1) + self.encoding.corner_offsets.unsqueeze(0)).reshape(N * 8, 3)
-
-            packed_voxels = (
-                (corners_flat[:, 0] << 42) | 
-                (corners_flat[:, 1] << 21) | 
-                 corners_flat[:, 2]
-            )
-
-            # 3. Sum the gradient energy per unique voxel IN THIS BATCH
+            # 2. Sum the gradient energy per unique voxel IN THIS BATCH
             unique_packed, inverse_indices = torch.unique(packed_voxels, return_inverse=True)
             batch_G = torch.zeros_like(unique_packed, dtype=torch.float32)
             batch_G.scatter_add_(0, inverse_indices, norms)
 
-            # 4. Use searchsorted to find where these voxels belong in our global history
+            # 3. Use searchsorted to find where these voxels belong in our global history
             history_voxels = self._seen_voxels[level_idx]
             history_G = self._seen_G[level_idx]
             
             idx = torch.searchsorted(history_voxels, unique_packed)
             
-            # Create a mask of which voxels we have genuinely seen before
             if len(history_voxels) == 0:
-                # First step ever: nothing is present yet!
                 is_present = torch.zeros_like(unique_packed, dtype=torch.bool)
             else:
-                # Safely check against existing history
                 is_present = (idx < len(history_voxels)) & \
                              (history_voxels[idx.clamp(max=len(history_voxels)-1)] == unique_packed)
 
@@ -245,47 +205,30 @@ class CollisionTracker:
 
     @torch.no_grad()
     def get_R_dom(self, eps: float = 1e-8) -> torch.Tensor:
-        """
-        R_dom(l, i) = G_max(l,i) / G_sum(l,i).
-        Calculates the true maximum voxel gradient.
-        """
         G_max = torch.zeros_like(self.G_sum)
         
         for l in range(self.n_levels):
             if self._seen_voxels[l].numel() == 0:
                 continue
                 
-            # 1. Unpack our global voxel history to 3D
             packed = self._seen_voxels[l]
             x = packed >> 42
             y = (packed >> 21) & 0x1FFFFF
             z = packed & 0x1FFFFF
             corners_3d = torch.stack([x, y, z], dim=-1)
             
-            # 2. Hash them to find which bin each voxel maps to
             bins = spatial_hash(corners_3d, self.T)
             
-            # 3. Find the maximum gradient score (G_max) inside each bin!
-            # scatter_reduce with 'amax' perfectly extracts the single dominant voxel's score.
             G_max[l].scatter_reduce_(
                 0, bins, self._seen_G[l], reduce="amax", include_self=False
             )
 
         R_dom = G_max / self.G_sum.clamp(min=eps)
-        R_dom[self.G_sum == 0] = 1.0  # Untouched bins have no conflict
+        R_dom[self.G_sum == 0] = 1.0  
         return R_dom
 
     @torch.no_grad()
     def get_C_grad(self, x_world: torch.Tensor) -> torch.Tensor:
-        """
-        C_grad(x) = sum_l (1 - R_dom(l, h_l(x))).
-        Uses exact 8-corner trilinear weighting to match the model's forward pass.
-        
-        Args:
-            x_world: (M, 3) world-space positions.
-        Returns:
-            (M,) float tensor.
-        """
         lo = self.scene_bound[:, 0]
         hi = self.scene_bound[:, 1]
         x_norm = ((x_world - lo) / (hi - lo)).clamp(0.0, 1.0)
@@ -304,16 +247,10 @@ class CollisionTracker:
             corners = x_floor.unsqueeze(1) + self.encoding.corner_offsets.unsqueeze(0)
             corners_flat = corners.reshape(M * 8, 3)
 
-            # 1. Hash all 8 corners
-            h_idx = spatial_hash(corners_flat, self.T)  # (M*8,)
-
-            # 2. Look up R_dom for all 8 corners and reshape back to (M, 8)
+            h_idx = spatial_hash(corners_flat, self.T)
             r_dom_corners = R_dom[level_idx][h_idx].reshape(M, 8)
-            
-            # 3. Calculate conflict (1 - R_dom) for each corner
             conflict_corners = 1.0 - r_dom_corners
 
-            # 4. Calculate trilinear weights EXACTLY as in the forward pass
             wx0, wx1 = 1.0 - w[:, 0], w[:, 0]
             wy0, wy1 = 1.0 - w[:, 1], w[:, 1]
             wz0, wz1 = 1.0 - w[:, 2], w[:, 2]
@@ -323,29 +260,21 @@ class CollisionTracker:
                 wx0 * wy1 * wz0, wx0 * wy1 * wz1,
                 wx1 * wy0 * wz0, wx1 * wy0 * wz1,
                 wx1 * wy1 * wz0, wx1 * wy1 * wz1,
-            ], dim=1) # (M, 8)
+            ], dim=1) 
 
-            # 5. Blend the conflict using the exact interpolation weights
             C_grad += (weights * conflict_corners).sum(dim=1)
 
         return C_grad
 
     @torch.no_grad()
     def compute_C_pot(self) -> torch.Tensor:
-        """
-        Calculates the theoretical upper bound of collisions for the scene.
-        """
         self.C_pot = torch.zeros(self.n_levels, self.T, dtype=torch.long, device=self.device)
         CHUNK = 2 ** 24
 
         for level_idx in range(self.n_levels):
             N_l = self.resolutions[level_idx].item()
-            
-            # Since inputs are normalized to [0, 1] before scaling by N_l, 
-            # integer vertices always range exactly from 0 to N_l inclusive.
             total_vertices = (N_l + 1) ** 3
 
-            # If vertices < 134 million, compute exact map
             if total_vertices <= 2 ** 27:
                 xs = torch.arange(0, N_l + 1, device=self.device)
                 ys = torch.arange(0, N_l + 1, device=self.device)
@@ -360,8 +289,6 @@ class CollisionTracker:
                         0, h, torch.ones(h.shape[0], dtype=torch.long, device=self.device)
                     )
                 logger.info(f"C_pot layer {level_idx + 1} done exactly (Vertices={total_vertices:,}).")
-            
-            # If vertices are massive, use uniform distribution expectation
             else:
                 expected_collisions = total_vertices // self.T
                 self.C_pot[level_idx] = expected_collisions
@@ -374,10 +301,12 @@ class CollisionTracker:
     # ─────────────────────────────────────────────────────────────────────────
 
     def save(self, path: str):
+        # We now correctly save the exact history tensors and remove G_max
         torch.save({
             "C_eff": self.C_eff.cpu(),
             "G_sum": self.G_sum.cpu(),
-            "G_max": self.G_max.cpu(),
+            "_seen_voxels": [v.cpu() for v in self._seen_voxels],
+            "_seen_G": [g.cpu() for g in self._seen_G],
             "n_levels": self.n_levels,
             "T": self.T,
             "F": self.F,
@@ -390,12 +319,13 @@ class CollisionTracker:
         tracker = cls(encoding, scene_bound, device)
         tracker.C_eff = data["C_eff"].to(device)
         tracker.G_sum = data["G_sum"].to(device)
-        tracker.G_max = data["G_max"].to(device)
+        # Restore the exact history states
+        tracker._seen_voxels = [v.to(device) for v in data.get("_seen_voxels", [])]
+        tracker._seen_G = [g.to(device) for g in data.get("_seen_G", [])]
         logger.info(f"CollisionTracker loaded from {path}.")
         return tracker
 
     def print_summary(self):
-        """Prints a detailed, column-separated numerical comparison of the tracking metrics."""
         if self.C_pot is None:
             logger.info("Computing C_pot...")
             self.compute_C_pot()
@@ -420,20 +350,16 @@ class CollisionTracker:
         for l in range(self.n_levels):
             res = self.resolutions[l].item()
             
-            # --- Grid Utilization ---
             total_potential_voxels = (res + 1) ** 3
             total_active_voxels = self.C_eff[l].sum().item()
             util_pct = (total_active_voxels / max(total_potential_voxels, 1)) * 100
             
-            # --- C_pot stats ---
             cp_avg = self.C_pot[l].float().mean().item()
             str_cp_avg = fmt_large(cp_avg)
             
-            # --- Occupancy ---
             occ = self.C_eff[l] > 0
             num_occ = occ.sum().item()
             
-            # --- C_eff stats (over OCCUPIED bins only) ---
             ce = self.C_eff[l][occ].float()
             if num_occ > 0:
                 ce_min = int(ce.min().item())
@@ -442,7 +368,6 @@ class CollisionTracker:
             else:
                 ce_min, ce_max, ce_avg = 0, 0, 0.0
                 
-            # --- R_dom stats (over OCCUPIED bins only) ---
             rd = R_dom[l][occ]
             if num_occ > 0:
                 rd_min = rd.min().item()
@@ -451,7 +376,6 @@ class CollisionTracker:
             else:
                 rd_min, rd_max, rd_avg = 1.0, 1.0, 1.0
                 
-            # Print the row (l+1 for 1-16 numbering, 7.2f for percentage)
             print(
                 f"{l+1:>3} | {res:>6} | {util_pct:>7.2f}% | {num_occ:>10} | {str_cp_avg:>10} | "
                 f"{ce_min:>9} | {ce_max:>9} | {ce_avg:>9.2f} | "
