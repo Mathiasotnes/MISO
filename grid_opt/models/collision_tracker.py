@@ -207,7 +207,7 @@ class CollisionTracker:
             bins = spatial_hash(_unpack(self._voxels[l]), self.T)
 
             G_sum[l].scatter_add_(0, bins, self._G[l])
-            G_max[l].scatter_reduce_(0, bins, self._G[l], reduce="amax", include_self=False)
+            G_max[l].scatter_reduce_(0, bins, self._G[l], reduce="amax", include_self=True)
 
         R_dom = G_max / G_sum.clamp(min=eps)
         R_dom[G_sum == 0] = 1.0
