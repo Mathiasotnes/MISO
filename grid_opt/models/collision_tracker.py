@@ -240,14 +240,17 @@ class CollisionTracker:
         """
         R_dom(l, i) = G_max(l,i) / G_sum(l,i).
         Bins with no gradient receive R_dom = 1.0 (no conflict).
-        Returns: (L, T) float tensor in (0, 1].
         """
-        return self.G_max / self.G_sum.clamp(min=eps)
+        R_dom = self.G_max / self.G_sum.clamp(min=eps)
+        R_dom[self.G_sum == 0] = 1.0
+        return R_dom
 
     @torch.no_grad()
     def get_C_grad(self, x_world: torch.Tensor) -> torch.Tensor:
         """
         C_grad(x) = sum_l (1 - R_dom(l, h_l(x))).
+        Uses exact 8-corner trilinear weighting to match the model's forward pass.
+        
         Args:
             x_world: (M, 3) world-space positions.
         Returns:
@@ -255,15 +258,45 @@ class CollisionTracker:
         """
         lo = self.scene_bound[:, 0]
         hi = self.scene_bound[:, 1]
-        x = ((x_world - lo) / (hi - lo)).clamp(0.0, 1.0)
+        x_norm = ((x_world - lo) / (hi - lo)).clamp(0.0, 1.0)
+        M = x_norm.shape[0]
 
         R_dom = self.get_R_dom()
-        C_grad = torch.zeros(x.shape[0], device=self.device)
+        C_grad = torch.zeros(M, device=self.device)
 
         for level_idx in range(self.n_levels):
             N_l = self.resolutions[level_idx].item()
-            h_idx = spatial_hash(torch.floor(x * N_l).long(), self.T)
-            C_grad += 1.0 - R_dom[level_idx][h_idx]
+            
+            x_scaled = x_norm * N_l
+            x_floor = torch.floor(x_scaled).long()
+            w = x_scaled - x_floor.float()
+
+            corners = x_floor.unsqueeze(1) + self.encoding.corner_offsets.unsqueeze(0)
+            corners_flat = corners.reshape(M * 8, 3)
+
+            # 1. Hash all 8 corners
+            h_idx = spatial_hash(corners_flat, self.T)  # (M*8,)
+
+            # 2. Look up R_dom for all 8 corners and reshape back to (M, 8)
+            r_dom_corners = R_dom[level_idx][h_idx].reshape(M, 8)
+            
+            # 3. Calculate conflict (1 - R_dom) for each corner
+            conflict_corners = 1.0 - r_dom_corners
+
+            # 4. Calculate trilinear weights EXACTLY as in the forward pass
+            wx0, wx1 = 1.0 - w[:, 0], w[:, 0]
+            wy0, wy1 = 1.0 - w[:, 1], w[:, 1]
+            wz0, wz1 = 1.0 - w[:, 2], w[:, 2]
+
+            weights = torch.stack([
+                wx0 * wy0 * wz0, wx0 * wy0 * wz1,
+                wx0 * wy1 * wz0, wx0 * wy1 * wz1,
+                wx1 * wy0 * wz0, wx1 * wy0 * wz1,
+                wx1 * wy1 * wz0, wx1 * wy1 * wz1,
+            ], dim=1) # (M, 8)
+
+            # 5. Blend the conflict using the exact interpolation weights
+            C_grad += (weights * conflict_corners).sum(dim=1)
 
         return C_grad
 
