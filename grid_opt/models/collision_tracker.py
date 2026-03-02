@@ -379,53 +379,65 @@ class CollisionTracker:
         return tracker
 
     def print_summary(self):
-        """Prints a side-by-side numerical comparison of the tracking metrics."""
+        """Prints a detailed, column-separated numerical comparison of the tracking metrics."""
         if self.C_pot is None:
             logger.info("Computing C_pot for the first time...")
             self.compute_C_pot()
 
         R_dom = self.get_R_dom()
         
-        print(f"\n{'='*92}")
-        print(f"{'Lvl':>3} | {'Res':>6} | {'C_pot (min/max/avg)':>20} | {'C_eff (min/max/avg)':>20} | {'R_dom (min/max/avg)':>20}")
-        print(f"{'-'*92}")
+        # Calculate table width based on column sizes
+        table_width = 109
+        print(f"\n{'='*table_width}")
+        print(
+            f"{'Lvl':>3} | {'Res':>6} | {'Occ (Bins)':>10} | {'C_pot avg':>10} | "
+            f"{'C_eff min':>9} | {'C_eff max':>9} | {'C_eff avg':>9} | "
+            f"{'R_dom min':>9} | {'R_dom max':>9} | {'R_dom avg':>9}"
+        )
+        print(f"{'-'*table_width}")
         
+        # Helper to keep massive C_pot averages readable without blowing up the column
+        def fmt_large(x):
+            if x >= 1e9: return f"{x/1e9:.1f}B"
+            if x >= 1e6: return f"{x/1e6:.1f}M"
+            if x >= 1e3: return f"{x/1e3:.1f}K"
+            return f"{int(x)}"
+
         for l in range(self.n_levels):
             res = self.resolutions[l].item()
             
-            # --- C_pot stats (over all T bins) ---
-            cp = self.C_pot[l].float()
-            cp_min, cp_max, cp_avg = cp.min().item(), cp.max().item(), cp.mean().item()
+            # --- C_pot stats ---
+            cp_avg = self.C_pot[l].float().mean().item()
+            str_cp_avg = fmt_large(cp_avg)
             
-            # Formatting large numbers nicely (e.g., 2.5B or 14M)
-            def fmt_large(x):
-                if x >= 1e9: return f"{x/1e9:.1f}B"
-                if x >= 1e6: return f"{x/1e6:.1f}M"
-                if x >= 1e3: return f"{x/1e3:.1f}K"
-                return f"{x:.0f}"
-            
-            str_cp = f"{fmt_large(cp_min)}/{fmt_large(cp_max)}/{fmt_large(cp_avg)}"
+            # --- Occupancy ---
+            occ = self.C_eff[l] > 0
+            num_occ = occ.sum().item()
             
             # --- C_eff stats (over OCCUPIED bins only) ---
-            # Unoccupied bins are 0, which skews the min/avg downward uselessly.
-            occ = self.C_eff[l] > 0
             ce = self.C_eff[l][occ].float()
-            if occ.any():
-                ce_min, ce_max, ce_avg = ce.min().item(), ce.max().item(), ce.mean().item()
+            if num_occ > 0:
+                ce_min = int(ce.min().item())
+                ce_max = int(ce.max().item())
+                ce_avg = ce.mean().item()
             else:
                 ce_min, ce_max, ce_avg = 0, 0, 0.0
-            str_ce = f"{ce_min:.0f}/{ce_max:.0f}/{ce_avg:.1f}"
-            
+                
             # --- R_dom stats (over OCCUPIED bins only) ---
             rd = R_dom[l][occ]
-            if occ.any():
-                rd_min, rd_max, rd_avg = rd.min().item(), rd.max().item(), rd.mean().item()
+            if num_occ > 0:
+                rd_min = rd.min().item()
+                rd_max = rd.max().item()
+                rd_avg = rd.mean().item()
             else:
                 rd_min, rd_max, rd_avg = 1.0, 1.0, 1.0
-            str_rd = f"{rd_min:.2f}/{rd_max:.2f}/{rd_avg:.2f}"
+                
+            # Print the row matching the exact formatting rules
+            print(
+                f"{l:>3} | {res:>6} | {num_occ:>10} | {str_cp_avg:>10} | "
+                f"{ce_min:>9} | {ce_max:>9} | {ce_avg:>9.2f} | "
+                f"{rd_min:>9.4f} | {rd_max:>9.4f} | {rd_avg:>9.4f}"
+            )
             
-            # Print the row
-            print(f"{l:>3} | {res:>6} | {str_cp:>20} | {str_ce:>20} | {str_rd:>20}")
-            
-        print(f"{'='*92}\n")
+        print(f"{'='*table_width}\n")
         
