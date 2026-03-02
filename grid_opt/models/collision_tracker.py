@@ -61,6 +61,9 @@ class CollisionTracker:
             torch.empty(0, dtype=torch.long, device=device) 
             for _ in range(self.n_levels)
         ]
+        
+        # ── C_pot ─────────────────────────────────────────────────────────────
+        self.C_pot = None
 
         # ── R_dom: only G_sum and G_max needed ────────────────────────────────
         self.G_sum = torch.zeros(self.n_levels, self.T, dtype=torch.float32, device=device)
@@ -303,33 +306,52 @@ class CollisionTracker:
     @torch.no_grad()
     def compute_C_pot(self) -> torch.Tensor:
         """
-        Enumerate all voxel vertices in the scene bounds and count collisions.
-        Offline analysis only — not needed during training.
-        Returns: (L, T) int32 tensor.
+        Calculates the theoretical upper bound of collisions for the scene.
+        For low resolutions, exactly enumerates all vertices.
+        For high resolutions, uses the uniform distribution expected value V / T 
+        to prevent OOM errors.
         """
-        C_pot = torch.zeros(self.n_levels, self.T, dtype=torch.int32, device=self.device)
+        # Using torch.long because high levels will exceed 2.1 billion (int32 limit)
+        self.C_pot = torch.zeros(self.n_levels, self.T, dtype=torch.long, device=self.device)
+        
         lo = self.scene_bound[:, 0]
         hi = self.scene_bound[:, 1]
-        CHUNK = 2 ** 20
+        CHUNK = 2 ** 24
 
         for level_idx in range(self.n_levels):
             N_l = self.resolutions[level_idx].item()
             g_lo = torch.floor(lo * N_l).long()
             g_hi = torch.ceil(hi * N_l).long()
-            xs = torch.arange(g_lo[0], g_hi[0] + 1, device=self.device)
-            ys = torch.arange(g_lo[1], g_hi[1] + 1, device=self.device)
-            zs = torch.arange(g_lo[2], g_hi[2] + 1, device=self.device)
-            gx, gy, gz = torch.meshgrid(xs, ys, zs, indexing='ij')
-            coords = torch.stack([gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)], dim=1)
-            for start in range(0, coords.shape[0], CHUNK):
-                c = coords[start:start + CHUNK]
-                h = spatial_hash(c, self.T)
-                C_pot[level_idx].scatter_add_(
-                    0, h, torch.ones(h.shape[0], dtype=torch.int32, device=self.device)
-                )
-            logger.info(f"C_pot level {level_idx} done (N_l={N_l}).")
+            
+            # Number of vertices along each axis
+            nx = (g_hi[0] - g_lo[0] + 1).item()
+            ny = (g_hi[1] - g_lo[1] + 1).item()
+            nz = (g_hi[2] - g_lo[2] + 1).item()
+            total_vertices = nx * ny * nz
 
-        return C_pot
+            # If vertices < 134 million, compute exact map
+            if total_vertices <= 2 ** 27:
+                xs = torch.arange(g_lo[0], g_hi[0] + 1, device=self.device)
+                ys = torch.arange(g_lo[1], g_hi[1] + 1, device=self.device)
+                zs = torch.arange(g_lo[2], g_hi[2] + 1, device=self.device)
+                gx, gy, gz = torch.meshgrid(xs, ys, zs, indexing='ij')
+                coords = torch.stack([gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)], dim=1)
+                
+                for start in range(0, coords.shape[0], CHUNK):
+                    c = coords[start:start + CHUNK]
+                    h = spatial_hash(c, self.T)
+                    self.C_pot[level_idx].scatter_add_(
+                        0, h, torch.ones(h.shape[0], dtype=torch.long, device=self.device)
+                    )
+                logger.info(f"C_pot level {level_idx} done exactly (Vertices={total_vertices:,}).")
+            
+            # If vertices are massive, use uniform distribution expectation
+            else:
+                expected_collisions = total_vertices // self.T
+                self.C_pot[level_idx] = expected_collisions
+                logger.info(f"C_pot level {level_idx} approximated (Vertices={total_vertices:,}).")
+
+        return self.C_pot
 
     # ─────────────────────────────────────────────────────────────────────────
     # Persistence and diagnostics
@@ -357,17 +379,53 @@ class CollisionTracker:
         return tracker
 
     def print_summary(self):
+        """Prints a side-by-side numerical comparison of the tracking metrics."""
+        if self.C_pot is None:
+            logger.info("Computing C_pot for the first time...")
+            self.compute_C_pot()
+
         R_dom = self.get_R_dom()
-        print(f"\n{'='*72}")
-        print(f"{'Lvl':>4}  {'Res':>5}  {'Bins used':>10}  {'Max C_eff':>10}  {'Mean C_eff':>10}  {'Mean R_dom':>10}")
-        print(f"{'-'*72}")
+        
+        print(f"\n{'='*92}")
+        print(f"{'Lvl':>3} | {'Res':>6} | {'C_pot (min/max/avg)':>20} | {'C_eff (min/max/avg)':>20} | {'R_dom (min/max/avg)':>20}")
+        print(f"{'-'*92}")
+        
         for l in range(self.n_levels):
             res = self.resolutions[l].item()
+            
+            # --- C_pot stats (over all T bins) ---
+            cp = self.C_pot[l].float()
+            cp_min, cp_max, cp_avg = cp.min().item(), cp.max().item(), cp.mean().item()
+            
+            # Formatting large numbers nicely (e.g., 2.5B or 14M)
+            def fmt_large(x):
+                if x >= 1e9: return f"{x/1e9:.1f}B"
+                if x >= 1e6: return f"{x/1e6:.1f}M"
+                if x >= 1e3: return f"{x/1e3:.1f}K"
+                return f"{x:.0f}"
+            
+            str_cp = f"{fmt_large(cp_min)}/{fmt_large(cp_max)}/{fmt_large(cp_avg)}"
+            
+            # --- C_eff stats (over OCCUPIED bins only) ---
+            # Unoccupied bins are 0, which skews the min/avg downward uselessly.
             occ = self.C_eff[l] > 0
-            n_occ = occ.sum().item()
-            max_c  = self.C_eff[l].max().item()
-            mean_c = self.C_eff[l][occ].float().mean().item() if n_occ > 0 else 0.0
-            mean_r = R_dom[l][occ].mean().item() if n_occ > 0 else 1.0
-            print(f"{l:>4}  {res:>5}  {n_occ:>10}  {max_c:>10}  {mean_c:>10.2f}  {mean_r:>10.4f}")
-        print(f"{'='*72}\n")
+            ce = self.C_eff[l][occ].float()
+            if occ.any():
+                ce_min, ce_max, ce_avg = ce.min().item(), ce.max().item(), ce.mean().item()
+            else:
+                ce_min, ce_max, ce_avg = 0, 0, 0.0
+            str_ce = f"{ce_min:.0f}/{ce_max:.0f}/{ce_avg:.1f}"
+            
+            # --- R_dom stats (over OCCUPIED bins only) ---
+            rd = R_dom[l][occ]
+            if occ.any():
+                rd_min, rd_max, rd_avg = rd.min().item(), rd.max().item(), rd.mean().item()
+            else:
+                rd_min, rd_max, rd_avg = 1.0, 1.0, 1.0
+            str_rd = f"{rd_min:.2f}/{rd_max:.2f}/{rd_avg:.2f}"
+            
+            # Print the row
+            print(f"{l:>3} | {res:>6} | {str_cp:>20} | {str_ce:>20} | {str_rd:>20}")
+            
+        print(f"{'='*92}\n")
         

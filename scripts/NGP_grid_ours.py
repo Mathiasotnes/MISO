@@ -176,7 +176,6 @@ def main_scannet():
     if hash_grid.track_collisions:
         hash_grid.tracker.print_summary()
         hash_grid.tracker.save("collision_stats.pt")
-        # c_grad = hash_grid.tracker.get_C_grad(query_pts)
     
     # Check Sparsity
     sparsity = calculate_model_sparsity(hash_grid)
