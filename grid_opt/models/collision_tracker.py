@@ -6,9 +6,8 @@ logger = logging.getLogger(__name__)
 
 
 def spatial_hash(coords_int: torch.Tensor, T: int) -> torch.Tensor:
-    """Must be identical to the version in grid_ngp.py."""
     x, y, z = coords_int[:, 0], coords_int[:, 1], coords_int[:, 2]
-    MASK = 0xFFFFFFFF
+    MASK = 0xFFFFFFFF # Cast to uint32 range explicitly to mimic TCNN behavior
     h = (x ^ (y * 2_654_435_761) ^ (z * 805_459_861)) & MASK
     return (h % T).long()
 
@@ -35,21 +34,6 @@ class CollisionTracker:
                    dominates perfectly).
 
     C_grad(x)    — sum_l (1 - R_dom(l, h_l(x))). Spatial conflict at x.
-
-    Storage
-    -------
-    Only three (L, T) tensors are needed regardless of scene size or
-    number of active vertices — no per-vertex dictionaries required.
-
-    Speed
-    -----
-    - C_eff / seen_mask updates are fully vectorised GPU ops (no Python loops
-      over vertices).
-    - Gradient capture uses a forward-pass hook on the feats tensor rather
-      than on hash_table.grad, giving per-lookup gradient norms before
-      colliders merge.
-    - Pending gradients are flushed in update() with scatter_add_ — one pass
-      per level per step.
     """
 
     def __init__(
@@ -66,12 +50,17 @@ class CollisionTracker:
         self.T = encoding.T
         self.F = encoding.F
         self.resolutions = encoding.resolutions
+        
+        # If finest resolution is above 2**20, the _seen_voxels tensor overflows and breaks down
+        assert self.resolutions[-1].item() <= 2**20, "Finest resolution must be <= 2^20 to avoid overflow in seen_voxels."
 
         # ── C_eff ─────────────────────────────────────────────────────────────
         self.C_eff = torch.zeros(self.n_levels, self.T, dtype=torch.int32, device=device)
-        # GPU bitmask: True once a bin has been visited at least once.
-        # Avoids double-counting the same bin across steps.
-        self._seen_mask = torch.zeros(self.n_levels, self.T, dtype=torch.bool, device=device)
+        # Tracks which voxels that has been visited.
+        self._seen_voxels = [
+            torch.empty(0, dtype=torch.long, device=device) 
+            for _ in range(self.n_levels)
+        ]
 
         # ── R_dom: only G_sum and G_max needed ────────────────────────────────
         self.G_sum = torch.zeros(self.n_levels, self.T, dtype=torch.float32, device=device)
@@ -173,55 +162,74 @@ class CollisionTracker:
         Args:
             x_world: (N, 3) world-space coordinates.
         """
+        assert self.resolutions[-1].item() <= 2**20, "Finest resolution must be <= 2^20 to avoid overflow in seen_voxels."
+
         # ── Step 1: flush gradient accumulators ──────────────────────────────
-        # _scratch[l, i] will hold the gradient energy contributed by bins
-        # that are freshly seen this step — used to update G_max.
         self._scratch.zero_()
 
         for lvl, local_idx, norms in self._pending:
             # G_sum: unconditional accumulation of every lookup's gradient norm
             self.G_sum[lvl].scatter_add_(0, local_idx, norms)
 
-            # For G_max we want the dominant *voxel's* energy, not the total.
-            # We approximate this by accumulating gradient energy only for bins
-            # that are new this step (their first-ever visit), treating that
-            # first visit as a proxy for the dominant voxel's contribution.
-            new_bins = ~self._seen_mask[lvl][local_idx]     # (N*8,) bool
-            if new_bins.any():
-                self._scratch[lvl].scatter_add_(
-                    0, local_idx, norms * new_bins.float()
-                )
+            # Accumulate the gradients for THIS SPECIFIC BATCH into scratch
+            self._scratch[lvl].scatter_add_(0, local_idx, norms)
 
         self._pending.clear()
 
-        # G_max: keep the running maximum over all first-visit contributions
+        # G_max: keep the running maximum of the highest single-step gradient 
+        # energy ever seen by this bin.
         torch.maximum(self.G_max, self._scratch, out=self.G_max)
 
-        # ── Step 2: update C_eff and seen_mask ───────────────────────────────
+        # ── Step 2: update C_eff ───────────────────────────────────────────────
         lo = self.scene_bound[:, 0]
         hi = self.scene_bound[:, 1]
-        x = ((x_world - lo) / (hi - lo)).clamp(0.0, 1.0)
-
-        offsets = self.encoding.corner_offsets   # (8, 3)
+        x_norm = ((x_world - lo) / (hi - lo)).clamp(0.0, 1.0)
+        N = x_norm.shape[0]
 
         for level_idx in range(self.n_levels):
             N_l = self.resolutions[level_idx].item()
-            x_floor = torch.floor(x * N_l).long()
+            
+            x_scaled = x_norm * N_l
+            x_floor = torch.floor(x_scaled).long()
+            
+            corners = x_floor.unsqueeze(1) + self.encoding.corner_offsets.unsqueeze(0)
+            corners_flat = corners.reshape(N * 8, 3)
 
-            corners_flat = (
-                x_floor.unsqueeze(1) + offsets.unsqueeze(0)
-            ).reshape(-1, 3)
+            # 1. Pack the 3D integer coordinates into a single 64-bit integer
+            # x: bits 42-62 | y: bits 21-41 | z: bits 0-20
+            packed_voxels = (
+                (corners_flat[:, 0] << 42) | 
+                (corners_flat[:, 1] << 21) | 
+                 corners_flat[:, 2]
+            )
 
-            local_idx = spatial_hash(corners_flat, self.T)  # (N*8,)
+            # 2. Find the unique voxels in THIS specific batch
+            unique_packed = torch.unique(packed_voxels)
 
-            # Find which bins are genuinely new (not seen before this step)
-            new_bin_mask = torch.zeros(self.T, dtype=torch.bool, device=self.device)
-            new_bin_mask[local_idx] = True          # deduplicates within batch
-            new_bin_mask &= ~self._seen_mask[level_idx]
+            # 3. Check which of these batch voxels are globally new
+            is_seen = torch.isin(unique_packed, self._seen_voxels[level_idx])
+            new_packed = unique_packed[~is_seen]
 
-            # Increment C_eff by 1 for each newly-seen bin
-            self.C_eff[level_idx] += new_bin_mask.int()
-            self._seen_mask[level_idx] |= new_bin_mask
+            if new_packed.numel() == 0:
+                continue  # No new voxels seen at this level
+
+            # 4. Add the genuinely new voxels to our global history
+            self._seen_voxels[level_idx] = torch.cat(
+                [self._seen_voxels[level_idx], new_packed]
+            )
+
+            # 5. Unpack the new voxels back to 3D so we can hash them
+            new_x = new_packed >> 42
+            new_y = (new_packed >> 21) & 0x1FFFFF
+            new_z = new_packed & 0x1FFFFF
+            new_corners_3d = torch.stack([new_x, new_y, new_z], dim=-1)
+
+            # 6. Hash ONLY the genuinely new, unique voxels
+            new_local_idx = spatial_hash(new_corners_3d, self.T)
+
+            # 7. Increment C_eff
+            ones = torch.ones_like(new_local_idx, dtype=torch.int32)
+            self.C_eff[level_idx].scatter_add_(0, new_local_idx, ones)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Derived metrics
