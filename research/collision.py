@@ -184,14 +184,19 @@ def analyze_disambiguation(model_path, stats_path, mesh_path, gt_mesh_path, devi
     
     # Calculate geometric error (distance to GT)
     print("Calculating nearest neighbor correspondences...")
-    _, dist_p = nn_correspondance(verts_pred, verts_trgt, 0.50, True) 
-    dist_p = np.array(dist_p)
+    # 1. Use False so NO points are dropped
+    _, dist_p = nn_correspondance(verts_pred, verts_trgt, 0.50, False)
+    
+    # 2. FLATTEN to fix the (1, N) shape bug!
+    dist_p = np.array(dist_p).flatten()
 
     # 3. Calculate C_grad using the new tracker
     print("Calculating spatial conflict (C_grad) for query points...")
+    
+    # 4. Because lengths match perfectly, we safely use verts_pred
     verts_torch = torch.from_numpy(verts_pred).float().to(device)
     
-    # We batch this to prevent OOM errors, as 1M points * 8 corners takes some memory
+    # We batch this to prevent OOM errors
     c_grad_scores = torch.zeros(len(verts_torch), device=device)
     BATCH_SIZE = 100000
     
@@ -204,7 +209,8 @@ def analyze_disambiguation(model_path, stats_path, mesh_path, gt_mesh_path, devi
 
     # 4. Filter and Analyze Trends
     print("Generating analysis plots...")
-    mask = dist_p < 0.10 # Filter outliers for cleaner trendline
+    # Both arrays are now exactly 1D and the exact same length. Perfect lockstep!
+    mask = dist_p < 0.10 
     c_f, e_f = c_grad_np[mask], dist_p[mask]
 
     # Initialize Plot
