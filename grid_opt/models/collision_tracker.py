@@ -310,33 +310,22 @@ class CollisionTracker:
     def compute_C_pot(self) -> torch.Tensor:
         """
         Calculates the theoretical upper bound of collisions for the scene.
-        For low resolutions, exactly enumerates all vertices.
-        For high resolutions, uses the uniform distribution expected value V / T 
-        to prevent OOM errors.
         """
-        # Using torch.long because high levels will exceed 2.1 billion (int32 limit)
         self.C_pot = torch.zeros(self.n_levels, self.T, dtype=torch.long, device=self.device)
-        
-        lo = self.scene_bound[:, 0]
-        hi = self.scene_bound[:, 1]
         CHUNK = 2 ** 24
 
         for level_idx in range(self.n_levels):
             N_l = self.resolutions[level_idx].item()
-            g_lo = torch.floor(lo * N_l).long()
-            g_hi = torch.ceil(hi * N_l).long()
             
-            # Number of vertices along each axis
-            nx = (g_hi[0] - g_lo[0] + 1).item()
-            ny = (g_hi[1] - g_lo[1] + 1).item()
-            nz = (g_hi[2] - g_lo[2] + 1).item()
-            total_vertices = nx * ny * nz
+            # Since inputs are normalized to [0, 1] before scaling by N_l, 
+            # integer vertices always range exactly from 0 to N_l inclusive.
+            total_vertices = (N_l + 1) ** 3
 
             # If vertices < 134 million, compute exact map
             if total_vertices <= 2 ** 27:
-                xs = torch.arange(g_lo[0], g_hi[0] + 1, device=self.device)
-                ys = torch.arange(g_lo[1], g_hi[1] + 1, device=self.device)
-                zs = torch.arange(g_lo[2], g_hi[2] + 1, device=self.device)
+                xs = torch.arange(0, N_l + 1, device=self.device)
+                ys = torch.arange(0, N_l + 1, device=self.device)
+                zs = torch.arange(0, N_l + 1, device=self.device)
                 gx, gy, gz = torch.meshgrid(xs, ys, zs, indexing='ij')
                 coords = torch.stack([gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)], dim=1)
                 
@@ -346,13 +335,13 @@ class CollisionTracker:
                     self.C_pot[level_idx].scatter_add_(
                         0, h, torch.ones(h.shape[0], dtype=torch.long, device=self.device)
                     )
-                logger.info(f"C_pot level {level_idx} done exactly (Vertices={total_vertices:,}).")
+                logger.info(f"C_pot layer {level_idx + 1} done exactly (Vertices={total_vertices:,}).")
             
             # If vertices are massive, use uniform distribution expectation
             else:
                 expected_collisions = total_vertices // self.T
                 self.C_pot[level_idx] = expected_collisions
-                logger.info(f"C_pot level {level_idx} approximated (Vertices={total_vertices:,}).")
+                logger.info(f"C_pot layer {level_idx + 1} approximated (Vertices={total_vertices:,}).")
 
         return self.C_pot
 
@@ -384,22 +373,20 @@ class CollisionTracker:
     def print_summary(self):
         """Prints a detailed, column-separated numerical comparison of the tracking metrics."""
         if self.C_pot is None:
-            logger.info("Computing C_pot for the first time...")
+            logger.info("Computing C_pot...")
             self.compute_C_pot()
 
         R_dom = self.get_R_dom()
         
-        # Calculate table width based on column sizes
-        table_width = 109
+        table_width = 120
         print(f"\n{'='*table_width}")
         print(
-            f"{'Lvl':>3} | {'Res':>6} | {'Occ (Bins)':>10} | {'C_pot avg':>10} | "
+            f"{'Lvl':>3} | {'Res':>6} | {'Util %':>8} | {'Occ (Bins)':>10} | {'C_pot avg':>10} | "
             f"{'C_eff min':>9} | {'C_eff max':>9} | {'C_eff avg':>9} | "
             f"{'R_dom min':>9} | {'R_dom max':>9} | {'R_dom avg':>9}"
         )
         print(f"{'-'*table_width}")
         
-        # Helper to keep massive C_pot averages readable without blowing up the column
         def fmt_large(x):
             if x >= 1e9: return f"{x/1e9:.1f}B"
             if x >= 1e6: return f"{x/1e6:.1f}M"
@@ -408,6 +395,11 @@ class CollisionTracker:
 
         for l in range(self.n_levels):
             res = self.resolutions[l].item()
+            
+            # --- Grid Utilization ---
+            total_potential_voxels = (res + 1) ** 3
+            total_active_voxels = self.C_eff[l].sum().item()
+            util_pct = (total_active_voxels / max(total_potential_voxels, 1)) * 100
             
             # --- C_pot stats ---
             cp_avg = self.C_pot[l].float().mean().item()
@@ -435,9 +427,9 @@ class CollisionTracker:
             else:
                 rd_min, rd_max, rd_avg = 1.0, 1.0, 1.0
                 
-            # Print the row matching the exact formatting rules
+            # Print the row (l+1 for 1-16 numbering, 7.2f for percentage)
             print(
-                f"{l:>3} | {res:>6} | {num_occ:>10} | {str_cp_avg:>10} | "
+                f"{l+1:>3} | {res:>6} | {util_pct:>7.2f}% | {num_occ:>10} | {str_cp_avg:>10} | "
                 f"{ce_min:>9} | {ce_max:>9} | {ce_avg:>9.2f} | "
                 f"{rd_min:>9.4f} | {rd_max:>9.4f} | {rd_avg:>9.4f}"
             )
