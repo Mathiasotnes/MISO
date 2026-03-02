@@ -53,28 +53,23 @@ class CollisionTracker:
         
         # If finest resolution is above 2**20, the _seen_voxels tensor overflows and breaks down
         assert self.resolutions[-1].item() <= 2**20, "Finest resolution must be <= 2^20 to avoid overflow in seen_voxels."
-
-        # ── C_eff ─────────────────────────────────────────────────────────────
-        self.C_eff = torch.zeros(self.n_levels, self.T, dtype=torch.int32, device=device)
-        # Tracks which voxels that has been visited.
-        self._seen_voxels = [
-            torch.empty(0, dtype=torch.long, device=device) 
-            for _ in range(self.n_levels)
-        ]
         
-        # ── C_pot ─────────────────────────────────────────────────────────────
-        self.C_pot = None
+        # ── C_eff Voxel Tracking ──────────────────────────────────────────────
+        self.C_eff = torch.zeros(self.n_levels, self.T, dtype=torch.int32, device=device)
+        
+        self._seen_voxels = [
+            torch.empty(0, dtype=torch.long, device=device) for _ in range(self.n_levels)
+        ]
+        self._seen_G = [
+            torch.empty(0, dtype=torch.float32, device=device) for _ in range(self.n_levels)
+        ]
 
-        # ── R_dom: only G_sum and G_max needed ────────────────────────────────
+        # ── R_dom: Only G_sum is needed as a standalone tensor ────────────────
         self.G_sum = torch.zeros(self.n_levels, self.T, dtype=torch.float32, device=device)
-        self.G_max = torch.zeros(self.n_levels, self.T, dtype=torch.float32, device=device)
-
-        # Scratch buffer reused every update() call — avoids repeated allocs
-        self._scratch = torch.zeros(self.n_levels, self.T, dtype=torch.float32, device=device)
-
-        # Gradient data captured by forward hooks, flushed in update()
-        # Each entry: (level_idx: int, local_idx: Tensor[N*8], norms: Tensor[N*8])
+        
+        # ── C_pot & hook buffer ───────────────────────────────────────────────
         self._pending: list = []
+        self.C_pot = None
 
     # ─────────────────────────────────────────────────────────────────────────
     # Hook registration
@@ -159,83 +154,85 @@ class CollisionTracker:
 
     @torch.no_grad()
     def update(self, x_world: torch.Tensor):
-        """
-        Flush pending gradients into G_sum / G_max, then update C_eff.
-
-        Call after loss.backward() each training step, passing the raw
-        world-space coordinates used in that forward pass (before normalisation).
-
-        Args:
-            x_world: (N, 3) world-space coordinates.
-        """
-        assert self.resolutions[-1].item() <= 2**20, "Finest resolution must be <= 2^20 to avoid overflow in seen_voxels."
-
-        # ── Step 1: flush gradient accumulators ──────────────────────────────
-        self._scratch.zero_()
-
-        for lvl, local_idx, norms in self._pending:
-            # G_sum: unconditional accumulation of every lookup's gradient norm
-            self.G_sum[lvl].scatter_add_(0, local_idx, norms)
-
-            # Accumulate the gradients for THIS SPECIFIC BATCH into scratch
-            self._scratch[lvl].scatter_add_(0, local_idx, norms)
-
-        self._pending.clear()
-
-        # G_max: keep the running maximum of the highest single-step gradient 
-        # energy ever seen by this bin.
-        torch.maximum(self.G_max, self._scratch, out=self.G_max)
-
-        # ── Step 2: update C_eff ───────────────────────────────────────────────
         lo = self.scene_bound[:, 0]
         hi = self.scene_bound[:, 1]
         x_norm = ((x_world - lo) / (hi - lo)).clamp(0.0, 1.0)
         N = x_norm.shape[0]
 
+        # Pre-group pending gradients by level to avoid looping multiple times
+        pending_by_lvl = {l: ([], []) for l in range(self.n_levels)}
+        for p_lvl, p_idx, p_norms in self._pending:
+            pending_by_lvl[p_lvl][0].append(p_idx)
+            pending_by_lvl[p_lvl][1].append(p_norms)
+
         for level_idx in range(self.n_levels):
-            N_l = self.resolutions[level_idx].item()
+            # 1. Standardize the batch gradients for this level
+            if not pending_by_lvl[level_idx][0]:
+                continue
+                
+            local_idx = torch.cat(pending_by_lvl[level_idx][0])
+            norms = torch.cat(pending_by_lvl[level_idx][1])
             
+            # G_sum unconditionally accumulates the bin's total energy
+            self.G_sum[level_idx].scatter_add_(0, local_idx, norms)
+
+            # 2. Calculate coordinates and pack exactly as before
+            N_l = self.resolutions[level_idx].item()
             x_scaled = x_norm * N_l
             x_floor = torch.floor(x_scaled).long()
-            
-            corners = x_floor.unsqueeze(1) + self.encoding.corner_offsets.unsqueeze(0)
-            corners_flat = corners.reshape(N * 8, 3)
+            corners_flat = (x_floor.unsqueeze(1) + self.encoding.corner_offsets.unsqueeze(0)).reshape(N * 8, 3)
 
-            # 1. Pack the 3D integer coordinates into a single 64-bit integer
-            # x: bits 42-62 | y: bits 21-41 | z: bits 0-20
             packed_voxels = (
                 (corners_flat[:, 0] << 42) | 
                 (corners_flat[:, 1] << 21) | 
                  corners_flat[:, 2]
             )
 
-            # 2. Find the unique voxels in THIS specific batch
-            unique_packed = torch.unique(packed_voxels)
+            # 3. Sum the gradient energy per unique voxel IN THIS BATCH
+            unique_packed, inverse_indices = torch.unique(packed_voxels, return_inverse=True)
+            batch_G = torch.zeros_like(unique_packed, dtype=torch.float32)
+            batch_G.scatter_add_(0, inverse_indices, norms)
 
-            # 3. Check which of these batch voxels are globally new
-            is_seen = torch.isin(unique_packed, self._seen_voxels[level_idx])
-            new_packed = unique_packed[~is_seen]
+            # 4. Use searchsorted to find where these voxels belong in our global history
+            history_voxels = self._seen_voxels[level_idx]
+            history_G = self._seen_G[level_idx]
+            
+            idx = torch.searchsorted(history_voxels, unique_packed)
+            
+            # Create a mask of which voxels we have genuinely seen before
+            is_present = (idx < len(history_voxels)) & \
+                         (history_voxels[idx.clamp(max=len(history_voxels)-1)] == unique_packed)
 
-            if new_packed.numel() == 0:
-                continue  # No new voxels seen at this level
+            # --- Update EXISTING voxels ---
+            if is_present.any():
+                existing_idx = idx[is_present]
+                history_G.scatter_add_(0, existing_idx, batch_G[is_present])
 
-            # 4. Add the genuinely new voxels to our global history
-            self._seen_voxels[level_idx] = torch.cat(
-                [self._seen_voxels[level_idx], new_packed]
-            )
+            # --- Add NEW voxels ---
+            new_packed = unique_packed[~is_present]
+            new_G = batch_G[~is_present]
 
-            # 5. Unpack the new voxels back to 3D so we can hash them
-            new_x = new_packed >> 42
-            new_y = (new_packed >> 21) & 0x1FFFFF
-            new_z = new_packed & 0x1FFFFF
-            new_corners_3d = torch.stack([new_x, new_y, new_z], dim=-1)
+            if new_packed.numel() > 0:
+                history_voxels = torch.cat([history_voxels, new_packed])
+                history_G = torch.cat([history_G, new_G])
+                
+                # Re-sort to maintain searchsorted integrity
+                sorted_idx = torch.argsort(history_voxels)
+                self._seen_voxels[level_idx] = history_voxels[sorted_idx]
+                self._seen_G[level_idx] = history_G[sorted_idx]
+                
+                # Unpack and hash ONLY the new voxels to update C_eff
+                new_x = new_packed >> 42
+                new_y = (new_packed >> 21) & 0x1FFFFF
+                new_z = new_packed & 0x1FFFFF
+                new_corners_3d = torch.stack([new_x, new_y, new_z], dim=-1)
+                new_local_idx = spatial_hash(new_corners_3d, self.T)
+                
+                self.C_eff[level_idx].scatter_add_(
+                    0, new_local_idx, torch.ones_like(new_local_idx, dtype=torch.int32)
+                )
 
-            # 6. Hash ONLY the genuinely new, unique voxels
-            new_local_idx = spatial_hash(new_corners_3d, self.T)
-
-            # 7. Increment C_eff
-            ones = torch.ones_like(new_local_idx, dtype=torch.int32)
-            self.C_eff[level_idx].scatter_add_(0, new_local_idx, ones)
+        self._pending.clear()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Derived metrics
@@ -245,10 +242,32 @@ class CollisionTracker:
     def get_R_dom(self, eps: float = 1e-8) -> torch.Tensor:
         """
         R_dom(l, i) = G_max(l,i) / G_sum(l,i).
-        Bins with no gradient receive R_dom = 1.0 (no conflict).
+        Calculates the true maximum voxel gradient.
         """
-        R_dom = self.G_max / self.G_sum.clamp(min=eps)
-        R_dom[self.G_sum == 0] = 1.0
+        G_max = torch.zeros_like(self.G_sum)
+        
+        for l in range(self.n_levels):
+            if self._seen_voxels[l].numel() == 0:
+                continue
+                
+            # 1. Unpack our global voxel history to 3D
+            packed = self._seen_voxels[l]
+            x = packed >> 42
+            y = (packed >> 21) & 0x1FFFFF
+            z = packed & 0x1FFFFF
+            corners_3d = torch.stack([x, y, z], dim=-1)
+            
+            # 2. Hash them to find which bin each voxel maps to
+            bins = spatial_hash(corners_3d, self.T)
+            
+            # 3. Find the maximum gradient score (G_max) inside each bin!
+            # scatter_reduce with 'amax' perfectly extracts the single dominant voxel's score.
+            G_max[l].scatter_reduce_(
+                0, bins, self._seen_G[l], reduce="amax", include_self=False
+            )
+
+        R_dom = G_max / self.G_sum.clamp(min=eps)
+        R_dom[self.G_sum == 0] = 1.0  # Untouched bins have no conflict
         return R_dom
 
     @torch.no_grad()
@@ -378,7 +397,7 @@ class CollisionTracker:
 
         R_dom = self.get_R_dom()
         
-        table_width = 120
+        table_width = 121
         print(f"\n{'='*table_width}")
         print(
             f"{'Lvl':>3} | {'Res':>6} | {'Util %':>8} | {'Occ (Bins)':>10} | {'C_pot avg':>10} | "
