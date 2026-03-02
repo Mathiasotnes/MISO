@@ -5,6 +5,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from grid_opt.utils.utils_eval import nn_correspondance, sample_points_from_mesh
+from ..grid_opt.models.collision_tracker import CollisionTracker
 
 
 ###############################################################
@@ -24,6 +25,7 @@ BOUNDS                  = torch.tensor([[-0.02,  10.38], [-0.01, 8.74], [-0.01, 
 COLLISION_STATS_PATH    = "./collision_stats.pt"
 MESH_PATH               = "./results/mapping/hash_pred_mesh.ply"
 GT_MESH_PATH            = "../../data/ScanNet/scans/scene0000_00/scene0000_00_vh_clean.ply"
+MODEL_PATH              = "./results/mapping/hash_grid.pth"
 
 def print_config() -> None:
     print("\n" + "="*40)
@@ -159,60 +161,49 @@ def potential_collisions(h_func, N_min: int, T: int, L: int, b: float) -> None:
 
         print(f"{l_idx+1:<6} | {N_l:<10} | {total_vertices:<14} | {collision_ratio:>12.2%} | {avg_load:.4f}")
 
-def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
-    """ Correlates per-vertex Accuracy with C_grad and prints layer-wise conflict stats. """
-    data = torch.load(stats_path)
-    cfg, L, T = data["config"], data["config"]["L"], data["config"]["T"]
-    PI = [1, 2654435761, 805459861]
+def analyze_disambiguation(model_path, stats_path, mesh_path, gt_mesh_path, device="cuda"):
+    """ Correlates per-vertex Accuracy with C_grad and plots the trend. """
     
-    r_dom_table = torch.ones((L, T))
+    # 1. Load the model and instantiate the loaded tracker
+    print("Loading model and collision statistics...")
+    hash_grid = torch.load(model_path, map_location=device)
+    tracker = CollisionTracker.load(
+        path=stats_path, 
+        encoding=hash_grid.encoding, 
+        scene_bound=hash_grid.bound, 
+        device=device
+    )
     
-    print("\n" + "="*100)
-    print(f"{'LAYER-WISE SPATIAL CONFLICT ANALYSIS (1 - R_dom)':^100}")
-    print("="*100)
-    print(f"{'L':<3} | {'Res':<6} | {'Bins (Occ)':<12} | {'C_grad (Min / Avg / Max)':<35}")
-    print("-" * 100)
+    # Print the clean summary we built earlier!
+    tracker.print_summary()
 
-    for l in range(L):
-        # Calculate R_dom for bins with effective collisions (C_eff > 1)
-        # Bins with C_eff <= 1 have R_dom = 1.0 (no conflict)
-        occ = data["eff_voxel_count"][l] > 1 
-        num_occ = occ.sum().item()
-        res = math.floor(cfg["N_min"] * (cfg["b"] ** l))
-        
-        if num_occ > 0:
-            r_dom_vals = data["max_voxel_grad"][l][occ] / data["total_bin_grad"][l][occ].clamp(min=1e-6)
-            r_dom_table[l, occ] = r_dom_vals
-            
-            # Level Conflict = 1 - R_dom
-            conflicts = 1.0 - r_dom_vals
-            c_str = f"{conflicts.min():.4f} / {conflicts.mean():.4f} / {conflicts.max():.4f}"
-            print(f"{l+1:<3} | {res:<6} | {num_occ:<12,} | {c_str:<35}")
-        else:
-            print(f"{l+1:<3} | {res:<6} | {'0':<12} | {'0.0000 / 0.0000 / 0.0000':<35}")
-
-    # Calculate distance to closest point in GT as error
+    # 2. Get Query Points (Predicted Mesh Vertices)
+    print("Sampling points from meshes...")
     verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
     verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
     
+    # Calculate geometric error (distance to GT)
+    print("Calculating nearest neighbor correspondences...")
     _, dist_p = nn_correspondance(verts_pred, verts_trgt, 0.50, True) 
     dist_p = np.array(dist_p)
 
-    # Calculate conflict C_grad(x)
-    verts_torch = torch.from_numpy(verts_pred).float()
-    b_min, b_max = bound[:, 0], bound[:, 1]
-    x = (verts_torch - b_min) / (b_max - b_min)
-    x = torch.clamp(x, 0.0, 1.0 - 1e-6)
+    # 3. Calculate C_grad using the new tracker
+    print("Calculating spatial conflict (C_grad) for query points...")
+    verts_torch = torch.from_numpy(verts_pred).float().to(device)
     
-    c_grad_scores = torch.zeros(len(verts_pred))
-    for l in range(L):
-        res = math.floor(cfg["N_min"] * (cfg["b"] ** l))
-        v_base = torch.floor(x * res).long()
-        h_idx = ((v_base[:, 0] * PI[0]) ^ (v_base[:, 1] * PI[1]) ^ (v_base[:, 2] * PI[2])) % T
-        c_grad_scores += (1.0 - r_dom_table[l, h_idx])
+    # We batch this to prevent OOM errors, as 1M points * 8 corners takes some memory
+    c_grad_scores = torch.zeros(len(verts_torch), device=device)
+    BATCH_SIZE = 100000
+    
+    with torch.no_grad():
+        for i in range(0, len(verts_torch), BATCH_SIZE):
+            batch_verts = verts_torch[i : i + BATCH_SIZE]
+            c_grad_scores[i : i + BATCH_SIZE] = tracker.get_C_grad(batch_verts)
+            
+    c_grad_np = c_grad_scores.cpu().numpy()
 
     # 4. Filter and Analyze Trends
-    c_grad_np = c_grad_scores.numpy()[:len(dist_p)]
+    print("Generating analysis plots...")
     mask = dist_p < 0.10 # Filter outliers for cleaner trendline
     c_f, e_f = c_grad_np[mask], dist_p[mask]
 
@@ -223,14 +214,21 @@ def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
     # Compute Trendline via Binned Averages
     bins = np.linspace(c_f.min(), c_f.max(), 40)
     bin_centers = (bins[:-1] + bins[1:]) / 2
-    bin_means = np.array([e_f[np.digitize(c_f, bins) == i].mean() for i in range(1, len(bins))])
+    
+    # Calculate means safely to avoid warnings on empty bins
+    bin_means = []
+    digitized = np.digitize(c_f, bins)
+    for i in range(1, len(bins)):
+        bin_vals = e_f[digitized == i]
+        bin_means.append(bin_vals.mean() if len(bin_vals) > 0 else np.nan)
+    bin_means = np.array(bin_means)
     
     valid = ~np.isnan(bin_means)
     plt.plot(bin_centers[valid], bin_means[valid], color='blue', lw=3, label='Disambiguation Slope')
     
     # Sensitivity Metric (Linear Fit)
     slope, intercept = np.polyfit(bin_centers[valid], bin_means[valid], 1)
-    print("="*100)
+    print("\n" + "="*100)
     print(f"OVERALL DISAMBIGUATION POWER")
     print(f" * Sensitivity Slope: {slope:.8f} (m per conflict unit)")
     print(f" * Intercept (Base):  {intercept:.4f} m")
@@ -247,6 +245,7 @@ def analyze_disambiguation(stats_path, mesh_path, gt_mesh_path, bound):
     plt.tight_layout()
     plt.savefig("./disambiguation_analysis.png", dpi=300, bbox_inches='tight')
     plt.close()
+    print("Saved plot to ./disambiguation_analysis.png")
 
 ###############################################################
 # Main Program Entry
@@ -268,9 +267,10 @@ if __name__ == "__main__":
     # analyze_hottest_bins(spatial_hash, N_l=406)
     
     analyze_disambiguation(
+        model_path=MODEL_PATH,
         stats_path=COLLISION_STATS_PATH, 
         mesh_path=MESH_PATH, 
-        gt_mesh_path=GT_MESH_PATH, 
-        bound=BOUNDS
+        gt_mesh_path=GT_MESH_PATH,
+        device=device
     )
     
