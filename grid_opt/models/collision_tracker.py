@@ -146,8 +146,11 @@ class CollisionTracker:
 
     def remove_hooks(self):
         """Remove the patched forward and discard any pending data."""
-        if hasattr(self.encoding, '_original_forward'):
-            self.encoding.forward = self.encoding._original_forward
+        try:
+            del self.encoding.forward
+            logger.info("CollisionTracker: hooks removed, forward restored.")
+        except AttributeError:
+            pass            
         self._pending.clear()
 
     # ─────────────────────────────────────────────────────────────────────────
