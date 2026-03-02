@@ -5,7 +5,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from grid_opt.utils.utils_eval import nn_correspondance, sample_points_from_mesh
-from ..grid_opt.models.collision_tracker import CollisionTracker
+from grid_opt.models.collision_tracker import CollisionTracker
 
 
 ###############################################################
