@@ -304,9 +304,9 @@ def analyze_conflict_vs_T(
 
         rows.append({
             'T'             : T,
-            'C_grad min'    : c.min(),
-            'C_grad max'    : c.max(),
-            'C_grad mean'   : c.mean(),
+            'min'           : c.min(),
+            'max'           : c.max(),
+            'mean'          : c.mean(),
             'std'           : c.std(),
             'Chamfer-L2'    : metrics.get('chamfer_l2', float('nan')),
             'F-score'       : metrics.get('f_score',    float('nan')),
@@ -320,7 +320,7 @@ def analyze_conflict_vs_T(
     w = 91
     print("\n" + "=" * w)
     print(
-        f"{'T':>4} | {'2^T':>12} | {'min':>6} | {'max':>6} | {'mean':>6} | "
+        f"{'T':>4} | {'2^T':>12} | {'C_grad min':>12} | {'C_grad max':>12} | {'C_grad mean':>12} | "
         f"{'std':>8} | {'Chamfer-L2':>10} | {'F-Score':>8}"
     )
     print("-" * w)
