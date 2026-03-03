@@ -258,7 +258,7 @@ class GridNGPOurs(BaseNet):
         self.per_level_scale = per_level_scale
         self.n_hidden_layers = n_hidden_layers
         self.n_neurons = n_neurons
-        n_output_dims = n_output_dims
+        self.n_output_dims = n_output_dims
         self.init_ngp(cfg)
         self.init_occupancy_grid(cfg)
         self.init_poses(cfg)
