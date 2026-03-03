@@ -273,7 +273,7 @@ def analyze_conflict_vs_T(
 
     for T in T_values:
         model_path   = join(results_dir, f'hash_grid_T{T}.pth')
-        stats_path   = join(results_dir, f'collision_stats_T{T}.pt')
+        stats_path   = join(results_dir, f'tracker_T{T}.pt')
         mesh_path    = join(results_dir, f'hash_pred_mesh_T{T}.ply')
         metrics_path = join(results_dir, f'metrics_T{T}.json')
 
