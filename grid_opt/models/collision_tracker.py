@@ -213,6 +213,15 @@ class CollisionTracker:
 
         R_dom = G_max / G_sum.clamp(min=eps)
         R_dom[G_sum == 0] = 1.0
+        
+        R_dom = (G_max / G_sum.clamp(min=eps)).clamp(min=0.0, max=1.0)
+        
+        # Enforce the theoretical floor (1/C_eff) per bin to exclude noise
+        C_eff_float = self.C_eff.float().clamp(min=1.0)
+        R_dom_floor = 1.0 / C_eff_float
+        R_dom = torch.maximum(R_dom, R_dom_floor)
+        R_dom[G_sum == 0] = 1.0
+        
         return R_dom
 
     @torch.no_grad()

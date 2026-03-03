@@ -161,6 +161,110 @@ def _compute_trendline(conflict: np.ndarray, errors: np.ndarray, n_bins: int = 4
     slope, intercept = np.polyfit(bin_centers[valid], bin_means[valid], 1)
     return slope, intercept, bin_centers, bin_means
 
+@torch.no_grad()
+def get_per_level_conflict(tracker: CollisionTracker, x_world: torch.Tensor) -> torch.Tensor:
+    """
+    Returns per-level conflict scores: (M, L) tensor.
+    Each column l is the trilinearly-interpolated (1 - R_dom) at level l.
+    """
+    lo = tracker.scene_bound[:, 0]
+    hi = tracker.scene_bound[:, 1]
+    x_norm = ((x_world - lo) / (hi - lo)).clamp(0.0, 1.0)
+    M = x_norm.shape[0]
+
+    R_dom = tracker.get_R_dom()
+    per_level = torch.zeros(M, tracker.n_levels, device=tracker.device)
+
+    for level_idx in range(tracker.n_levels):
+        N_l = tracker.resolutions[level_idx].item()
+
+        x_scaled = x_norm * N_l
+        x_floor  = torch.floor(x_scaled).long()
+        w        = x_scaled - x_floor.float()
+
+        corners      = x_floor.unsqueeze(1) + tracker.encoding.corner_offsets.unsqueeze(0)
+        corners_flat = corners.reshape(M * 8, 3)
+
+        h_idx            = spatial_hash(corners_flat, tracker.T)
+        r_dom_corners    = R_dom[level_idx][h_idx].reshape(M, 8)
+        conflict_corners = 1.0 - r_dom_corners
+
+        wx0, wx1 = 1.0 - w[:, 0], w[:, 0]
+        wy0, wy1 = 1.0 - w[:, 1], w[:, 1]
+        wz0, wz1 = 1.0 - w[:, 2], w[:, 2]
+
+        weights = torch.stack([
+            wx0 * wy0 * wz0, wx0 * wy0 * wz1,
+            wx0 * wy1 * wz0, wx0 * wy1 * wz1,
+            wx1 * wy0 * wz0, wx1 * wy0 * wz1,
+            wx1 * wy1 * wz0, wx1 * wy1 * wz1,
+        ], dim=1)
+
+        per_level[:, level_idx] = (weights * conflict_corners).sum(dim=1)
+
+    return per_level  # (M, L)
+
+
+def plot_per_level_correlation(
+    per_level_conflict: np.ndarray,   # (N, L)
+    errors: np.ndarray,               # (N,)
+    resolutions: list,
+    save_path: str,
+    error_threshold: float = 0.10,
+):
+    mask  = errors < error_threshold
+    conf  = per_level_conflict[mask]   # (N', L)
+    err   = errors[mask]
+    L     = conf.shape[1]
+
+    correlations = np.array([
+        np.corrcoef(conf[:, l], err)[0, 1] for l in range(L)
+    ])
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+    # ── Left: bar chart of per-level Pearson r ────────────────────────────────
+    ax = axes[0]
+    colors = ['tomato' if r > 0 else 'steelblue' for r in correlations]
+    ax.bar(range(1, L + 1), correlations, color=colors)
+    ax.axhline(0, color='black', lw=0.8)
+    ax.set_xlabel("Hash Level")
+    ax.set_ylabel("Pearson r  (conflict vs. error)")
+    ax.set_title("Per-Level Conflict–Error Correlation")
+    ax.set_xticks(range(1, L + 1))
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # Annotate resolution on each bar
+    for l, (r, res) in enumerate(zip(correlations, resolutions)):
+        ax.text(l + 1, r + 0.005 * np.sign(r), f"N={int(res)}", ha='center',
+                va='bottom' if r >= 0 else 'top', fontsize=7, rotation=45)
+
+    # ── Right: scatter of |r| vs log(resolution) ─────────────────────────────
+    ax = axes[1]
+    log_res = np.log2(resolutions)
+    ax.scatter(log_res, np.abs(correlations), c=correlations, cmap='RdBu_r',
+               vmin=-max(abs(correlations)), vmax=max(abs(correlations)), s=60, zorder=3)
+    ax.set_xlabel("log₂(Resolution)")
+    ax.set_ylabel("|Pearson r|")
+    ax.set_title("|Correlation| vs. Level Resolution")
+    ax.grid(True, alpha=0.3)
+
+    plt.suptitle("Per-Level Hash Conflict vs. Geometric Error", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved per-level correlation plot → {save_path}")
+
+    # Print table
+    print("\n" + "=" * 55)
+    print(f"{'Lvl':>4} | {'Res':>6} | {'Pearson r':>10} | {'|r|':>8}")
+    print("-" * 55)
+    for l, (r, res) in enumerate(zip(correlations, resolutions)):
+        print(f"{l+1:>4} | {int(res):>6} | {r:>10.4f} | {abs(r):>8.4f}")
+    print("=" * 55 + "\n")
+
+    return correlations
+
 
 ###############################################################
 # Main Analysis
@@ -221,6 +325,21 @@ def analyze_disambiguation(model_path, stats_path, mesh_path, gt_mesh_path, devi
         c_grad_np, c_eff_grad_np, dist_p,
         save_path="./disambiguation_comparison.png",
     )
+    
+    # Compute per-level conflict: (N, L)
+    per_level_t = torch.zeros(n, tracker.n_levels, device=device)
+    with torch.no_grad():
+        for i in range(0, n, BATCH):
+            batch = verts_torch[i : i + BATCH]
+            per_level_t[i : i + BATCH] = get_per_level_conflict(tracker, batch)
+
+    per_level_np  = per_level_t.cpu().numpy()
+    resolutions   = [tracker.resolutions[l].item() for l in range(tracker.n_levels)]
+
+    correlations = plot_per_level_correlation(
+        per_level_np, dist_p, resolutions,
+        save_path="./per_level_correlation.png",
+    )
 
     # 6. Summary
     print("\n" + "=" * 80)
@@ -231,6 +350,9 @@ def analyze_disambiguation(model_path, stats_path, mesh_path, gt_mesh_path, devi
         print("  → C_grad correlates MORE strongly: gradient asymmetry is doing real work")
     else:
         print("  → C_eff_grad correlates MORE strongly: raw collision frequency drives error")
+    most_predictive = int(np.argmax(np.abs(correlations)))
+    print(f"  Most predictive level: {most_predictive + 1} "
+          f"(res={int(resolutions[most_predictive])}, r={correlations[most_predictive]:.4f})")
     print("=" * 80 + "\n")
 
 
