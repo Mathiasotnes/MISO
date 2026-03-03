@@ -89,12 +89,11 @@ class CollisionTracker:
                 # ── gradient hook ─────────────────────────────────────────────
                 if feats.requires_grad:
                     _lvl = level_idx
-                    _idx = local_idx.detach()
                     _packed = packed_voxels.detach()
 
-                    def _hook(grad, lvl=_lvl, idx=_idx, pck=_packed):
+                    def _hook(grad, lvl=_lvl, pck=_packed):
                         with torch.no_grad():
-                            tracker._pending.append((lvl, idx, pck, grad.norm(dim=-1)))
+                            tracker._pending.append((lvl, pck, grad.norm(dim=-1)))
                         return grad
 
                     feats.register_hook(_hook)
@@ -135,24 +134,27 @@ class CollisionTracker:
     @torch.no_grad()
     def update(self):
         # Pre-group pending gradients by level
-        pending_by_lvl = {l: ([], [], []) for l in range(self.n_levels)}
-        for p_lvl, p_idx, p_packed, p_norms in self._pending:
-            pending_by_lvl[p_lvl][0].append(p_idx)
-            pending_by_lvl[p_lvl][1].append(p_packed)
-            pending_by_lvl[p_lvl][2].append(p_norms)
+        pending_by_lvl = {l: ([], []) for l in range(self.n_levels)}
+        for p_lvl, p_packed, p_norms in self._pending:
+            pending_by_lvl[p_lvl][0].append(p_packed)
+            pending_by_lvl[p_lvl][1].append(p_norms)
 
         for level_idx in range(self.n_levels):
             if not pending_by_lvl[level_idx][0]:
                 continue
 
-            local_idx     = torch.cat(pending_by_lvl[level_idx][0])
-            packed_voxels = torch.cat(pending_by_lvl[level_idx][1])
-            norms         = torch.cat(pending_by_lvl[level_idx][2])
+            packed_voxels = torch.cat(pending_by_lvl[level_idx][0])
+            norms         = torch.cat(pending_by_lvl[level_idx][1])
 
             # 1. Sum gradient energy per unique voxel in this batch
             unique_packed, inverse_indices = torch.unique(packed_voxels, return_inverse=True)
             batch_G = torch.zeros(unique_packed.shape[0], dtype=torch.float32, device=self.device)
             batch_G.scatter_add_(0, inverse_indices, norms)
+            
+            # Mask out negligible gradients to avoid polluting the history with noise            
+            mask = batch_G > 1e-12
+            unique_packed = unique_packed[mask]
+            batch_G = batch_G[mask]
 
             # 2. Merge into global voxel history via searchsorted
             history_voxels = self._voxels[level_idx]

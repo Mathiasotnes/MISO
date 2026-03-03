@@ -1,282 +1,250 @@
 import torch
-import math
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
 from grid_opt.utils.utils_eval import nn_correspondance, sample_points_from_mesh
-from grid_opt.models.collision_tracker import CollisionTracker
+from grid_opt.models.collision_tracker import CollisionTracker, spatial_hash
 
 
 ###############################################################
 # Constants / Configuration
 ###############################################################
 
-# Multiresolution Hash-Grid (MHE) parameters (taken from InstantNGP)
-PI      = [1, 2654435761, 805459861]
-T       = 2**19
-L       = 16
-N_min   = 16
-N_max   = 2048
-b       = torch.exp((torch.log(torch.tensor(N_max)) - torch.log(torch.tensor(N_min))) / (L - 1)).item()
+COLLISION_STATS_PATH = "./collision_stats.pt"
+MESH_PATH            = "./results/mapping/hash_pred_mesh.ply"
+GT_MESH_PATH         = "../../data/ScanNet/scans/scene0000_00/scene0000_00_vh_clean.ply"
+MODEL_PATH           = "./results/mapping/hash_grid.pth"
 
-# Data
-BOUNDS                  = torch.tensor([[-0.02,  10.38], [-0.01, 8.74], [-0.01,  3.03]])
-COLLISION_STATS_PATH    = "./collision_stats.pt"
-MESH_PATH               = "./results/mapping/hash_pred_mesh.ply"
-GT_MESH_PATH            = "../../data/ScanNet/scans/scene0000_00/scene0000_00_vh_clean.ply"
-MODEL_PATH              = "./results/mapping/hash_grid.pth"
 
-def print_config() -> None:
-    print("\n" + "="*40)
-    print("MHE CONFIGURATION")
-    print("="*40)
-    print(f" * Hash Table Size (T):     {T:,}")
-    print(f" * Number of Levels (L):    {L}")
-    print(f" * Min Resolution (N_min):  {N_min}")
-    print(f" * Max Resolution (N_max):  {N_max}")
-    print(f" * Growth Factor (b):       {b:.4f}")
-    print(f" * Primes (π):              {PI}")
-    print("="*40 + "\n")
-    
-    
 ###############################################################
-# Spatial Collision Density Analysis
+# Conflict Metrics
 ###############################################################
 
-def spatial_hash(x: torch.Tensor) -> torch.Tensor:
-    """ Hash function for 3D coordinates using bitwise XOR and primes. """
-    assert x.shape[1] == 3
-    # Use int64 for intermediate calculation to avoid overflow before modulo T
-    h = (x[:, 0].long() * PI[0]) ^ (x[:, 1].long() * PI[1]) ^ (x[:, 2].long() * PI[2])
-    return h % T
-
-def get_vertices_for_index(target_index: int, N_l: int) -> torch.Tensor:
-    """ Reverse-check: Which coordinates in a grid of resolution N_l hash to a specific index? """
-    coords = []
-    # NOTE: This is a brute-force check for analysis purposes
-    for z in range(N_l + 1):
-        x_c = torch.arange(N_l + 1)
-        y_c = torch.arange(N_l + 1)
-        grid_x, grid_y = torch.meshgrid(x_c, y_c, indexing='ij')
-        verts = torch.stack([grid_x.flatten(), grid_y.flatten(), torch.full_like(grid_x.flatten(), z)], dim=1)
-        indices = spatial_hash(verts)
-        matches = verts[indices == target_index]
-        if matches.shape[0] > 0:
-            coords.append(matches)
-    return torch.cat(coords) if coords else torch.tensor([])
-
-def analyze_hottest_bins(h_func, N_l: int, top_k: int = 1):
-    """ 
-    Finds the bins with the highest potential collisions (C_pot) 
-    and analyzes their spatial distribution.
+@torch.no_grad()
+def get_C_eff_grad(tracker: CollisionTracker, x_world: torch.Tensor) -> torch.Tensor:
     """
-    bin_counts = torch.zeros(T, dtype=torch.long)
-    total_verts = (N_l + 1)**3
+    C_eff_grad(x) = sum_l sum_c w_c * C_eff(l, h_l(c)) / C_pot_avg(l)
     
-    # Calculate counts via chunking
-    for z in range(N_l + 1):
-        x_c = torch.arange(N_l + 1); y_c = torch.arange(N_l + 1)
-        grid_x, grid_y = torch.meshgrid(x_c, y_c, indexing='ij')
-        verts = torch.stack([grid_x.flatten(), grid_y.flatten(), torch.full_like(grid_x.flatten(), z)], dim=1)
-        indices = h_func(verts)
-        bin_counts.put_(indices, torch.ones_like(indices), accumulate=True)
-
-    # Get stats
-    max_val, hottest_idx = torch.max(bin_counts, dim=0)
-    # Find a 'least hot' bin that is still occupied (C_pot > 0)
-    occupied_indices = torch.where(bin_counts > 0)[0]
-    min_val, min_occ_idx = torch.min(bin_counts[occupied_indices], dim=0)
-    least_hot_idx = occupied_indices[min_occ_idx]
-
-    print(f"\nLevel Analysis: N_l = {N_l}")
-    print("="*40)
-    print(f"Hottest Index: {hottest_idx.item():<8} | Load: {max_val.item()}")
-    print(f"Coldest Index: {least_hot_idx.item():<8} | Load: {min_val.item()}")
-    print("="*40)
-
-    # Find where the hottest collisions are located
-    # This checks which coordinates mapped to that specific hot index
-    hot_coords = []
-    for z in range(N_l + 1):
-        x_c = torch.arange(N_l + 1); y_c = torch.arange(N_l + 1)
-        grid_x, grid_y = torch.meshgrid(x_c, y_c, indexing='ij')
-        verts = torch.stack([grid_x.flatten(), grid_y.flatten(), torch.full_like(grid_x.flatten(), z)], dim=1)
-        indices = h_func(verts)
-        matches = verts[indices == hottest_idx]
-        if matches.shape[0] > 0:
-            hot_coords.append(matches)
-    
-    all_hot_coords = torch.cat(hot_coords)
-    print(f"Sample coordinates for Hottest Index {hottest_idx.item()}:")
-    # Print first few to look for patterns
-    for i in range(min(5, all_hot_coords.shape[0])):
-        print(f"  - Vertex {i+1}: {all_hot_coords[i].tolist()}")
-
-def potential_collisions(h_func, N_min: int, T: int, L: int, b: float) -> None:
-    """ 
-    Calculates the frequency and density of potential collisions for each level. 
+    Gradient-agnostic version of C_grad. Uses raw collision counts normalized
+    by the expected collisions per bin at each level, making layers comparable.
+    C_pot_avg(l) = (N_l + 1)^3 / T is the expected number of voxels per bin.
     """
-    header = f"{'Level':<6} | {'Res (N_l)':<10} | {'Total Verts':<14} | {'Coll. Ratio':<12} | {'Avg. Load'}"
-    print(header)
-    print("-" * len(header))
+    lo = tracker.scene_bound[:, 0]
+    hi = tracker.scene_bound[:, 1]
+    x_norm = ((x_world - lo) / (hi - lo)).clamp(0.0, 1.0)
+    M = x_norm.shape[0]
 
-    for l_idx in range(L):
-        N_l = int(torch.floor(torch.tensor(N_min * (b**(l_idx)))).item())
-        total_vertices = (N_l + 1)**3
-        
-        # Tracking counts per bin
-        bin_counts = torch.zeros(T, dtype=torch.long)
-        
-        # Memory-efficient XY-plane chunking
-        for z in range(N_l + 1):
-            x_coords = torch.arange(N_l + 1)
-            y_coords = torch.arange(N_l + 1)
-            grid_x, grid_y = torch.meshgrid(x_coords, y_coords, indexing='ij')
-            
-            slice_verts = torch.stack([
-                grid_x.flatten(), 
-                grid_y.flatten(), 
-                torch.full_like(grid_x.flatten(), z)
-            ], dim=1)
-            
-            indices = h_func(slice_verts)
-            # Efficient histogram update
-            bin_counts.put_(indices, torch.ones_like(indices, dtype=torch.long), accumulate=True)
+    C_eff_grad = torch.zeros(M, device=tracker.device)
 
-        # Metrics calculation
-        occupied_mask = bin_counts > 0
-        num_occupied_bins = occupied_mask.sum().item()
-        
-        # Collision Ratio: Vertices that don't have their own unique bin
-        collision_ratio = 0.0
-        if total_vertices > num_occupied_bins:
-            collision_ratio = (total_vertices - num_occupied_bins) / total_vertices
+    for level_idx in range(tracker.n_levels):
+        N_l = tracker.resolutions[level_idx].item()
+        C_pot_avg = (N_l + 1) ** 3 / tracker.T  # expected voxels per bin
 
-        # Average Load: For bins that have something in them, what is the average count?
-        # A load of 1.0 means perfect 1:1 mapping (no collisions)[cite: 191].
-        avg_load = 0.0
-        if num_occupied_bins > 0:
-            avg_load = total_vertices / num_occupied_bins
+        x_scaled = x_norm * N_l
+        x_floor  = torch.floor(x_scaled).long()
+        w        = x_scaled - x_floor.float()
 
-        print(f"{l_idx+1:<6} | {N_l:<10} | {total_vertices:<14} | {collision_ratio:>12.2%} | {avg_load:.4f}")
+        corners      = x_floor.unsqueeze(1) + tracker.encoding.corner_offsets.unsqueeze(0)
+        corners_flat = corners.reshape(M * 8, 3)
+
+        h_idx             = spatial_hash(corners_flat, tracker.T)
+        c_eff_corners     = tracker.C_eff[level_idx][h_idx].float().reshape(M, 8)
+        normalized_corners = c_eff_corners / C_pot_avg
+
+        wx0, wx1 = 1.0 - w[:, 0], w[:, 0]
+        wy0, wy1 = 1.0 - w[:, 1], w[:, 1]
+        wz0, wz1 = 1.0 - w[:, 2], w[:, 2]
+
+        weights = torch.stack([
+            wx0 * wy0 * wz0, wx0 * wy0 * wz1,
+            wx0 * wy1 * wz0, wx0 * wy1 * wz1,
+            wx1 * wy0 * wz0, wx1 * wy0 * wz1,
+            wx1 * wy1 * wz0, wx1 * wy1 * wz1,
+        ], dim=1)
+
+        C_eff_grad += (weights * normalized_corners).sum(dim=1)
+
+    return C_eff_grad
+
+
+###############################################################
+# Plotting
+###############################################################
+
+def plot_conflict_vs_error(
+    conflict_scores: np.ndarray,
+    errors: np.ndarray,
+    label: str,
+    save_path: str,
+    error_threshold: float = 0.10,
+):
+    mask = errors < error_threshold
+    c_f, e_f = conflict_scores[mask], errors[mask]
+
+    slope, intercept, bin_centers, bin_means = _compute_trendline(c_f, e_f)
+
+    print("\n" + "=" * 80)
+    print(f"DISAMBIGUATION POWER — {label}")
+    print(f"  Sensitivity Slope : {slope:.8f}  (m per conflict unit)")
+    print(f"  Intercept (Base)  : {intercept:.4f} m")
+    print("=" * 80 + "\n")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    hb = ax.hexbin(c_f, e_f, gridsize=60, cmap='YlOrRd', mincnt=1)
+    fig.colorbar(hb, ax=ax, label='Point Density')
+
+    valid = ~np.isnan(bin_means)
+    ax.plot(bin_centers[valid], bin_means[valid], color='blue', lw=3, label='Binned Mean')
+
+    ax.set_xlabel(f"Conflict Score  [{label}]")
+    ax.set_ylabel("Geometric Error (m)")
+    ax.set_title(f"Decoder Disambiguation Analysis: {label} vs. Accuracy")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved plot → {save_path}")
+    return slope
+
+
+def plot_conflict_comparison(
+    c_grad: np.ndarray,
+    c_eff_grad: np.ndarray,
+    errors: np.ndarray,
+    save_path: str,
+    error_threshold: float = 0.10,
+):
+    """Side-by-side comparison of C_grad vs C_eff_grad."""
+    mask = errors < error_threshold
+
+    fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+    titles   = ["$C_{grad}$ (gradient-weighted)", "$C_{eff-grad}$ (frequency, normalized)"]
+    datasets = [c_grad[mask], c_eff_grad[mask]]
+    e_f = errors[mask]
+
+    for ax, scores, title in zip(axes, datasets, titles):
+        hb = ax.hexbin(scores, e_f, gridsize=60, cmap='YlOrRd', mincnt=1)
+        fig.colorbar(hb, ax=ax, label='Point Density')
+
+        _, _, bin_centers, bin_means = _compute_trendline(scores, e_f)
+        valid = ~np.isnan(bin_means)
+        ax.plot(bin_centers[valid], bin_means[valid], color='blue', lw=3, label='Binned Mean')
+
+        ax.set_xlabel("Conflict Score")
+        ax.set_ylabel("Geometric Error (m)")
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle("C_grad vs C_eff_grad: Disambiguation Power Comparison", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved comparison plot → {save_path}")
+
+
+def _compute_trendline(conflict: np.ndarray, errors: np.ndarray, n_bins: int = 40):
+    bins        = np.linspace(conflict.min(), conflict.max(), n_bins + 1)
+    bin_centers = (bins[:-1] + bins[1:]) / 2
+    digitized   = np.digitize(conflict, bins)
+
+    bin_means = np.array([
+        errors[digitized == i].mean() if (digitized == i).any() else np.nan
+        for i in range(1, len(bins))
+    ])
+
+    valid = ~np.isnan(bin_means)
+    slope, intercept = np.polyfit(bin_centers[valid], bin_means[valid], 1)
+    return slope, intercept, bin_centers, bin_means
+
+
+###############################################################
+# Main Analysis
+###############################################################
 
 def analyze_disambiguation(model_path, stats_path, mesh_path, gt_mesh_path, device="cuda"):
-    """ Correlates per-vertex Accuracy with C_grad and plots the trend. """
-    
-    # 1. Load the model and instantiate the loaded tracker
+    # 1. Load model and tracker
     print("Loading model and collision statistics...")
     hash_grid = torch.load(model_path, map_location=device)
     tracker = CollisionTracker.load(
-        path=stats_path, 
-        encoding=hash_grid.encoding, 
-        scene_bound=hash_grid.bound, 
-        device=device
+        path=stats_path,
+        encoding=hash_grid.encoding,
+        scene_bound=hash_grid.bound,
+        device=device,
     )
-    
-    # Print the clean summary we built earlier!
     tracker.print_summary()
 
-    # 2. Get Query Points (Predicted Mesh Vertices)
+    # 2. Load meshes and compute geometric error
     print("Sampling points from meshes...")
-    verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
-    verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
-    
-    # Calculate geometric error (distance to GT)
-    print("Calculating nearest neighbor correspondences...")
-    # 1. Use False so NO points are dropped
+    verts_pred = sample_points_from_mesh(mesh_path,    mesh_sample_point=1_000_000)
+    verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1_000_000)
+
+    print("Calculating nearest-neighbour correspondences...")
     _, dist_p = nn_correspondance(verts_pred, verts_trgt, 0.50, False)
-    
-    # 2. FLATTEN to fix the (1, N) shape bug!
     dist_p = np.array(dist_p).flatten()
 
-    # 3. Calculate C_grad using the new tracker
-    print("Calculating spatial conflict (C_grad) for query points...")
-    
-    # 4. Because lengths match perfectly, we safely use verts_pred
-    verts_torch = torch.from_numpy(verts_pred).float().to(device)
-    
-    # We batch this to prevent OOM errors
-    c_grad_scores = torch.zeros(len(verts_torch), device=device)
-    BATCH_SIZE = 100000
-    
+    # 3. Compute both conflict metrics in batches
+    print("Computing conflict scores...")
+    verts_torch  = torch.from_numpy(verts_pred).float().to(device)
+    BATCH        = 100_000
+    n            = len(verts_torch)
+    c_grad_t     = torch.zeros(n, device=device)
+    c_eff_grad_t = torch.zeros(n, device=device)
+
     with torch.no_grad():
-        for i in range(0, len(verts_torch), BATCH_SIZE):
-            batch_verts = verts_torch[i : i + BATCH_SIZE]
-            c_grad_scores[i : i + BATCH_SIZE] = tracker.get_C_grad(batch_verts)
-            
-    c_grad_np = c_grad_scores.cpu().numpy()
+        for i in range(0, n, BATCH):
+            batch = verts_torch[i : i + BATCH]
+            c_grad_t    [i : i + BATCH] = tracker.get_C_grad(batch)
+            c_eff_grad_t[i : i + BATCH] = get_C_eff_grad(tracker, batch)
 
-    # 4. Filter and Analyze Trends
-    print("Generating analysis plots...")
-    # Both arrays are now exactly 1D and the exact same length. Perfect lockstep!
-    mask = dist_p < 0.10 
-    c_f, e_f = c_grad_np[mask], dist_p[mask]
+    c_grad_np     = c_grad_t.cpu().numpy()
+    c_eff_grad_np = c_eff_grad_t.cpu().numpy()
 
-    # Initialize Plot
-    plt.figure(figsize=(10, 6))
-    plt.hexbin(c_f, e_f, gridsize=60, cmap='YlOrRd', mincnt=1)
-    
-    # Compute Trendline via Binned Averages
-    bins = np.linspace(c_f.min(), c_f.max(), 40)
-    bin_centers = (bins[:-1] + bins[1:]) / 2
-    
-    # Calculate means safely to avoid warnings on empty bins
-    bin_means = []
-    digitized = np.digitize(c_f, bins)
-    for i in range(1, len(bins)):
-        bin_vals = e_f[digitized == i]
-        bin_means.append(bin_vals.mean() if len(bin_vals) > 0 else np.nan)
-    bin_means = np.array(bin_means)
-    
-    valid = ~np.isnan(bin_means)
-    plt.plot(bin_centers[valid], bin_means[valid], color='blue', lw=3, label='Disambiguation Slope')
-    
-    # Sensitivity Metric (Linear Fit)
-    slope, intercept = np.polyfit(bin_centers[valid], bin_means[valid], 1)
-    print("\n" + "="*100)
-    print(f"OVERALL DISAMBIGUATION POWER")
-    print(f" * Sensitivity Slope: {slope:.8f} (m per conflict unit)")
-    print(f" * Intercept (Base):  {intercept:.4f} m")
-    print("="*100 + "\n")
+    # 4. Individual plots
+    slope_c_grad = plot_conflict_vs_error(
+        c_grad_np, dist_p,
+        label="$C_{grad}$",
+        save_path="./disambiguation_c_grad.png",
+    )
+    slope_c_eff_grad = plot_conflict_vs_error(
+        c_eff_grad_np, dist_p,
+        label="$C_{eff-grad}$",
+        save_path="./disambiguation_c_eff_grad.png",
+    )
 
-    # Finalize and Save Plot
-    plt.xlabel("Spatial Conflict Index $C_{grad}(\mathbf{x})$")
-    plt.ylabel("Accuracy Error (m)")
-    plt.title("Decoder Disambiguation Analysis: Conflict vs. Geometric Accuracy")
-    plt.colorbar(label='Point Density')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig("./disambiguation_analysis.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    print("Saved plot to ./disambiguation_analysis.png")
+    # 5. Side-by-side comparison
+    plot_conflict_comparison(
+        c_grad_np, c_eff_grad_np, dist_p,
+        save_path="./disambiguation_comparison.png",
+    )
+
+    # 6. Summary
+    print("\n" + "=" * 80)
+    print("METRIC COMPARISON SUMMARY")
+    print(f"  C_grad     slope: {slope_c_grad:.8f}")
+    print(f"  C_eff_grad slope: {slope_c_eff_grad:.8f}")
+    if abs(slope_c_grad) > abs(slope_c_eff_grad):
+        print("  → C_grad correlates MORE strongly: gradient asymmetry is doing real work")
+    else:
+        print("  → C_eff_grad correlates MORE strongly: raw collision frequency drives error")
+    print("=" * 80 + "\n")
+
 
 ###############################################################
-# Main Program Entry
+# Entry Point
 ###############################################################
 
 if __name__ == "__main__":
-    
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # print_config()
-    
-    ####################################
-    # Collision Analysis
-    ####################################
-    
-    # Summarizes collisions statistics across all layers
-    # potential_collisions(spatial_hash, N_min, T, L, b)
-    
-    # analyze_hottest_bins(spatial_hash, N_l=2048)
-    # analyze_hottest_bins(spatial_hash, N_l=406)
-    
     analyze_disambiguation(
         model_path=MODEL_PATH,
-        stats_path=COLLISION_STATS_PATH, 
-        mesh_path=MESH_PATH, 
+        stats_path=COLLISION_STATS_PATH,
+        mesh_path=MESH_PATH,
         gt_mesh_path=GT_MESH_PATH,
-        device=device
+        device=device,
     )
     
