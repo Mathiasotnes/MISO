@@ -461,9 +461,9 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     analyze_disambiguation(
-        model_path=MODEL_PATH,
-        stats_path=STATS_PATH,
-        mesh_path=MESH_PATH,
+        model_path=MODEL_PATH_HIGH_T,
+        stats_path=STATS_PATH_HIGH_T,
+        mesh_path=MESH_PATH_HIGH_T,
         gt_mesh_path=GT_MESH_PATH,
         device=device,
     )
