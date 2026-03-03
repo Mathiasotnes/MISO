@@ -12,10 +12,14 @@ from grid_opt.models.collision_tracker import CollisionTracker, spatial_hash
 # Constants / Configuration
 ###############################################################
 
-COLLISION_STATS_PATH = "./collision_stats.pt"
-MESH_PATH            = "./results/mapping/hash_pred_mesh.ply"
-GT_MESH_PATH         = "../../data/ScanNet/scans/scene0000_00/scene0000_00_vh_clean.ply"
-MODEL_PATH           = "./results/mapping/hash_grid.pth"
+STATS_PATH          = "./collision_stats.pt"
+MESH_PATH           = "./results/mapping/hash_pred_mesh.ply"
+GT_MESH_PATH        = "../../data/ScanNet/scans/scene0000_00/scene0000_00_vh_clean.ply"
+MODEL_PATH          = "./results/mapping/hash_grid.pth"
+
+MODEL_PATH_HIGH_T   = "./results/mapping/hash_grid_high_T.pth"
+STATS_PATH_HIGH_T   = "./results/mapping/collision_stats_high_T.pt"
+MESH_PATH_HIGH_T    = "./results/mapping/hash_pred_mesh_high_T.ply"
 
 
 ###############################################################
@@ -483,6 +487,139 @@ def analyze_disambiguation(model_path, stats_path, mesh_path, gt_mesh_path, devi
           f"(res={int(resolutions[most_predictive])}, r={correlations[most_predictive]:.4f})")
     print("=" * 80 + "\n")
 
+def analyze_collision_damage(
+    model_path_high_T: str,
+    stats_path_high_T: str,
+    mesh_path_high_T: str,
+    model_path_low_T: str,
+    stats_path_low_T: str,
+    mesh_path_low_T: str,
+    gt_mesh_path: str,
+    device: str = "cuda",
+):
+    """
+    Computes collision_damage(x) = error_low_T(x) - error_high_T(x)
+    and correlates it with conflict metrics from the low-T model.
+    """
+    # 1. Load both trackers
+    print("Loading models...")
+    hash_grid_low  = torch.load(model_path_low_T,  map_location=device)
+    hash_grid_high = torch.load(model_path_high_T, map_location=device)
+
+    tracker_low = CollisionTracker.load(
+        path=stats_path_low_T,
+        encoding=hash_grid_low.encoding,
+        scene_bound=hash_grid_low.bound,
+        device=device,
+    )
+    tracker_high = CollisionTracker.load(
+        path=stats_path_high_T,
+        encoding=hash_grid_high.encoding,
+        scene_bound=hash_grid_high.bound,
+        device=device,
+    )
+
+    print("High-T model (collision-free baseline):")
+    tracker_high.print_summary()
+    print("Low-T model (collision-heavy):")
+    tracker_low.print_summary()
+
+    # 2. Sample GT mesh once, pred meshes separately
+    print("Sampling meshes...")
+    verts_trgt      = sample_points_from_mesh(gt_mesh_path,       mesh_sample_point=1_000_000)
+    verts_pred_low  = sample_points_from_mesh(mesh_path_low_T,    mesh_sample_point=1_000_000)
+    verts_pred_high = sample_points_from_mesh(mesh_path_high_T,   mesh_sample_point=1_000_000)
+
+    print("Computing per-point errors...")
+    _, dist_low  = nn_correspondance(verts_pred_low,  verts_trgt, 0.50, False)
+    _, dist_high = nn_correspondance(verts_pred_high, verts_trgt, 0.50, False)
+    dist_low  = np.array(dist_low).flatten()
+    dist_high = np.array(dist_high).flatten()
+
+    # 3. The two predicted meshes have different vertex sets so we can't
+    #    subtract pointwise directly — we need to bring them to a common
+    #    set of query points. Use the low-T vertices as the reference and
+    #    find the nearest high-T error estimate for each.
+    print("Aligning error fields...")
+    verts_low_t  = torch.from_numpy(verts_pred_low).float().to(device)
+    verts_high_t = torch.from_numpy(verts_pred_high).float().to(device)
+
+    # For each low-T vertex, find the nearest high-T vertex and use its error
+    # as the collision-free baseline at that location
+    from torch.nn.functional import normalize
+    CHUNK = 50_000
+    nearest_high_error = np.zeros(len(verts_pred_low))
+
+    for i in range(0, len(verts_low_t), CHUNK):
+        batch    = verts_low_t[i : i + CHUNK]                          # (B, 3)
+        dists_sq = torch.cdist(batch, verts_high_t)                    # (B, N_high)
+        nn_idx   = dists_sq.argmin(dim=1).cpu().numpy()                # (B,)
+        nearest_high_error[i : i + CHUNK] = dist_high[nn_idx]
+
+    # Collision damage: how much worse is the low-T model at each point?
+    collision_damage = dist_low - nearest_high_error                   # can be negative
+
+    print(f"Collision damage stats:")
+    print(f"  mean  : {collision_damage.mean():.4f} m")
+    print(f"  std   : {collision_damage.std():.4f} m")
+    print(f"  % positive (collision hurt): {(collision_damage > 0).mean()*100:.1f}%")
+
+    # 4. Compute conflict metrics for the low-T model at low-T vertices
+    print("Computing conflict scores for low-T model...")
+    BATCH        = 100_000
+    n            = len(verts_low_t)
+    c_grad_t     = torch.zeros(n, device=device)
+    c_eff_grad_t = torch.zeros(n, device=device)
+
+    with torch.no_grad():
+        for i in range(0, n, BATCH):
+            batch = verts_low_t[i : i + BATCH]
+            c_grad_t    [i : i + BATCH] = tracker_low.get_C_grad(batch)
+            c_eff_grad_t[i : i + BATCH] = get_C_eff_grad(tracker_low, batch)
+
+    c_grad_np     = c_grad_t.cpu().numpy()
+    c_eff_grad_np = c_eff_grad_t.cpu().numpy()
+
+    # 5. Correlate conflict with collision damage
+    # Only look at points where low-T was actually worse (genuine damage)
+    damage_mask = (collision_damage > 0) & (dist_low < 0.10)
+
+    r_c_grad     = np.corrcoef(c_grad_np[damage_mask],     collision_damage[damage_mask])[0, 1]
+    r_c_eff_grad = np.corrcoef(c_eff_grad_np[damage_mask], collision_damage[damage_mask])[0, 1]
+
+    print("\n" + "=" * 80)
+    print("COLLISION DAMAGE CORRELATION")
+    print(f"  Points with positive damage : {damage_mask.sum():,} / {n:,}")
+    print(f"  Pearson r (C_grad     vs damage) : {r_c_grad:.4f}")
+    print(f"  Pearson r (C_eff_grad vs damage) : {r_c_eff_grad:.4f}")
+    print("=" * 80 + "\n")
+
+    # 6. Plot
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    titles   = ["$C_{grad}$ vs Collision Damage", "$C_{eff-grad}$ vs Collision Damage"]
+    datasets = [c_grad_np[damage_mask], c_eff_grad_np[damage_mask]]
+    damage_f = collision_damage[damage_mask]
+
+    for ax, scores, title, r in zip(axes, datasets, titles, [r_c_grad, r_c_eff_grad]):
+        hb = ax.hexbin(scores, damage_f, gridsize=50, cmap='YlOrRd', mincnt=1)
+        fig.colorbar(hb, ax=ax, label='Point Density')
+
+        _, _, bin_centers, bin_means = _compute_trendline(scores, damage_f)
+        valid = ~np.isnan(bin_means)
+        ax.plot(bin_centers[valid], bin_means[valid], color='blue', lw=2, label=f'r={r:.3f}')
+
+        ax.set_xlabel("Conflict Score")
+        ax.set_ylabel("Collision Damage (m)")
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle("Conflict Metrics vs. Collision Damage  (low-T − high-T error)", fontsize=13)
+    plt.tight_layout()
+    plt.savefig("./collision_damage_analysis.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print("Saved → ./collision_damage_analysis.png")
+
 
 ###############################################################
 # Entry Point
@@ -490,10 +627,21 @@ def analyze_disambiguation(model_path, stats_path, mesh_path, gt_mesh_path, devi
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    analyze_disambiguation(
-        model_path=MODEL_PATH,
-        stats_path=COLLISION_STATS_PATH,
-        mesh_path=MESH_PATH,
+    # analyze_disambiguation(
+    #     model_path=MODEL_PATH,
+    #     stats_path=STATS_PATH,
+    #     mesh_path=MESH_PATH,
+    #     gt_mesh_path=GT_MESH_PATH,
+    #     device=device,
+    # )
+    
+    analyze_collision_damage(
+        model_path_high_T=MODEL_PATH_HIGH_T,
+        stats_path_high_T=STATS_PATH_HIGH_T,
+        mesh_path_high_T=MESH_PATH_HIGH_T,
+        model_path_low_T=MODEL_PATH,
+        stats_path_low_T=STATS_PATH,
+        mesh_path_low_T=MESH_PATH,
         gt_mesh_path=GT_MESH_PATH,
         device=device,
     )
