@@ -288,8 +288,11 @@ class GridNGPOurs(BaseNet):
             decoder.append(layer)
             decoder.append(nn.ReLU())
 
-        # Final output layer (Linear) 
-        final_layer = nn.Linear(self.n_neurons, self.n_output_dims)
+        # Final output layer
+        if self.n_hidden_layers == 0:
+            final_layer = nn.Linear(input_dim, self.n_output_dims)
+        else:
+            final_layer = nn.Linear(self.n_neurons, self.n_output_dims)
         nn.init.xavier_uniform_(final_layer.weight)
         decoder.append(final_layer)
 
