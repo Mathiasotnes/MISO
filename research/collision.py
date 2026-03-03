@@ -500,6 +500,12 @@ def analyze_collision_damage(
     """
     Computes collision_damage(x) = error_low_T(x) - error_high_T(x)
     and correlates it with conflict metrics from the low-T model.
+
+    Error decomposition:
+        error(x) = e_collision(x) + e_model(x) + e_sampling(x) + noise
+    where:
+        e_collision(x) = dist_low(x) - dist_high(x)   [what we measure here]
+        e_model(x)     = dist_high(x)                  [irreducible model error]
     """
     # 1. Load both trackers
     print("Loading models...")
@@ -524,98 +530,150 @@ def analyze_collision_damage(
     print("Low-T model (collision-heavy):")
     tracker_low.print_summary()
 
-    # 2. Sample GT mesh once, pred meshes separately
+    # 2. Sample meshes — GT is the common query set
     print("Sampling meshes...")
-    verts_trgt      = sample_points_from_mesh(gt_mesh_path,       mesh_sample_point=1_000_000)
-    verts_pred_low  = sample_points_from_mesh(mesh_path_low_T,    mesh_sample_point=1_000_000)
-    verts_pred_high = sample_points_from_mesh(mesh_path_high_T,   mesh_sample_point=1_000_000)
+    verts_trgt      = sample_points_from_mesh(gt_mesh_path,     mesh_sample_point=1_000_000)
+    verts_pred_low  = sample_points_from_mesh(mesh_path_low_T,  mesh_sample_point=1_000_000)
+    verts_pred_high = sample_points_from_mesh(mesh_path_high_T, mesh_sample_point=1_000_000)
 
-    print("Computing per-point errors...")
-    _, dist_low  = nn_correspondance(verts_pred_low,  verts_trgt, 0.50, False)
-    _, dist_high = nn_correspondance(verts_pred_high, verts_trgt, 0.50, False)
+    # 3. Compute errors at GT vertices (common query set)
+    print("Computing per-point errors at GT vertices...")
+    _, dist_low  = nn_correspondance(verts_trgt, verts_pred_low,  0.50, False)
+    _, dist_high = nn_correspondance(verts_trgt, verts_pred_high, 0.50, False)
     dist_low  = np.array(dist_low).flatten()
     dist_high = np.array(dist_high).flatten()
 
-    # 3. The two predicted meshes have different vertex sets so we can't
-    #    subtract pointwise directly — we need to bring them to a common
-    #    set of query points. Use the low-T vertices as the reference and
-    #    find the nearest high-T error estimate for each.
-    print("Aligning error fields...")
-    verts_low_t  = torch.from_numpy(verts_pred_low).float().to(device)
-    verts_high_t = torch.from_numpy(verts_pred_high).float().to(device)
+    # Error decomposition
+    e_collision = dist_low - dist_high   # collision component  (can be negative)
+    e_model     = dist_high              # irreducible model error
 
-    # For each low-T vertex, find the nearest high-T vertex and use its error
-    # as the collision-free baseline at that location
-    print("Aligning error fields...")
-    from scipy.spatial import cKDTree
-    
-    tree = cKDTree(verts_pred_high)
-    _, nn_idx = tree.query(verts_pred_low, k=1, workers=-1)
-    nearest_high_error = dist_high[nn_idx]
+    print(f"\nError decomposition summary:")
+    print(f"  e_model     MAE  : {np.abs(e_model).mean():.4f} m  (irreducible)")
+    print(f"  e_collision MAE  : {np.abs(e_collision).mean():.4f} m")
+    print(f"  e_collision mean : {e_collision.mean():.4f} m  (+ = collisions hurt on avg)")
+    print(f"  e_collision std  : {e_collision.std():.4f} m")
+    print(f"  % where collisions hurt  : {(e_collision > 0).mean()*100:.1f}%")
+    print(f"  % where collisions help  : {(e_collision < 0).mean()*100:.1f}%")
+    print(f"  collision share of total : {np.abs(e_collision).mean() / dist_low.mean()*100:.1f}%")
 
-    # Collision damage: how much worse is the low-T model at each point?
-    collision_damage = dist_low - nearest_high_error                   # can be negative
-
-    print(f"Collision damage stats:")
-    print(f"  mean  : {collision_damage.mean():.4f} m")
-    print(f"  std   : {collision_damage.std():.4f} m")
-    print(f"  % positive (collision hurt): {(collision_damage > 0).mean()*100:.1f}%")
-
-    # 4. Compute conflict metrics for the low-T model at low-T vertices
-    print("Computing conflict scores for low-T model...")
+    # 4. Compute conflict metrics at GT vertices (matching the error query points)
+    print("\nComputing conflict scores at GT vertices...")
+    verts_trgt_t = torch.from_numpy(verts_trgt).float().to(device)
     BATCH        = 100_000
-    n            = len(verts_low_t)
+    n            = len(verts_trgt_t)
     c_grad_t     = torch.zeros(n, device=device)
     c_eff_grad_t = torch.zeros(n, device=device)
 
     with torch.no_grad():
         for i in range(0, n, BATCH):
-            batch = verts_low_t[i : i + BATCH]
+            batch = verts_trgt_t[i : i + BATCH]
             c_grad_t    [i : i + BATCH] = tracker_low.get_C_grad(batch)
             c_eff_grad_t[i : i + BATCH] = get_C_eff_grad(tracker_low, batch)
 
     c_grad_np     = c_grad_t.cpu().numpy()
     c_eff_grad_np = c_eff_grad_t.cpu().numpy()
 
-    # 5. Correlate conflict with collision damage
-    # Only look at points where low-T was actually worse (genuine damage)
-    damage_mask = (collision_damage > 0) & (dist_low < 0.10)
+    # 5. Correlations — use all points, not just positive damage
+    # Masking to positive-only biases the sample and hides disambiguation success
+    quality_mask = dist_low < 0.10   # exclude extreme outliers only
 
-    r_c_grad     = np.corrcoef(c_grad_np[damage_mask],     collision_damage[damage_mask])[0, 1]
-    r_c_eff_grad = np.corrcoef(c_eff_grad_np[damage_mask], collision_damage[damage_mask])[0, 1]
+    r_collision_cgrad     = np.corrcoef(c_grad_np[quality_mask],     e_collision[quality_mask])[0, 1]
+    r_collision_ceffgrad  = np.corrcoef(c_eff_grad_np[quality_mask], e_collision[quality_mask])[0, 1]
+    r_model_cgrad         = np.corrcoef(c_grad_np[quality_mask],     e_model[quality_mask])[0, 1]
 
-    print("\n" + "=" * 80)
-    print("COLLISION DAMAGE CORRELATION")
-    print(f"  Points with positive damage : {damage_mask.sum():,} / {n:,}")
-    print(f"  Pearson r (C_grad     vs damage) : {r_c_grad:.4f}")
-    print(f"  Pearson r (C_eff_grad vs damage) : {r_c_eff_grad:.4f}")
-    print("=" * 80 + "\n")
+    print(f"\nCorrelation analysis:")
+    print(f"  r(C_grad,     e_collision) : {r_collision_cgrad:.4f}  ← does conflict predict damage?")
+    print(f"  r(C_eff_grad, e_collision) : {r_collision_ceffgrad:.4f}")
+    print(f"  r(C_grad,     e_model)     : {r_model_cgrad:.4f}  ← does conflict predict irreducible error?")
 
-    # 6. Plot
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    titles   = ["$C_{grad}$ vs Collision Damage", "$C_{eff-grad}$ vs Collision Damage"]
-    datasets = [c_grad_np[damage_mask], c_eff_grad_np[damage_mask]]
-    damage_f = collision_damage[damage_mask]
+    # 6. Binned variance analysis — key test for decoder disambiguation
+    # If decoder succeeds: damage variance should be FLAT across conflict bins
+    # If decoder fails:    damage variance should RISE with conflict
+    _plot_binned_variance(
+        c_grad_np[quality_mask], e_collision[quality_mask],
+        xlabel="$C_{grad}$",
+        title="Binned Damage Mean & Variance vs. Conflict\n(flat variance = decoder disambiguates successfully)",
+        save_path="./damage_variance_analysis.png",
+    )
 
-    for ax, scores, title, r in zip(axes, datasets, titles, [r_c_grad, r_c_eff_grad]):
-        hb = ax.hexbin(scores, damage_f, gridsize=50, cmap='YlOrRd', mincnt=1)
+    # 7. Main damage scatter plots
+    fig, axes = plt.subplots(1, 3, figsize=(22, 6))
+
+    plot_specs = [
+        (c_grad_np,     e_collision, "$C_{grad}$ vs $e_{collision}$",     r_collision_cgrad),
+        (c_eff_grad_np, e_collision, "$C_{eff-grad}$ vs $e_{collision}$", r_collision_ceffgrad),
+        (c_grad_np,     e_model,     "$C_{grad}$ vs $e_{model}$",         r_model_cgrad),
+    ]
+
+    for ax, (scores, target, title, r) in zip(axes, plot_specs):
+        m = quality_mask
+        hb = ax.hexbin(scores[m], target[m], gridsize=50, cmap='YlOrRd', mincnt=1)
         fig.colorbar(hb, ax=ax, label='Point Density')
 
-        _, _, bin_centers, bin_means = _compute_trendline(scores, damage_f)
+        _, _, bin_centers, bin_means = _compute_trendline(scores[m], target[m])
         valid = ~np.isnan(bin_means)
         ax.plot(bin_centers[valid], bin_means[valid], color='blue', lw=2, label=f'r={r:.3f}')
+        ax.axhline(0, color='gray', lw=0.8, linestyle='--')
 
         ax.set_xlabel("Conflict Score")
-        ax.set_ylabel("Collision Damage (m)")
+        ax.set_ylabel("Error (m)")
         ax.set_title(title)
         ax.legend()
         ax.grid(True, alpha=0.3)
 
-    plt.suptitle("Conflict Metrics vs. Collision Damage  (low-T − high-T error)", fontsize=13)
+    plt.suptitle("Conflict vs. Error Decomposition  (low_T - high_T)", fontsize=13)
     plt.tight_layout()
     plt.savefig("./collision_damage_analysis.png", dpi=300, bbox_inches='tight')
     plt.close()
     print("Saved → ./collision_damage_analysis.png")
+
+
+def _plot_binned_variance(
+    conflict: np.ndarray,
+    damage: np.ndarray,
+    xlabel: str,
+    title: str,
+    save_path: str,
+    n_bins: int = 30,
+):
+    bins        = np.linspace(conflict.min(), conflict.max(), n_bins + 1)
+    bin_centers = (bins[:-1] + bins[1:]) / 2
+    digitized   = np.digitize(conflict, bins)
+
+    bin_means = []
+    bin_stds  = []
+    valid_centers = []
+
+    for i in range(1, len(bins)):
+        vals = damage[digitized == i]
+        if len(vals) < 10:
+            continue
+        bin_means.append(vals.mean())
+        bin_stds.append(vals.std())
+        valid_centers.append(bin_centers[i - 1])
+
+    valid_centers = np.array(valid_centers)
+    bin_means     = np.array(bin_means)
+    bin_stds      = np.array(bin_stds)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(valid_centers, bin_means, color='blue', lw=2, label='Binned Mean')
+    ax.fill_between(
+        valid_centers,
+        bin_means - bin_stds,
+        bin_means + bin_stds,
+        alpha=0.25, color='blue', label='±1 std'
+    )
+    ax.axhline(0, color='gray', lw=0.8, linestyle='--')
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Collision Damage (m)")
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved → {save_path}")
 
 
 ###############################################################
