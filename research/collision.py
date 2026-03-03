@@ -546,15 +546,12 @@ def analyze_collision_damage(
 
     # For each low-T vertex, find the nearest high-T vertex and use its error
     # as the collision-free baseline at that location
-    from torch.nn.functional import normalize
-    CHUNK = 50_000
-    nearest_high_error = np.zeros(len(verts_pred_low))
-
-    for i in range(0, len(verts_low_t), CHUNK):
-        batch    = verts_low_t[i : i + CHUNK]                          # (B, 3)
-        dists_sq = torch.cdist(batch, verts_high_t)                    # (B, N_high)
-        nn_idx   = dists_sq.argmin(dim=1).cpu().numpy()                # (B,)
-        nearest_high_error[i : i + CHUNK] = dist_high[nn_idx]
+    print("Aligning error fields...")
+    from scipy.spatial import cKDTree
+    
+    tree = cKDTree(verts_pred_high)
+    _, nn_idx = tree.query(verts_pred_low, k=1, workers=-1)
+    nearest_high_error = dist_high[nn_idx]
 
     # Collision damage: how much worse is the low-T model at each point?
     collision_damage = dist_low - nearest_high_error                   # can be negative
