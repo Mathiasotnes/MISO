@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import matplotlib
+import json
 from os.path import join
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -268,16 +269,13 @@ def analyze_conflict_vs_T(
     gt_mesh_path: str,
     device: str = "cuda",
 ):
-    """
-    Loads trackers and meshes for each T value and prints a summary table
-    of C_grad statistics across all T values.
-    """
     rows = []
 
     for T in T_values:
-        model_path = join(results_dir, f'hash_grid_T{T}.pth')
-        stats_path = join(results_dir, f'tracker_T{T}.pt')
-        mesh_path  = join(results_dir, f'hash_pred_mesh_T{T}.ply')
+        model_path   = join(results_dir, f'hash_grid_T{T}.pth')
+        stats_path   = join(results_dir, f'collision_stats_T{T}.pt')
+        mesh_path    = join(results_dir, f'hash_pred_mesh_T{T}.ply')
+        metrics_path = join(results_dir, f'metrics_T{T}.json')
 
         print(f"Loading T={T}...")
         hash_grid = torch.load(model_path, map_location=device)
@@ -300,26 +298,38 @@ def analyze_conflict_vs_T(
                 c_grad_t[i : i + BATCH] = tracker.get_C_grad(verts_t[i : i + BATCH])
 
         c = c_grad_t.cpu().numpy()
+
+        with open(metrics_path, 'r') as f:
+            metrics = json.load(f)
+
         rows.append({
-            'T'   : T,
-            'min' : c.min(),
-            'max' : c.max(),
-            'mean': c.mean(),
-            'std' : c.std(),
-            'n'   : n,
+            'T'             : T,
+            'C_grad min'    : c.min(),
+            'C_grad max'    : c.max(),
+            'C_grad mean'   : c.mean(),
+            'std'           : c.std(),
+            'Chamfer-L2'    : metrics.get('chamfer_l2', float('nan')),
+            'F-score'       : metrics.get('f_score',    float('nan')),
+            'n'             : n,
         })
 
-        # Free GPU memory before next iteration
         del hash_grid, tracker, verts_t, c_grad_t
         torch.cuda.empty_cache()
 
     # Print table
-    print("\n" + "=" * 65)
-    print(f"{'T':>4} | {'2^T':>8} | {'min':>8} | {'max':>8} | {'mean':>8} | {'std':>8}")
-    print("-" * 65)
+    w = 91
+    print("\n" + "=" * w)
+    print(
+        f"{'T':>4} | {'2^T':>12} | {'min':>6} | {'max':>6} | {'mean':>6} | "
+        f"{'std':>8} | {'Chamfer-L2':>10} | {'F-Score':>8}"
+    )
+    print("-" * w)
     for r in rows:
-        print(f"{r['T']:>4} | {2**r['T']:>8,} | {r['min']:>8.4f} | {r['max']:>8.4f} | {r['mean']:>8.4f} | {r['std']:>8.4f}")
-    print("=" * 65 + "\n")
+        print(
+            f"{r['T']:>4} | {2**r['T']:>12,} | {r['min']:>12.2f} | {r['max']:>12.2f} | "
+            f"{r['mean']:>12.2f} | {r['std']:>8.4f} | {r['chamfer_l2']:>10.2f} | {r['f_score']:>8.2f}"
+        )
+    print("=" * w + "\n")
 
     return rows
 
