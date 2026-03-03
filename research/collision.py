@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import matplotlib
+from os.path import join
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
@@ -261,7 +262,66 @@ def analyze_disambiguation(model_path, stats_path, mesh_path, gt_mesh_path, devi
 
     print_C_grad_stats(tracker, verts_pred, device=device)
 
-    
+def analyze_conflict_vs_T(
+    T_values: list,
+    results_dir: str,
+    gt_mesh_path: str,
+    device: str = "cuda",
+):
+    """
+    Loads trackers and meshes for each T value and prints a summary table
+    of C_grad statistics across all T values.
+    """
+    rows = []
+
+    for T in T_values:
+        model_path = join(results_dir, f'hash_grid_T{T}.pth')
+        stats_path = join(results_dir, f'tracker_T{T}.pt')
+        mesh_path  = join(results_dir, f'hash_pred_mesh_T{T}.ply')
+
+        print(f"Loading T={T}...")
+        hash_grid = torch.load(model_path, map_location=device)
+        tracker   = CollisionTracker.load(
+            path=stats_path,
+            encoding=hash_grid.encoding,
+            scene_bound=hash_grid.bound,
+            device=device,
+        )
+
+        verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1_000_000)
+        verts_t    = torch.from_numpy(verts_pred).float().to(device)
+
+        BATCH    = 100_000
+        n        = len(verts_t)
+        c_grad_t = torch.zeros(n, device=device)
+
+        with torch.no_grad():
+            for i in range(0, n, BATCH):
+                c_grad_t[i : i + BATCH] = tracker.get_C_grad(verts_t[i : i + BATCH])
+
+        c = c_grad_t.cpu().numpy()
+        rows.append({
+            'T'   : T,
+            'min' : c.min(),
+            'max' : c.max(),
+            'mean': c.mean(),
+            'std' : c.std(),
+            'n'   : n,
+        })
+
+        # Free GPU memory before next iteration
+        del hash_grid, tracker, verts_t, c_grad_t
+        torch.cuda.empty_cache()
+
+    # Print table
+    print("\n" + "=" * 65)
+    print(f"{'T':>4} | {'2^T':>8} | {'min':>8} | {'max':>8} | {'mean':>8} | {'std':>8}")
+    print("-" * 65)
+    for r in rows:
+        print(f"{r['T']:>4} | {2**r['T']:>8,} | {r['min']:>8.4f} | {r['max']:>8.4f} | {r['mean']:>8.4f} | {r['std']:>8.4f}")
+    print("=" * 65 + "\n")
+
+    return rows
 
 def analyze_collision_damage(
     model_path_high_T: str,
@@ -460,10 +520,19 @@ if __name__ == "__main__":
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    analyze_disambiguation(
-        model_path=MODEL_PATH_HIGH_T,
-        stats_path=STATS_PATH_HIGH_T,
-        mesh_path=MESH_PATH_HIGH_T,
+    # analyze_disambiguation(
+    #     model_path=MODEL_PATH_HIGH_T,
+    #     stats_path=STATS_PATH_HIGH_T,
+    #     mesh_path=MESH_PATH_HIGH_T,
+    #     gt_mesh_path=GT_MESH_PATH,
+    #     device=device,
+    # )
+    
+    T_values = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24]
+
+    analyze_conflict_vs_T(
+        T_values=T_values,
+        results_dir="./results/mapping",
         gt_mesh_path=GT_MESH_PATH,
         device=device,
     )
