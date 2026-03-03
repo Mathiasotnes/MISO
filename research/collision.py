@@ -18,7 +18,7 @@ GT_MESH_PATH        = "../../data/ScanNet/scans/scene0000_00/scene0000_00_vh_cle
 MODEL_PATH          = "./results/mapping/hash_grid.pth"
 
 MODEL_PATH_HIGH_T   = "./results/mapping/hash_grid_high_T.pth"
-STATS_PATH_HIGH_T   = "./results/mapping/collision_stats_high_T.pt"
+STATS_PATH_HIGH_T   = "./collision_stats_high_T.pt"
 MESH_PATH_HIGH_T    = "./results/mapping/hash_pred_mesh_high_T.ply"
 
 
