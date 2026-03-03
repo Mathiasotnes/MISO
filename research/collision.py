@@ -265,6 +265,126 @@ def plot_per_level_correlation(
 
     return correlations
 
+@torch.no_grad()
+def analyze_bin_level_correlation(
+    tracker: CollisionTracker,
+    verts_pred: np.ndarray,
+    errors: np.ndarray,
+    save_path: str,
+    error_threshold: float = 0.10,
+    device: str = "cuda",
+):
+    """
+    Aggregates mesh vertices into hash bins and correlates bin-level
+    mean conflict with bin-level mean error.
+    """
+    mask       = errors < error_threshold
+    verts_filt = verts_pred[mask]
+    errors_filt = errors[mask]
+
+    lo = tracker.scene_bound[:, 0].cpu().numpy()
+    hi = tracker.scene_bound[:, 1].cpu().numpy()
+    x_norm = np.clip((verts_filt - lo) / (hi - lo), 0.0, 1.0)
+    x_norm_t = torch.from_numpy(x_norm).float().to(device)
+
+    R_dom = tracker.get_R_dom()  # (L, T)
+
+    n_levels = tracker.n_levels
+    all_r       = []
+    all_res     = []
+    all_n_bins  = []
+
+    fig, axes = plt.subplots(2, n_levels // 2 + n_levels % 2, figsize=(24, 10))
+    axes_flat = axes.flatten()
+
+    for level_idx in range(n_levels):
+        N_l = tracker.resolutions[level_idx].item()
+
+        # Map each vertex to its nearest floor corner (single representative corner)
+        x_scaled = x_norm_t * N_l
+        x_floor  = torch.floor(x_scaled).long()  # (N, 3)
+
+        # Hash the floor corner to get the bin each vertex "belongs to"
+        from grid_opt.models.collision_tracker import spatial_hash
+        bins = spatial_hash(x_floor, tracker.T).cpu().numpy()  # (N,)
+
+        c_eff_bins  = tracker.C_eff[level_idx].cpu().numpy()   # (T,)
+        r_dom_bins  = R_dom[level_idx].cpu().numpy()            # (T,)
+        conflict_bins = 1.0 - r_dom_bins                        # (T,)
+
+        # Aggregate: mean error per bin
+        unique_bins = np.unique(bins)
+        bin_mean_error    = []
+        bin_mean_conflict = []
+        bin_c_eff         = []
+        bin_counts        = []
+
+        for b in unique_bins:
+            pts_in_bin = bins == b
+            n_pts = pts_in_bin.sum()
+            if n_pts < 5:  # skip bins with too few points for stable mean
+                continue
+            bin_mean_error.append(errors_filt[pts_in_bin].mean())
+            bin_mean_conflict.append(conflict_bins[b])
+            bin_c_eff.append(c_eff_bins[b])
+            bin_counts.append(n_pts)
+
+        if len(bin_mean_error) < 10:
+            all_r.append(np.nan)
+            all_res.append(N_l)
+            all_n_bins.append(0)
+            continue
+
+        bin_mean_error    = np.array(bin_mean_error)
+        bin_mean_conflict = np.array(bin_mean_conflict)
+        bin_c_eff         = np.array(bin_c_eff)
+        bin_counts        = np.array(bin_counts)
+
+        r = np.corrcoef(bin_mean_conflict, bin_mean_error)[0, 1]
+        all_r.append(r)
+        all_res.append(N_l)
+        all_n_bins.append(len(bin_mean_error))
+
+        # Plot this level
+        ax = axes_flat[level_idx]
+        sc = ax.scatter(
+            bin_mean_conflict, bin_mean_error,
+            c=np.log1p(bin_c_eff), cmap='YlOrRd',
+            s=np.sqrt(bin_counts) * 2, alpha=0.6, edgecolors='none'
+        )
+        fig.colorbar(sc, ax=ax, label='log(1 + C_eff)')
+
+        # Trendline
+        if len(bin_mean_conflict) > 2:
+            z = np.polyfit(bin_mean_conflict, bin_mean_error, 1)
+            xline = np.linspace(bin_mean_conflict.min(), bin_mean_conflict.max(), 100)
+            ax.plot(xline, np.polyval(z, xline), color='blue', lw=2)
+
+        ax.set_title(f"Level {level_idx+1}  (res={int(N_l)}, r={r:.3f}, bins={len(bin_mean_error)})")
+        ax.set_xlabel("Bin Mean Conflict  (1 − R_dom)")
+        ax.set_ylabel("Bin Mean Error (m)")
+        ax.grid(True, alpha=0.3)
+
+    # Hide unused subplots
+    for i in range(n_levels, len(axes_flat)):
+        axes_flat[i].set_visible(False)
+
+    plt.suptitle("Bin-Level Conflict vs. Mean Geometric Error", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved bin-level correlation plot → {save_path}")
+
+    # Summary table
+    print("\n" + "=" * 55)
+    print(f"{'Lvl':>4} | {'Res':>6} | {'Pearson r':>10} | {'N bins':>8}")
+    print("-" * 55)
+    for l, (r, res, nb) in enumerate(zip(all_r, all_res, all_n_bins)):
+        r_str = f"{r:>10.4f}" if not np.isnan(r) else f"{'N/A':>10}"
+        print(f"{l+1:>4} | {int(res):>6} | {r_str} | {nb:>8}")
+    print("=" * 55 + "\n")
+
+    return np.array(all_r), np.array(all_res)
 
 ###############################################################
 # Main Analysis
@@ -324,6 +444,14 @@ def analyze_disambiguation(model_path, stats_path, mesh_path, gt_mesh_path, devi
     plot_conflict_comparison(
         c_grad_np, c_eff_grad_np, dist_p,
         save_path="./disambiguation_comparison.png",
+    )
+    
+    bin_r, bin_res = analyze_bin_level_correlation(
+        tracker       = tracker,
+        verts_pred    = verts_pred,
+        errors        = dist_p,
+        save_path     = "./bin_level_correlation.png",
+        device        = device,
     )
     
     # Compute per-level conflict: (N, L)
