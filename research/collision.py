@@ -309,7 +309,7 @@ def analyze_conflict_vs_T(
             'mean'          : c.mean(),
             'std'           : c.std(),
             'chamfer_l2'    : metrics.get('Chamfer_L2 (cm)', float('nan')),
-            'f_score'       : metrics.get('F-Score (%)',    float('nan')),
+            'f_score'       : metrics.get('F-score (%)',    float('nan')),
             'n'             : n,
         })
 
@@ -317,17 +317,17 @@ def analyze_conflict_vs_T(
         torch.cuda.empty_cache()
 
     # Print table
-    w = 106
+    w = 110
     print("\n" + "=" * w)
     print(
         f"{'T':>4} | {'2^T':>12} | {'C_grad min':>12} | {'C_grad max':>12} | {'C_grad mean':>12} | "
-        f"{'std':>10} | {'Chamfer-L2':>10} | {'F-Score':>10}"
+        f"{'std':>10} | {'Chamfer-L2':>12} | {'F-Score':>12}"
     )
     print("-" * w)
     for r in rows:
         print(
             f"{r['T']:>4} | {2**r['T']:>12,} | {r['min']:>12.2f} | {r['max']:>12.2f} | "
-            f"{r['mean']:>12.2f} | {r['std']:>10.4f} | {r['chamfer_l2']:>10.2f} | {r['f_score']:>10.2f}"
+            f"{r['mean']:>12.2f} | {r['std']:>10.4f} | {r['chamfer_l2']:>12.2f} | {r['f_score']:>12.2f}"
         )
     print("=" * w + "\n")
 
