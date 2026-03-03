@@ -21,6 +21,7 @@ parser.add_argument('--save_dir', type=str, default='./results/mapping')
 parser.add_argument('--pose_init', type=str, default='gt')  # reg_icp OR kiss_icp OR gt
 parser.add_argument('--scannet_root', type=str, default='../../data/ScanNet/scans')
 parser.add_argument('--scene', type=str, default='0000_00')
+parser.add_argument('--log2_hashmap_size', type=int, default=15, help='Log2 of hash table size T (e.g. 10 for T=2^10)')
 
 
 ##############################################
@@ -59,7 +60,20 @@ def initialize_scannet(args):
     dataset = utils_scannet.create_scannet_dataset(args.scannet_root, args.scene, n_rays=cfg['sample']['n_rays'], frame_downsample=1)
     cfg = create_configs_scannet(args, dataset)
 
-    hash_grid = GridNGPOurs(cfg['model'], device=cfg['device'], dtype=torch.float32, track_collisions=True)
+    hash_grid = GridNGPOurs(
+        cfg['model'], 
+        device=cfg['device'], 
+        dtype=torch.float32, 
+        track_collisions=True,
+        n_levels = 16,
+        n_features_per_level = 2,
+        log2_hashmap_size = args.log2_hashmap_size,
+        base_resolution = 16,
+        per_level_scale = 1.26,
+        n_hidden_layers = 2,
+        n_neurons = 64,
+        n_output_dims = 1
+    )
     hash_grid.to(cfg['device'])
     
     return cfg, hash_grid, dataset
@@ -166,8 +180,13 @@ def main_scannet():
     np.random.seed(55)
     torch.manual_seed(55)
     args = parser.parse_args()
-    model_path = join(args.save_dir, 'hash_grid.pth')
-    mesh_path = join(args.save_dir, 'hash_pred_mesh.ply')
+    
+    T               = args.log2_hashmap_size
+    model_path      = join(args.save_dir, f'hash_grid_T{T}.pth')
+    mesh_path       = join(args.save_dir, f'hash_pred_mesh_T{T}.ply')
+    tracker_path    = join(args.save_dir, f'tracker_T{T}.pt')
+    metrics_path    = join(args.save_dir, f'metrics_T{T}.json')
+    
     cfg, hash_grid, dataset = initialize_scannet(args)
     
     mapping(cfg, hash_grid, dataset)
@@ -175,12 +194,8 @@ def main_scannet():
     # Save collision statistics
     if hash_grid.track_collisions:
         hash_grid.tracker.print_summary()
-        hash_grid.tracker.save("collision_stats.pt")
+        hash_grid.tracker.save(tracker_path)
         hash_grid.tracker.remove_hooks()
-    
-    # Check Sparsity
-    sparsity = calculate_model_sparsity(hash_grid)
-    print(f"Overall Model Sparsity: {sparsity:.2f}%")
     
     # Evaluate
     torch.save(hash_grid, model_path)
@@ -191,15 +206,19 @@ def main_scannet():
     verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
     
     # Disambiguation Analysis
-    analyze_disambiguation(
-        model_path=model_path,
-        stats_path="./collision_stats.pt",
-        mesh_path=mesh_path,
-        gt_mesh_path=gt_mesh_path
-    )
+    # analyze_disambiguation(
+    #     model_path=model_path,
+    #     stats_path="./collision_stats.pt",
+    #     mesh_path=mesh_path,
+    #     gt_mesh_path=gt_mesh_path
+    # )
     
     metrics_results = compute_chamfer_metrics(verts_pred, verts_trgt, threshold=0.05)
     print(json.dumps(metrics_results, indent=4))
+    
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics_results, f, indent=4)
+    print(f"Saved metrics → {metrics_path}")
 
 if __name__ == "__main__":
     main_scannet()

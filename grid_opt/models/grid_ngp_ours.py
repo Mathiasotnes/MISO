@@ -237,56 +237,59 @@ class GridNGPOurs(BaseNet):
         cfg: dict, 
         device = 'cuda:0',
         dtype = torch.float32,
-        track_collisions = False
+        track_collisions = False,
+        n_levels = 16,
+        n_features_per_level = 2,
+        log2_hashmap_size = 15,
+        base_resolution = 16,
+        per_level_scale = 1.26,
+        n_hidden_layers = 2,
+        n_neurons = 64,
+        n_output_dims = 1
     ):
         super(GridNGPOurs, self).__init__(cfg, device, dtype)    
         self.device = device
         self.dtype = dtype
         self.track_collisions = track_collisions
+        self.n_levels = n_levels
+        self.n_features_per_level = n_features_per_level
+        self.log2_hashmap_size = log2_hashmap_size
+        self.base_resolution = base_resolution
+        self.per_level_scale = per_level_scale
+        self.n_hidden_layers = n_hidden_layers
+        self.n_neurons = n_neurons
+        n_output_dims = n_output_dims
         self.init_ngp(cfg)
         self.init_occupancy_grid(cfg)
         self.init_poses(cfg)
+        self.num_levels = 1 # Hack to make it compatible with trainer.py. I think we can make a much simpler trainer unless we still want
+                            # to support coarse-to-fine curriculum learning (coordinate option).
         
     def init_ngp(self, cfg):
         
-        self.num_levels = 1 # Hack to make it compatible with trainer.py. I think we can make a much simpler trainer unless we still want
-                            # to support coarse-to-fine curriculum learning (coordinate option).
-                            
-        # Multiresolution Hash-Encoding (MHE) Configuration (equivalent to tiny-cuda-nn)
-        n_levels = 16
-        n_features_per_level = 2
-        log2_hashmap_size = 15
-        base_resolution = 16
-        per_level_scale = 1.26
-
         self.encoding = MultiResHashEncoding(
-            n_levels             = n_levels,
-            n_features_per_level = n_features_per_level,
-            log2_hashmap_size    = log2_hashmap_size,
-            base_resolution      = base_resolution,
-            per_level_scale      = per_level_scale,
+            n_levels             = self.n_levels,
+            n_features_per_level = self.n_features_per_level,
+            log2_hashmap_size    = self.log2_hashmap_size,
+            base_resolution      = self.base_resolution,
+            per_level_scale      = self.per_level_scale,
         ).to(self.device)
         
         ########################################
         # Decoder network (MLP)
         ########################################
         
-        # Config
-        n_hidden_layers = 2
-        n_neurons = 64
-        n_output_dims = 1
-        
         decoder = []
         input_dim = self.encoding.n_output_dims
 
-        for i in range(n_hidden_layers):
-            layer = nn.Linear(input_dim if i == 0 else n_neurons, n_neurons)
+        for i in range(self.n_hidden_layers):
+            layer = nn.Linear(input_dim if i == 0 else self.n_neurons, self.n_neurons)
             nn.init.xavier_uniform_(layer.weight) # InstantNGP paper uses Glorot (Xavier) initialization
             decoder.append(layer)
             decoder.append(nn.ReLU())
 
         # Final output layer (Linear) 
-        final_layer = nn.Linear(n_neurons, n_output_dims)
+        final_layer = nn.Linear(self.n_neurons, self.n_output_dims)
         nn.init.xavier_uniform_(final_layer.weight)
         decoder.append(final_layer)
 
