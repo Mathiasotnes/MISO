@@ -208,187 +208,31 @@ def get_per_level_conflict(tracker: CollisionTracker, x_world: torch.Tensor) -> 
 
     return per_level  # (M, L)
 
-
-def plot_per_level_correlation(
-    per_level_conflict: np.ndarray,   # (N, L)
-    errors: np.ndarray,               # (N,)
-    resolutions: list,
-    save_path: str,
-    error_threshold: float = 0.10,
-):
-    mask  = errors < error_threshold
-    conf  = per_level_conflict[mask]   # (N', L)
-    err   = errors[mask]
-    L     = conf.shape[1]
-
-    correlations = np.array([
-        np.corrcoef(conf[:, l], err)[0, 1] for l in range(L)
-    ])
-
-    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
-
-    # ── Left: bar chart of per-level Pearson r ────────────────────────────────
-    ax = axes[0]
-    colors = ['tomato' if r > 0 else 'steelblue' for r in correlations]
-    ax.bar(range(1, L + 1), correlations, color=colors)
-    ax.axhline(0, color='black', lw=0.8)
-    ax.set_xlabel("Hash Level")
-    ax.set_ylabel("Pearson r  (conflict vs. error)")
-    ax.set_title("Per-Level Conflict–Error Correlation")
-    ax.set_xticks(range(1, L + 1))
-    ax.grid(True, alpha=0.3, axis='y')
-
-    # Annotate resolution on each bar
-    for l, (r, res) in enumerate(zip(correlations, resolutions)):
-        ax.text(l + 1, r + 0.005 * np.sign(r), f"N={int(res)}", ha='center',
-                va='bottom' if r >= 0 else 'top', fontsize=7, rotation=45)
-
-    # ── Right: scatter of |r| vs log(resolution) ─────────────────────────────
-    ax = axes[1]
-    log_res = np.log2(resolutions)
-    ax.scatter(log_res, np.abs(correlations), c=correlations, cmap='RdBu_r',
-               vmin=-max(abs(correlations)), vmax=max(abs(correlations)), s=60, zorder=3)
-    ax.set_xlabel("log₂(Resolution)")
-    ax.set_ylabel("|Pearson r|")
-    ax.set_title("|Correlation| vs. Level Resolution")
-    ax.grid(True, alpha=0.3)
-
-    plt.suptitle("Per-Level Hash Conflict vs. Geometric Error", fontsize=13)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"Saved per-level correlation plot → {save_path}")
-
-    # Print table
-    print("\n" + "=" * 55)
-    print(f"{'Lvl':>4} | {'Res':>6} | {'Pearson r':>10} | {'|r|':>8}")
-    print("-" * 55)
-    for l, (r, res) in enumerate(zip(correlations, resolutions)):
-        print(f"{l+1:>4} | {int(res):>6} | {r:>10.4f} | {abs(r):>8.4f}")
-    print("=" * 55 + "\n")
-
-    return correlations
-
-@torch.no_grad()
-def analyze_bin_level_correlation(
+def print_C_grad_stats(
     tracker: CollisionTracker,
-    verts_pred: np.ndarray,
-    errors: np.ndarray,
-    save_path: str,
-    error_threshold: float = 0.10,
+    verts: np.ndarray,
     device: str = "cuda",
+    label: str = "C_grad",
 ):
-    """
-    Aggregates mesh vertices into hash bins and correlates bin-level
-    mean conflict with bin-level mean error.
-    """
-    mask       = errors < error_threshold
-    verts_filt = verts_pred[mask]
-    errors_filt = errors[mask]
+    verts_t  = torch.from_numpy(verts).float().to(device)
+    BATCH    = 100_000
+    n        = len(verts_t)
+    c_grad_t = torch.zeros(n, device=device)
 
-    lo = tracker.scene_bound[:, 0].cpu().numpy()
-    hi = tracker.scene_bound[:, 1].cpu().numpy()
-    x_norm = np.clip((verts_filt - lo) / (hi - lo), 0.0, 1.0)
-    x_norm_t = torch.from_numpy(x_norm).float().to(device)
+    with torch.no_grad():
+        for i in range(0, n, BATCH):
+            c_grad_t[i : i + BATCH] = tracker.get_C_grad(verts_t[i : i + BATCH])
 
-    R_dom = tracker.get_R_dom()  # (L, T)
-
-    n_levels = tracker.n_levels
-    all_r       = []
-    all_res     = []
-    all_n_bins  = []
-
-    fig, axes = plt.subplots(2, n_levels // 2 + n_levels % 2, figsize=(24, 10))
-    axes_flat = axes.flatten()
-
-    for level_idx in range(n_levels):
-        N_l = tracker.resolutions[level_idx].item()
-
-        # Map each vertex to its nearest floor corner (single representative corner)
-        x_scaled = x_norm_t * N_l
-        x_floor  = torch.floor(x_scaled).long()  # (N, 3)
-
-        # Hash the floor corner to get the bin each vertex "belongs to"
-        from grid_opt.models.collision_tracker import spatial_hash
-        bins = spatial_hash(x_floor, tracker.T).cpu().numpy()  # (N,)
-
-        c_eff_bins  = tracker.C_eff[level_idx].cpu().numpy()   # (T,)
-        r_dom_bins  = R_dom[level_idx].cpu().numpy()            # (T,)
-        conflict_bins = 1.0 - r_dom_bins                        # (T,)
-
-        # Aggregate: mean error per bin
-        unique_bins = np.unique(bins)
-        bin_mean_error    = []
-        bin_mean_conflict = []
-        bin_c_eff         = []
-        bin_counts        = []
-
-        for b in unique_bins:
-            pts_in_bin = bins == b
-            n_pts = pts_in_bin.sum()
-            if n_pts < 5:  # skip bins with too few points for stable mean
-                continue
-            bin_mean_error.append(errors_filt[pts_in_bin].mean())
-            bin_mean_conflict.append(conflict_bins[b])
-            bin_c_eff.append(c_eff_bins[b])
-            bin_counts.append(n_pts)
-
-        if len(bin_mean_error) < 10:
-            all_r.append(np.nan)
-            all_res.append(N_l)
-            all_n_bins.append(0)
-            continue
-
-        bin_mean_error    = np.array(bin_mean_error)
-        bin_mean_conflict = np.array(bin_mean_conflict)
-        bin_c_eff         = np.array(bin_c_eff)
-        bin_counts        = np.array(bin_counts)
-
-        r = np.corrcoef(bin_mean_conflict, bin_mean_error)[0, 1]
-        all_r.append(r)
-        all_res.append(N_l)
-        all_n_bins.append(len(bin_mean_error))
-
-        # Plot this level
-        ax = axes_flat[level_idx]
-        sc = ax.scatter(
-            bin_mean_conflict, bin_mean_error,
-            c=np.log1p(bin_c_eff), cmap='YlOrRd',
-            s=np.sqrt(bin_counts) * 2, alpha=0.6, edgecolors='none'
-        )
-        fig.colorbar(sc, ax=ax, label='log(1 + C_eff)')
-
-        # Trendline
-        if len(bin_mean_conflict) > 2:
-            z = np.polyfit(bin_mean_conflict, bin_mean_error, 1)
-            xline = np.linspace(bin_mean_conflict.min(), bin_mean_conflict.max(), 100)
-            ax.plot(xline, np.polyval(z, xline), color='blue', lw=2)
-
-        ax.set_title(f"Level {level_idx+1}  (res={int(N_l)}, r={r:.3f}, bins={len(bin_mean_error)})")
-        ax.set_xlabel("Bin Mean Conflict  (1 − R_dom)")
-        ax.set_ylabel("Bin Mean Error (m)")
-        ax.grid(True, alpha=0.3)
-
-    # Hide unused subplots
-    for i in range(n_levels, len(axes_flat)):
-        axes_flat[i].set_visible(False)
-
-    plt.suptitle("Bin-Level Conflict vs. Mean Geometric Error", fontsize=14)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"Saved bin-level correlation plot → {save_path}")
-
-    # Summary table
-    print("\n" + "=" * 55)
-    print(f"{'Lvl':>4} | {'Res':>6} | {'Pearson r':>10} | {'N bins':>8}")
-    print("-" * 55)
-    for l, (r, res, nb) in enumerate(zip(all_r, all_res, all_n_bins)):
-        r_str = f"{r:>10.4f}" if not np.isnan(r) else f"{'N/A':>10}"
-        print(f"{l+1:>4} | {int(res):>6} | {r_str} | {nb:>8}")
-    print("=" * 55 + "\n")
-
-    return np.array(all_r), np.array(all_res)
+    c = c_grad_t.cpu().numpy()
+    print(f"\n{label} stats over {n:,} surface points:")
+    print(f"  min  : {c.min():.4f}")
+    print(f"  max  : {c.max():.4f}")
+    print(f"  mean : {c.mean():.4f}")
+    print(f"  std  : {c.std():.4f}")
+    print(f"  p25  : {np.percentile(c, 25):.4f}")
+    print(f"  p50  : {np.percentile(c, 50):.4f}")
+    print(f"  p75  : {np.percentile(c, 75):.4f}")
+    print(f"  p95  : {np.percentile(c, 95):.4f}")
 
 ###############################################################
 # Main Analysis
@@ -410,82 +254,14 @@ def analyze_disambiguation(model_path, stats_path, mesh_path, gt_mesh_path, devi
     print("Sampling points from meshes...")
     verts_pred = sample_points_from_mesh(mesh_path,    mesh_sample_point=1_000_000)
     verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1_000_000)
-
+    
     print("Calculating nearest-neighbour correspondences...")
     _, dist_p = nn_correspondance(verts_pred, verts_trgt, 0.50, False)
     dist_p = np.array(dist_p).flatten()
 
-    # 3. Compute both conflict metrics in batches
-    print("Computing conflict scores...")
-    verts_torch  = torch.from_numpy(verts_pred).float().to(device)
-    BATCH        = 100_000
-    n            = len(verts_torch)
-    c_grad_t     = torch.zeros(n, device=device)
-    c_eff_grad_t = torch.zeros(n, device=device)
+    print_C_grad_stats(tracker, verts_pred, device=device)
 
-    with torch.no_grad():
-        for i in range(0, n, BATCH):
-            batch = verts_torch[i : i + BATCH]
-            c_grad_t    [i : i + BATCH] = tracker.get_C_grad(batch)
-            c_eff_grad_t[i : i + BATCH] = get_C_eff_grad(tracker, batch)
-
-    c_grad_np     = c_grad_t.cpu().numpy()
-    c_eff_grad_np = c_eff_grad_t.cpu().numpy()
-
-    # 4. Individual plots
-    slope_c_grad = plot_conflict_vs_error(
-        c_grad_np, dist_p,
-        label="$C_{grad}$",
-        save_path="./disambiguation_c_grad.png",
-    )
-    slope_c_eff_grad = plot_conflict_vs_error(
-        c_eff_grad_np, dist_p,
-        label="$C_{eff-grad}$",
-        save_path="./disambiguation_c_eff_grad.png",
-    )
-
-    # 5. Side-by-side comparison
-    plot_conflict_comparison(
-        c_grad_np, c_eff_grad_np, dist_p,
-        save_path="./disambiguation_comparison.png",
-    )
     
-    bin_r, bin_res = analyze_bin_level_correlation(
-        tracker       = tracker,
-        verts_pred    = verts_pred,
-        errors        = dist_p,
-        save_path     = "./bin_level_correlation.png",
-        device        = device,
-    )
-    
-    # Compute per-level conflict: (N, L)
-    per_level_t = torch.zeros(n, tracker.n_levels, device=device)
-    with torch.no_grad():
-        for i in range(0, n, BATCH):
-            batch = verts_torch[i : i + BATCH]
-            per_level_t[i : i + BATCH] = get_per_level_conflict(tracker, batch)
-
-    per_level_np  = per_level_t.cpu().numpy()
-    resolutions   = [tracker.resolutions[l].item() for l in range(tracker.n_levels)]
-
-    correlations = plot_per_level_correlation(
-        per_level_np, dist_p, resolutions,
-        save_path="./per_level_correlation.png",
-    )
-
-    # 6. Summary
-    print("\n" + "=" * 80)
-    print("METRIC COMPARISON SUMMARY")
-    print(f"  C_grad     slope: {slope_c_grad:.8f}")
-    print(f"  C_eff_grad slope: {slope_c_eff_grad:.8f}")
-    if abs(slope_c_grad) > abs(slope_c_eff_grad):
-        print("  → C_grad correlates MORE strongly: gradient asymmetry is doing real work")
-    else:
-        print("  → C_eff_grad correlates MORE strongly: raw collision frequency drives error")
-    most_predictive = int(np.argmax(np.abs(correlations)))
-    print(f"  Most predictive level: {most_predictive + 1} "
-          f"(res={int(resolutions[most_predictive])}, r={correlations[most_predictive]:.4f})")
-    print("=" * 80 + "\n")
 
 def analyze_collision_damage(
     model_path_high_T: str,
@@ -681,23 +457,25 @@ def _plot_binned_variance(
 ###############################################################
 
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    # analyze_disambiguation(
-    #     model_path=MODEL_PATH,
-    #     stats_path=STATS_PATH,
-    #     mesh_path=MESH_PATH,
-    #     gt_mesh_path=GT_MESH_PATH,
-    #     device=device,
-    # )
     
-    analyze_collision_damage(
-        model_path_high_T=MODEL_PATH_HIGH_T,
-        stats_path_high_T=STATS_PATH_HIGH_T,
-        mesh_path_high_T=MESH_PATH_HIGH_T,
-        model_path_low_T=MODEL_PATH,
-        stats_path_low_T=STATS_PATH,
-        mesh_path_low_T=MESH_PATH,
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    analyze_disambiguation(
+        model_path=MODEL_PATH,
+        stats_path=STATS_PATH,
+        mesh_path=MESH_PATH,
         gt_mesh_path=GT_MESH_PATH,
         device=device,
     )
+    
+    # analyze_collision_damage(
+    #     model_path_high_T=MODEL_PATH_HIGH_T,
+    #     stats_path_high_T=STATS_PATH_HIGH_T,
+    #     mesh_path_high_T=MESH_PATH_HIGH_T,
+    #     model_path_low_T=MODEL_PATH,
+    #     stats_path_low_T=STATS_PATH,
+    #     mesh_path_low_T=MESH_PATH,
+    #     gt_mesh_path=GT_MESH_PATH,
+    #     device=device,
+    # )
     
