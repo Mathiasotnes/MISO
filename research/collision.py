@@ -331,7 +331,92 @@ def analyze_conflict_vs_T(
         )
     print("=" * w + "\n")
 
+    plot_conflict_vs_metrics(rows, save_path="./conflict_vs_metrics.png")
     return rows
+
+def plot_conflict_vs_metrics(rows: list, save_path: str):
+    T_vals      = np.array([r['T']          for r in rows])
+    c_means     = np.array([r['mean']        for r in rows])
+    chamfer     = np.array([r['chamfer_l2']  for r in rows])
+    f_scores    = np.array([r['f_score']     for r in rows])
+
+    r_chamfer = np.corrcoef(c_means, chamfer)[0, 1]
+    r_fscore  = np.corrcoef(c_means, f_scores)[0, 1]
+
+    print("\n" + "=" * 50)
+    print("C_grad mean vs. Reconstruction Metrics")
+    print(f"  r(C_grad, Chamfer-L2) : {r_chamfer:.4f}")
+    print(f"  r(C_grad, F-Score)    : {r_fscore:.4f}")
+    print("=" * 50 + "\n")
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # ── Top left: C_grad mean and Chamfer-L2 vs T ────────────────────────────
+    ax = axes[0, 0]
+    ax2 = ax.twinx()
+    ax.plot(T_vals, c_means,  'o-', color='steelblue',  label='C_grad mean')
+    ax2.plot(T_vals, chamfer, 's--', color='tomato',    label='Chamfer-L2')
+    ax.set_xlabel("$\log_2(T)$")
+    ax.set_ylabel("C_grad mean",   color='steelblue')
+    ax2.set_ylabel("Chamfer-L2 (cm)", color='tomato')
+    ax.tick_params(axis='y', labelcolor='steelblue')
+    ax2.tick_params(axis='y', labelcolor='tomato')
+    ax.set_title("C_grad & Chamfer-L2 vs. T")
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+    ax.grid(True, alpha=0.3)
+
+    # ── Top right: C_grad mean and F-Score vs T ───────────────────────────────
+    ax = axes[0, 1]
+    ax2 = ax.twinx()
+    ax.plot(T_vals, c_means,   'o-', color='steelblue', label='C_grad mean')
+    ax2.plot(T_vals, f_scores, 's--', color='seagreen',  label='F-Score')
+    ax.set_xlabel("$\log_2(T)$")
+    ax.set_ylabel("C_grad mean",  color='steelblue')
+    ax2.set_ylabel("F-Score (%)", color='seagreen')
+    ax.tick_params(axis='y', labelcolor='steelblue')
+    ax2.tick_params(axis='y', labelcolor='seagreen')
+    ax.set_title("C_grad & F-Score vs. T")
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+    ax.grid(True, alpha=0.3)
+
+    # ── Bottom left: C_grad mean vs Chamfer-L2 scatter ───────────────────────
+    ax = axes[1, 0]
+    ax.scatter(c_means, chamfer, c=T_vals, cmap='viridis', s=60, zorder=3)
+    for r in rows:
+        ax.annotate(f"T={r['T']}", (r['mean'], r['chamfer_l2']),
+                    textcoords="offset points", xytext=(5, 3), fontsize=7)
+    z = np.polyfit(c_means, chamfer, 1)
+    xline = np.linspace(c_means.min(), c_means.max(), 100)
+    ax.plot(xline, np.polyval(z, xline), color='tomato', lw=1.5, linestyle='--')
+    ax.set_xlabel("C_grad mean")
+    ax.set_ylabel("Chamfer-L2 (cm)")
+    ax.set_title(f"C_grad vs Chamfer-L2  (r={r_chamfer:.3f})")
+    ax.grid(True, alpha=0.3)
+
+    # ── Bottom right: C_grad mean vs F-Score scatter ─────────────────────────
+    ax = axes[1, 1]
+    sc = ax.scatter(c_means, f_scores, c=T_vals, cmap='viridis', s=60, zorder=3)
+    fig.colorbar(sc, ax=ax, label='$\log_2(T)$')
+    for r in rows:
+        ax.annotate(f"T={r['T']}", (r['mean'], r['f_score']),
+                    textcoords="offset points", xytext=(5, 3), fontsize=7)
+    z = np.polyfit(c_means, f_scores, 1)
+    xline = np.linspace(c_means.min(), c_means.max(), 100)
+    ax.plot(xline, np.polyval(z, xline), color='seagreen', lw=1.5, linestyle='--')
+    ax.set_xlabel("C_grad mean")
+    ax.set_ylabel("F-Score (%)")
+    ax.set_title(f"C_grad vs F-Score  (r={r_fscore:.3f})")
+    ax.grid(True, alpha=0.3)
+
+    plt.suptitle("Scene-Level Hash Conflict vs. Reconstruction Quality", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved → {save_path}")
 
 def analyze_collision_damage(
     model_path_high_T: str,
