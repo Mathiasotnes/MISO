@@ -46,7 +46,7 @@ def initialize_scannet(args):
     dataset = utils_scannet.create_scannet_dataset(args.scannet_root, args.scene, n_rays=cfg['sample']['n_rays'], frame_downsample=1)
     cfg = create_configs_scannet(args, dataset)
 
-    hash_grid = GridNGP(cfg['model'], device=cfg['device'], dtype=torch.float32) 
+    hash_grid = GridNGP(cfg['model'], device=cfg['device'], dtype=torch.float32, track_occupancy=True) 
     hash_grid.to(cfg['device'])
     
     return cfg, hash_grid, dataset
@@ -58,7 +58,7 @@ def mapping(cfg, hash_grid:BaseNet, dataset:SubmapDataset):
         model=hash_grid,
         dataset=dataset,
         cfg=cfg,
-        track_occupancy=False # Custom parameter for NGPGrid
+        track_occupancy=True # Custom parameter for NGPGrid
     )
     
     for kf_id in range(dataset.num_kfs):

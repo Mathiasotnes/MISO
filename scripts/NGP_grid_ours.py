@@ -52,6 +52,7 @@ def initialize_scannet(args):
         device=cfg['device'], 
         dtype=torch.float32, 
         track_collisions=True,
+        track_occupancy=True,
         n_levels = 16,
         n_features_per_level = 2,
         log2_hashmap_size = args.log2_hashmap_size,
