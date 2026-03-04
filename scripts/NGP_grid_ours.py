@@ -70,7 +70,7 @@ def initialize_scannet(args):
         log2_hashmap_size = args.log2_hashmap_size,
         base_resolution = 16,
         per_level_scale = 1.26,
-        n_hidden_layers = 0,
+        n_hidden_layers = 2,
         n_neurons = 64,
         n_output_dims = 1
     )
