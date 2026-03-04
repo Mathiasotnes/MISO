@@ -117,10 +117,10 @@ class MultiResHashEncoding(nn.Module):
       "Instant Neural Graphics Primitives with a Multiresolution Hash Encoding"
 
     For each of L levels we maintain a hash table of size T, where each
-    entry is an F-dimensional trainable feature vector.  Given a 3D input
+    entry is an F-dimensional trainable feature vector. Given a 3D input
     coordinate (already normalised to [0,1]^3) we:
       1. Scale the coordinate to that level's grid resolution.
-      2. Find the 8 surrounding integer corners (trilinear voxel).
+      2. Find the 8 surrounding integer corners.
       3. Map every corner to a hash-table index via the spatial hash function.
       4. Look up the F-dim feature vector for every corner.
       5. Trilinearly interpolate the 8 vectors.
@@ -162,15 +162,16 @@ class MultiResHashEncoding(nn.Module):
         self.register_buffer("corner_offsets", offsets)
 
     def hash(self, coords_int: torch.Tensor) -> torch.Tensor:
-        """ Spatial hash of integer grid coordinates.
+        """ Spatial hash of integer grid coordinates. It's the same as spatial_hash(), but uses the class's T and pi values.
         Args:
             coords_int: (N, 3) long tensor of integer grid coordinates.
         Returns:
             (N,) long tensor of hash-table indices in [0, T).
         """
         x, y, z = coords_int[:, 0], coords_int[:, 1], coords_int[:, 2]
-        h = x ^ (y * self.pi[1]) ^ (z * self.pi[2])
-        return h % self.T
+        MASK = 0xFFFFFFFF # Cast to uint32 range explicitly to mimic TCNN behavior
+        h = (x ^ (y * self.pi[1]) ^ (z * self.pi[2])) & MASK
+        return (h % self.T).long()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -238,6 +239,7 @@ class GridNGPOurs(BaseNet):
         device = 'cuda:0',
         dtype = torch.float32,
         track_collisions = False,
+        track_occupancy = True,
         n_levels = 16,
         n_features_per_level = 2,
         log2_hashmap_size = 15,
@@ -251,6 +253,7 @@ class GridNGPOurs(BaseNet):
         self.device = device
         self.dtype = dtype
         self.track_collisions = track_collisions
+        self.track_occupancy = track_occupancy
         self.n_levels = n_levels
         self.n_features_per_level = n_features_per_level
         self.log2_hashmap_size = log2_hashmap_size
@@ -262,8 +265,7 @@ class GridNGPOurs(BaseNet):
         self.init_ngp(cfg)
         self.init_occupancy_grid(cfg)
         self.init_poses(cfg)
-        self.num_levels = 1 # Hack to make it compatible with trainer.py. I think we can make a much simpler trainer unless we still want
-                            # to support coarse-to-fine curriculum learning (coordinate option).
+        self.num_levels = 1 # Hack to make it compatible with old MISO trainer.py
         
     def init_ngp(self, cfg):
         
@@ -314,7 +316,10 @@ class GridNGPOurs(BaseNet):
             self.tracker.register_hooks()
         
     def init_occupancy_grid(self, cfg):
-        self.occupancy_grid = OccupancyGrid(device=self.device, bound=self.bound)
+        """ The loss function updates the occupancy grid when the track_occupancy flag is on. This is
+        because we have access to the label here, and we want to add occupancy whenever a sample with low SDF is observed. """
+        if self.track_occupancy:
+            self.occupancy_grid = OccupancyGrid(device=self.device, bound=self.bound)
 
     def init_poses(self, cfg):
         """Initialize pose correction terms.

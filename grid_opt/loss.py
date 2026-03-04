@@ -804,7 +804,7 @@ class MisoLossMappingBase(BaseLoss):
         return out_dict
         
     def compute(self, model, model_input: dict, gt: dict) -> dict:
-        assert ((self.track_occupancy and isinstance(model, GridNGP)) or (self.track_occupancy and isinstance(model, GridNGPOurs))) or not self.track_occupancy, "Occupancy tracking only supported for GridNGP and GridNGPOurs."
+        assert (self.track_occupancy and isinstance(model, GridNGPOurs)) or not self.track_occupancy, "Occupancy tracking only supported for GridNGPOurs."
         assert (self.init_neural_points and (isinstance(model, NeuralPoints) or isinstance(model, NeuralPointsHash))) or not self.init_neural_points, "Neural point initialization only supported for NeuralPoints."
         coords_frame = model_input['coords_frame'][0]
         sample_frame_ids = model_input['sample_frame_ids'][0, :, 0]
@@ -880,18 +880,6 @@ class MisoLossMappingBase(BaseLoss):
                     coords_v = coords_world[valid_mask]
                     sdf_v = gt_sdf[valid_mask]
                     model.init_neural_points(coords_v, sdf_v)
-
-        # NGP Grid collision tracking:
-        if isinstance(model, GridNGP):
-            if model.track_collisions:
-                sdf_loss_vector = miso_loss_regression_vector(
-                    pred=pred_sdf,
-                    targ=gt_sdf,
-                    valid_mask=gt_sdf_valid,
-                    sample_weights=sample_weights,
-                    loss_type=self.loss_type
-                )
-                model.tracker.track_step(coords_world, model.bound, sdf_loss_vector, model.encoding)
         
         return loss_dict
 

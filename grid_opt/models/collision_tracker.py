@@ -4,6 +4,7 @@ import types
 
 logger = logging.getLogger(__name__)
 
+from grid_opt.models.grid_ngp_ours import spatial_hash
 
 #########################################################
 # Utilities
@@ -12,6 +13,12 @@ logger = logging.getLogger(__name__)
 _COORD_BITS = 21  # each x/y/z must fit in 21 bits → max resolution 2^21
 _COORD_MASK = (1 << _COORD_BITS) - 1  # 0x1FFFFF
 
+"""
+NOTE:
+Packing coordinates into a single int64 reduces memory needs, but more importantly it makes 
+torch.unique() work for identifying unique voxels. We will get the wrong coordinates if we 
+try to pack then unpack coordinates that exceed 2^21, but that's not a problem for our resolutions.
+"""
 def _pack(coords):   # (N, 3) int64 → (N,) int64
     return (coords[:, 0] << (2 * _COORD_BITS)) | \
            (coords[:, 1] << _COORD_BITS) | \
@@ -22,12 +29,6 @@ def _unpack(packed):  # (N,) int64 → (N, 3) int64
     y = (packed >> _COORD_BITS) & _COORD_MASK
     z = packed & _COORD_MASK
     return torch.stack([x, y, z], dim=-1)
-
-def spatial_hash(coords_int: torch.Tensor, T: int) -> torch.Tensor:
-    x, y, z = coords_int[:, 0], coords_int[:, 1], coords_int[:, 2]
-    MASK = 0xFFFFFFFF # Cast to uint32 range explicitly to mimic TCNN behavior
-    h = (x ^ (y * 2_654_435_761) ^ (z * 805_459_861)) & MASK
-    return (h % T).long()
 
 
 #########################################################
@@ -58,13 +59,13 @@ class CollisionTracker:
         self._voxels    = [torch.empty(0, dtype=torch.long, device=device) for _ in range(self.n_levels)]
         self._G         = [torch.empty(0, dtype=torch.float32, device=device) for _ in range(self.n_levels)]
         self._pending: list = []
-        
 
-    # ─────────────────────────────────────────────────────────────────────────
+    #########################################################
     # Hook registration
-    # ─────────────────────────────────────────────────────────────────────────
+    #########################################################
 
     def register_hooks(self):
+        """ This modifies our forward() to record and store gradient norms and voxel indices for calculating collision metrics. """
         tracker = self
 
         def patched_forward(enc_self, x: torch.Tensor) -> torch.Tensor:
@@ -86,7 +87,7 @@ class CollisionTracker:
 
                 feats = enc_self.hash_table[global_idx] # (N*8, F)
 
-                # ── gradient hook ─────────────────────────────────────────────
+                ### gradient hook #############################################
                 if feats.requires_grad:
                     _lvl = level_idx
                     _packed = packed_voxels.detach()
@@ -97,7 +98,7 @@ class CollisionTracker:
                         return grad
 
                     feats.register_hook(_hook)
-                # ─────────────────────────────────────────────────────────────
+                ##############################################################
 
                 feats = feats.reshape(N, 8, enc_self.F)
 
@@ -127,9 +128,9 @@ class CollisionTracker:
             pass            
         self._pending.clear()
 
-    # ─────────────────────────────────────────────────────────────────────────
+    #########################################################
     # update() — call after loss.backward() each step
-    # ─────────────────────────────────────────────────────────────────────────
+    #########################################################
 
     @torch.no_grad()
     def update(self):
@@ -156,7 +157,7 @@ class CollisionTracker:
             unique_packed = unique_packed[mask]
             batch_G = batch_G[mask]
 
-            # 2. Merge into global voxel history via searchsorted
+            # 2. Merge into global voxel history using searchsorted
             history_voxels = self._voxels[level_idx]
             history_G      = self._G[level_idx]
 
@@ -193,9 +194,9 @@ class CollisionTracker:
 
         self._pending.clear()
 
-    # ─────────────────────────────────────────────────────────────────────────
+    #########################################################
     # Derived metrics
-    # ─────────────────────────────────────────────────────────────────────────
+    #########################################################
 
     @torch.no_grad()
     def get_R_dom(self, eps: float = 1e-8) -> torch.Tensor:
@@ -291,10 +292,10 @@ class CollisionTracker:
                 logger.info(f"C_pot layer {level_idx + 1} approximated (Vertices={total_vertices:,}).")
 
         return self.C_pot
-
-    # ─────────────────────────────────────────────────────────────────────────
+    
+    #########################################################
     # Persistence and diagnostics
-    # ─────────────────────────────────────────────────────────────────────────
+    #########################################################
 
     def save(self, path: str):
         torch.save({

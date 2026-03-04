@@ -14,187 +14,6 @@ import tinycudann as tcnn
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-class CollisionTracker:
-    def __init__(self, encoding, n_feats=2, n_levels=16, hashmap_size=2**15, base_res=16, per_level_scale=1.26):
-        self.n_feats    = n_feats
-        self.L          = n_levels
-        self.T          = hashmap_size
-        self.N_min      = base_res
-        self.b          = per_level_scale
-        
-        # Importance: G(l, v) 
-        self.voxel_grads    = []
-        self.bin_eff_count  = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
-        self.bin_max_grad   = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
-        self.bin_total_grad = torch.zeros((self.L, self.T), dtype=torch.float32, device='cuda')
-        
-        for l in range(self.L):
-            res = math.floor(self.N_min * (self.b ** l))
-            num_verts = (res + 1) ** 3
-            self.voxel_grads.append(torch.zeros(num_verts, dtype=torch.float32, device='cuda'))
-
-        self.level_offsets = self._detect_offsets(encoding)
-        self._verify_offsets(encoding)
-        self.offsets_3d = torch.stack(torch.meshgrid([torch.tensor([0, 1])] * 3, indexing='ij')).reshape(3, -1).t().to('cuda')
-
-    def _detect_offsets(self, encoding):
-        """ Probes the TCNN parameter vector to find the physical start of each layer. """
-        offsets = []
-        zero_coord = torch.zeros((1, 3), device='cuda', requires_grad=True)
-        for l in range(self.L):
-            if encoding.params.grad is not None: encoding.params.grad.zero_()
-            # We isolate the backward pass to a specific feature slice
-            encoding(zero_coord)[:, l*self.n_feats : (l+1)*self.n_feats].sum().backward()
-            
-            grad_indices = torch.where(encoding.params.grad != 0)[0]
-            if grad_indices.numel() > 0:
-                offsets.append(grad_indices.min().item())
-            else:
-                raise RuntimeError(f"Probe failed at level {l}. Is the model initialized?")
-        encoding.params.grad = None
-        return offsets
-
-    def _verify_offsets(self, encoding):
-        """ 
-        Self-Correction Test: Ensures that detected offsets 
-        consistently yield indices within [0, T-1].
-        """
-        print("\n--- TCNN Memory Layout Verification Report ---")
-        total_params = encoding.params.shape[0]
-        self.actual_level_sizes = [] # Store these for later indexing
-        
-        for l in range(self.L):
-            start = self.level_offsets[l]
-            end = self.level_offsets[l+1] if l < self.L-1 else total_params
-            actual_size = end - start
-            self.actual_level_sizes.append(actual_size)
-            
-            # The only real "FAIL" is if the gap is 0 or negative
-            status = "PASS" if actual_size > 0 else "FAIL"
-            print(f"L{l+1:02} | Start: {start:10} | Actual Params: {actual_size:8} | {status}")
-            
-            if status == "FAIL":
-                raise RuntimeError(f"Level {l} offset detection failed (size 0)!")
-        print("---------------------------------------\n")
-
-    def _get_tcnn_indices(self, encoding, x):
-        """ Returns all global indices touched by the batch across all layers. """
-        x_probe = x.detach().clone().requires_grad_(True)
-        orig_grad = encoding.params.grad.clone() if encoding.params.grad is not None else None
-        encoding.params.grad = None
-        encoding(x_probe).sum().backward()
-        touched_indices = torch.where(encoding.params.grad != 0)[0]
-        encoding.params.grad = orig_grad
-        return touched_indices
-
-    @torch.no_grad()
-    def track_step(self, coords_world, bound, loss_vec, encoding):
-        x = (coords_world.detach() - bound[:, 0]) / (bound[:, 1] - bound[:, 0])
-        valid = (x >= 0).all(dim=-1) & (x < 1).all(dim=-1)
-        if not valid.any(): return
-        
-        x_valid = torch.clamp(x[valid], 0.0, 1.0 - 1e-6)
-        g = loss_vec.detach().reshape(-1)[valid]
-        
-        with torch.enable_grad():
-            touched_indices = self._get_tcnn_indices(encoding, x_valid)
-
-        for l in range(self.L):
-            res = math.floor(self.N_min * (self.b ** l))
-            stride = res + 1
-            
-            # 1. Get integer voxel corners for every point [N, 8]
-            base_v = torch.floor(x_valid * res).long()
-            # all_v: [8, N, 3]
-            all_v = (base_v.unsqueeze(0) + self.offsets_3d.unsqueeze(1))
-            # v_idx: [N, 8] -> flatten to [N*8]
-            v_idx = (all_v[..., 0] + stride * (all_v[..., 1] + stride * all_v[..., 2])).T.reshape(-1)
-            
-            # 2. Voxel Grads: G(l, v)
-            # Each point in 'g' contributes to 8 corners
-            g_repeated = g.repeat_interleave(8)
-            self.voxel_grads[l].index_add_(0, v_idx, g_repeated)
-
-            # 3. Bin Attribution (The most critical fix)
-            start, end = self.level_offsets[l], (self.level_offsets[l+1] if l < self.L-1 else encoding.params.shape[0])
-            level_indices = touched_indices[(touched_indices >= start) & (touched_indices < end)]
-            
-            # We convert physical addresses to bin IDs [0...T-1]
-            # TCNN touched_indices will have duplicates (features per bin). 
-            # We unique them to get one entry per bin-hit per point.
-            if level_indices.numel() > 0:
-                bin_ids = (level_indices // self.n_feats)
-                # Localize to [0...T-1]
-                local_bin_ids = (bin_ids - (self.level_offsets[l] // self.n_feats))
-                local_bin_ids = torch.clamp(local_bin_ids, 0, self.T - 1)
-                
-                # --- NEW LOGIC: GRANULAR MAPPING ---
-                # We unique both to find which bins were actually hit by this batch.
-                unique_bins, inverse_indices = torch.unique(local_bin_ids, return_inverse=True)
-                
-                # C_eff update: How many unique voxels (v_idx) in this batch 
-                # mapped to these specific bins?
-                # We use the ratio of (total voxel corners) / (total bins touched)
-                # to distribute the 'occupancy' fairly.
-                batch_v_count = torch.unique(v_idx).numel()
-                occupancy_load = batch_v_count / unique_bins.numel()
-                
-                self.bin_eff_count[l].index_add_(0, unique_bins, 
-                    torch.full_like(unique_bins, occupancy_load, dtype=torch.float32))
-
-                # Importance: Sum and Max per BIN, not per BATCH
-                # We aggregate the 'g' signal for each bin index hit
-                # This ensures R_dom = Max(G_v) / Sum(G_v) is locally correct
-                batch_bin_grads = torch.zeros(unique_bins.size(0), device='cuda')
-                # Map the point-wise gradients (g_repeated) to the bins (inverse_indices)
-                # Note: This assumes order-parity between v_idx and local_bin_ids
-                limit = min(g_repeated.size(0), local_bin_ids.size(0))
-                batch_bin_grads.index_add_(0, inverse_indices[:limit], g_repeated[:limit])
-                
-                self.bin_total_grad[l].index_add_(0, unique_bins, batch_bin_grads)
-                
-                # For R_dom, we need the max of the individual voxel grads hitting the bin
-                # Since multiple voxels in a batch can hit the same bin, we reduce to max
-                self.bin_max_grad[l].index_reduce_(0, unique_bins, batch_bin_grads, 
-                                                   reduce='amax', include_self=True)
-
-    def _compute_final_stats(self):
-        eff = self.bin_eff_count.clamp(min=1.0)
-        return eff, self.bin_max_grad, self.bin_total_grad
-
-    def save(self, path):
-        eff, mx, sm = self._compute_final_stats()
-        torch.save({
-            "eff_voxel_count": eff.cpu(),
-            "max_voxel_grad": mx.cpu(),
-            "total_bin_grad": sm.cpu(),
-            "config": {"L": self.L, "T": self.T, "b": self.b, "N_min": self.N_min}
-        }, path)
-
-    def print_collision_summary(self):
-        eff, mx, sm = self._compute_final_stats()
-        print("\n" + "="*125)
-        print(f"{'MHE SPATIAL COLLISION DENSITY & DOMINANCE ANALYSIS':^125}")
-        print("="*125)
-        header = f"{'L':<3} | {'Res':<5} | {'Bins (Occ)':<10} | {'C_eff (Min/Avg/Max)':<25} | {'R_dom (Min/Avg/Max)':<25}"
-        print(header)
-        print("-" * len(header))
-
-        for l in range(self.L):
-            occ = (sm[l] > 1e-9)
-            if occ.any():
-                c_eff = eff[l][occ]
-                r_dom = mx[l][occ] / sm[l][occ].clamp(min=1e-9)
-                
-                # Prepare column strings
-                c_eff_str = f"{c_eff.min():.0f} / {c_eff.mean():.1f} / {c_eff.max():.0f}"
-                r_dom_str = f"{r_dom.min():.4f} / {r_dom.mean():.4f} / {r_dom.max():.4f}"
-                
-                res = math.floor(self.N_min * (self.b ** l))
-                
-                # Use the same width specifiers as the header to ensure perfect alignment
-                print(f"{l+1:<3} | {res:<5} | {occ.sum():<10,} | {c_eff_str:<25} | {r_dom_str:<25}")
-
 class OccupancyGrid:
     """ A lightweight/simple occupancy grid. """
     def __init__(self, bound, res=0.1, device='cuda:0'):
@@ -239,7 +58,7 @@ class OccupancyGrid:
         Args:
             x (torch.Tensor):           (N,3) tensor of world coordinates corresponding to the SDF values.
             sdf (torch.Tensor):         (N,) tensor of SDF values corresponding to the input world coordinates.
-            tau (float, optional):      Threshold SDF value for marking cell as occupied. Defaults to 0.1.
+            tau (float, optional):      Threshold SDF value for marking cell as occupied. Defaults to 0.2.
         """
         sdf = sdf.view(-1)
         occ = sdf < tau
@@ -283,12 +102,12 @@ class GridNGP(BaseNet):
         cfg: dict, 
         device = 'cuda:0',
         dtype = torch.float32,
-        track_collisions = False
+        track_occupancy = True
     ):
         super(GridNGP, self).__init__(cfg, device, dtype)    
         self.device = device
         self.dtype = dtype
-        self.track_collisions = track_collisions
+        self.track_occupancy = track_occupancy,
         self.init_ngp(cfg)
         self.init_occupancy_grid(cfg)
         self.init_poses(cfg)
@@ -328,15 +147,14 @@ class GridNGP(BaseNet):
             "n_hidden_layers": 2        # Number of hidden layers.
         }
         
-        self.num_levels = 1 # Hack to make it compatible with trainer.py. I think we can make a much simpler trainer unless we still want
-                            # to support coarse-to-fine curriculum learning (coordinate option).
+        self.num_levels = 1 # Hack to make it compatible with old MISO trainer.py
         
         self.encoding = tcnn.Encoding(config_encoding["n_input_dims"], config_encoding)
         
         # Use this for an optimized fully fused MLP:
         # self.network = tcnn.Network(self.encoding.n_output_dims, config_network["n_output_dims"], config_network)
         
-        # I'm using this for research purposes to access activation patterns:
+        # I'm using this for research purposes to access decoder:
         layers = []
         input_dim = self.encoding.n_output_dims
         hidden_dim = config_network["n_neurons"]
@@ -357,19 +175,11 @@ class GridNGP(BaseNet):
         self.model = torch.nn.Sequential(self.encoding, self.network)
         self.print_trainable_params()
         
-        # Collision tracker
-        if self.track_collisions:
-            self.tracker = CollisionTracker(
-                encoding=self.encoding,
-                n_feats=config_encoding["n_features_per_level"],
-                n_levels=config_encoding["n_levels"],
-                hashmap_size=2**config_encoding["log2_hashmap_size"],
-                base_res=config_encoding["base_resolution"],
-                per_level_scale=config_encoding["per_level_scale"]
-            )
-        
     def init_occupancy_grid(self, cfg):
-        self.occupancy_grid = OccupancyGrid(device=self.device, bound=self.bound)
+        """ The loss function updates the occupancy grid when the track_occupancy flag is on. This is
+        because we have access to the label here, and we want to add occupancy whenever a sample with low SDF is observed. """
+        if self.track_occupancy:
+            self.occupancy_grid = OccupancyGrid(device=self.device, bound=self.bound)
 
     def init_poses(self, cfg):
         """Initialize pose correction terms.

@@ -24,19 +24,6 @@ parser.add_argument('--scene', type=str, default='0000_00')
 
 
 ##############################################
-# Helpers
-##############################################
-
-def save_submap(grid:BaseNet, submap_id:int, save_dir=None, visualize=False):
-    mesh_path = None
-    if save_dir is not None:
-        mesh_path = join(save_dir, f'pred_mesh.ply')
-    mesh = utils_sdf.save_mesh(grid, grid.bound, save_path=mesh_path)
-    if visualize:
-        o3d.visualization.draw_geometries([mesh], window_name=f"Predicted Mesh")
-        
-
-##############################################
 # Script Implementation
 ##############################################
 
@@ -86,39 +73,15 @@ def mapping(cfg, neural_points:BaseNet, dataset:SubmapDataset):
         level_iterations=cfg['train']['max_epochs_in_level']
     )
     
-def calculate_model_sparsity(model: torch.nn.Module):
-    """
-    Calculates the overall sparsity (percentage of zero weights) of a PyTorch model.
-    N.B: It's not taking into consideration parameters that SHOULD be 0. So use this carefully.
-    """
-    total_elements = 0
-    total_zeros = 0
-
-    for name, parameter in model.named_parameters():
-        if 'feature' in name: # Focus on weight tensors
-            # Get the total number of elements in the tensor
-            num_elements = parameter.numel()
-            total_elements += num_elements
-
-            # Count the number of zero elements
-            num_zeros = torch.sum(parameter == 0).item()
-            total_zeros += num_zeros
-            
-            # Print sparsity for each layer
-            layer_sparsity = 100.0 * num_zeros / num_elements
-            print(f"Layer: {name} | Sparsity: {layer_sparsity:.2f}%")
-
-    # Calculate overall model sparsity
-    if total_elements > 0:
-        overall_sparsity = 100.0 * total_zeros / total_elements
-        return overall_sparsity
-    else:
-        return 0.0
-    
 def save_active_point_cloud(path, points_xyz):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points_xyz)
     o3d.io.write_point_cloud(path, pcd)
+    
+
+##############################################
+# Main entry point
+##############################################
 
 def main_scannet():
     np.random.seed(55)

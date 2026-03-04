@@ -25,19 +25,6 @@ parser.add_argument('--log2_hashmap_size', type=int, default=15, help='Log2 of h
 
 
 ##############################################
-# Helpers
-##############################################
-
-def save_submap(grid:BaseNet, submap_id:int, save_dir=None, visualize=False):
-    mesh_path = None
-    if save_dir is not None:
-        mesh_path = join(save_dir, f'pred_mesh.ply')
-    mesh = utils_sdf.save_mesh(grid, grid.bound, save_path=mesh_path)
-    if visualize:
-        o3d.visualization.draw_geometries([mesh], window_name=f"Predicted Mesh")
-        
-
-##############################################
 # Script Implementation
 ##############################################
 
@@ -138,7 +125,7 @@ def save_mesh(
         flip_face=True, 
         transform:torch.Tensor=None   # [4,4] matrix
     ):
-    """ Custom mesh saving that also applies occupancy grid. """
+    """ Custom mesh saving that similar to utils_sdf.save_mesh, but also applies occupancy grid. """
 
     if save_path is not None:
         logger.info(f"Saving mesh to {save_path}...")
@@ -176,6 +163,10 @@ def save_mesh(
     return mesh_o3d
 
 
+##############################################
+# Main entry point
+##############################################
+
 def main_scannet():
     np.random.seed(55)
     torch.manual_seed(55)
@@ -199,19 +190,14 @@ def main_scannet():
     
     # Evaluate
     torch.save(hash_grid, model_path)
-    mesh = save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
+    if hash_grid.track_occupancy:
+        mesh = save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
+    else:
+        mesh = utils_sdf.save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
     gt_mesh_path = join(args.scannet_root, f"scene{args.scene}/scene{args.scene}_vh_clean.ply")
     
     verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
     verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
-    
-    # Disambiguation Analysis
-    # analyze_disambiguation(
-    #     model_path=model_path,
-    #     stats_path="./collision_stats.pt",
-    #     mesh_path=mesh_path,
-    #     gt_mesh_path=gt_mesh_path
-    # )
     
     metrics_results = compute_chamfer_metrics(verts_pred, verts_trgt, threshold=0.05)
     print(json.dumps(metrics_results, indent=4))

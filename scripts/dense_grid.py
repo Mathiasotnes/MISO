@@ -20,20 +20,7 @@ parser.add_argument('--save_dir', type=str, default='./results/mapping')
 parser.add_argument('--pose_init', type=str, default='gt')  # reg_icp OR kiss_icp OR gt
 parser.add_argument('--scannet_root', type=str, default='../../data/ScanNet/scans')
 parser.add_argument('--scene', type=str, default='0000_00')
-
-
-##############################################
-# Helpers
-##############################################
-
-def save_submap(grid:BaseNet, submap_id:int, save_dir=None, visualize=False):
-    mesh_path = None
-    if save_dir is not None:
-        mesh_path = join(save_dir, f'pred_mesh.ply')
-    mesh = utils_sdf.save_mesh(grid, grid.bound, save_path=mesh_path)
-    if visualize:
-        o3d.visualization.draw_geometries([mesh], window_name=f"Predicted Mesh")
-        
+ 
 
 ##############################################
 # Script Implementation
@@ -112,6 +99,11 @@ def calculate_model_sparsity(model: torch.nn.Module):
         return overall_sparsity
     else:
         return 0.0
+    
+
+##############################################
+# Main entry point
+##############################################
 
 def main_scannet():
     np.random.seed(55)

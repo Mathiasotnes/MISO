@@ -24,19 +24,6 @@ parser.add_argument('--scene', type=str, default='0000_00')
 
 
 ##############################################
-# Helpers
-##############################################
-
-def save_submap(grid:BaseNet, submap_id:int, save_dir=None, visualize=False):
-    mesh_path = None
-    if save_dir is not None:
-        mesh_path = join(save_dir, f'pred_mesh.ply')
-    mesh = utils_sdf.save_mesh(grid, grid.bound, save_path=mesh_path)
-    if visualize:
-        o3d.visualization.draw_geometries([mesh], window_name=f"Predicted Mesh")
-        
-
-##############################################
 # Script Implementation
 ##############################################
 
@@ -59,7 +46,7 @@ def initialize_scannet(args):
     dataset = utils_scannet.create_scannet_dataset(args.scannet_root, args.scene, n_rays=cfg['sample']['n_rays'], frame_downsample=1)
     cfg = create_configs_scannet(args, dataset)
 
-    hash_grid = GridNGP(cfg['model'], device=cfg['device'], dtype=torch.float32, track_collisions=True) 
+    hash_grid = GridNGP(cfg['model'], device=cfg['device'], dtype=torch.float32) 
     hash_grid.to(cfg['device'])
     
     return cfg, hash_grid, dataset
@@ -71,7 +58,7 @@ def mapping(cfg, hash_grid:BaseNet, dataset:SubmapDataset):
         model=hash_grid,
         dataset=dataset,
         cfg=cfg,
-        track_occupancy=True # Custom parameter for NGPGrid
+        track_occupancy=False # Custom parameter for NGPGrid
     )
     
     for kf_id in range(dataset.num_kfs):
@@ -122,7 +109,7 @@ def save_mesh(
         flip_face=True, 
         transform:torch.Tensor=None   # [4,4] matrix
     ):
-    """ Custom mesh saving that also applies occupancy grid. """
+    """ Custom mesh saving that similar to utils_sdf.save_mesh, but also applies occupancy grid. """
 
     if save_path is not None:
         logger.info(f"Saving mesh to {save_path}...")
@@ -160,35 +147,33 @@ def save_mesh(
     return mesh_o3d
 
 
+##############################################
+# Main entry point
+##############################################
+
 def main_scannet():
     np.random.seed(55)
     torch.manual_seed(55)
     args = parser.parse_args()
-    model_path = join(args.save_dir, 'hash_grid.pth')
-    mesh_path = join(args.save_dir, 'hash_pred_mesh.ply')
+    model_path      = join(args.save_dir, 'hash_grid.pth')
+    mesh_path       = join(args.save_dir, 'hash_pred_mesh.ply')
+    tracker_path    = join(args.save_dir, f'tracker.pt')
+    metrics_path    = join(args.save_dir, f'metrics.json')
     cfg, hash_grid, dataset = initialize_scannet(args)
+    
     
     mapping(cfg, hash_grid, dataset)
     
-    # Save collision statistics
-    if hash_grid.track_collisions:
-        hash_grid.tracker.save("collision_stats.pt")
-        hash_grid.tracker.print_collision_summary()
-    
-    # Check Sparsity
-    sparsity = calculate_model_sparsity(hash_grid)
-    print(f"Overall Model Sparsity: {sparsity:.2f}%")
-    
     # Evaluate
     torch.save(hash_grid, model_path)
-    mesh = save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
+    if hash_grid.track_occupancy:
+        mesh = save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
+    else:
+        mesh = utils_sdf.save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
     gt_mesh_path = join(args.scannet_root, f"scene{args.scene}/scene{args.scene}_vh_clean.ply")
     
     verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
     verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
-    
-    BOUNDS = torch.tensor([[-0.02,  10.38], [-0.01, 8.74], [-0.01,  3.03]]) # NOTE: Hardcoded for scene0000_00!
-    analyze_disambiguation(stats_path="./collision_stats.pt", mesh_path=mesh_path, gt_mesh_path=gt_mesh_path, bound=BOUNDS)
     
     metrics_results = compute_chamfer_metrics(verts_pred, verts_trgt, threshold=0.05)
     print(json.dumps(metrics_results, indent=4))
