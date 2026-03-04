@@ -166,10 +166,7 @@ def main_scannet():
     
     # Evaluate
     torch.save(hash_grid, model_path)
-    if hash_grid.track_occupancy:
-        mesh = save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
-    else:
-        mesh = utils_sdf.save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
+    mesh = utils_sdf.save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
     gt_mesh_path = join(args.scannet_root, f"scene{args.scene}/scene{args.scene}_vh_clean.ply")
     
     verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
