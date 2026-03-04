@@ -4,8 +4,6 @@ import types
 
 logger = logging.getLogger(__name__)
 
-from grid_opt.models.grid_ngp_ours import spatial_hash
-
 #########################################################
 # Utilities
 #########################################################
@@ -29,6 +27,13 @@ def _unpack(packed):  # (N,) int64 → (N, 3) int64
     y = (packed >> _COORD_BITS) & _COORD_MASK
     z = packed & _COORD_MASK
     return torch.stack([x, y, z], dim=-1)
+
+def spatial_hash(coords_int: torch.Tensor, T: int) -> torch.Tensor:
+    """ Identical to the hash used in GridNGPOurs. Included here to avoid circular inclusions. Should be in a utility file ideally. """
+    x, y, z = coords_int[:, 0], coords_int[:, 1], coords_int[:, 2]
+    MASK = 0xFFFFFFFF # Cast to uint32 range explicitly to mimic TCNN behavior
+    h = (x ^ (y * 2_654_435_761) ^ (z * 805_459_861)) & MASK
+    return (h % T).long()
 
 
 #########################################################
