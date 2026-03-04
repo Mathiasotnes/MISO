@@ -107,7 +107,7 @@ class GridNGP(BaseNet):
         super(GridNGP, self).__init__(cfg, device, dtype)    
         self.device = device
         self.dtype = dtype
-        self.track_occupancy = track_occupancy,
+        self.track_occupancy = track_occupancy
         self.init_ngp(cfg)
         self.init_occupancy_grid(cfg)
         self.init_poses(cfg)
