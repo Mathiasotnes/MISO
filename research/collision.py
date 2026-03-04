@@ -272,10 +272,10 @@ def analyze_conflict_vs_T(
     rows = []
 
     for T in T_values:
-        model_path   = join(results_dir, f'hash_grid_T{T}_linear.pth')
-        stats_path   = join(results_dir, f'tracker_T{T}_linear.pt')
-        mesh_path    = join(results_dir, f'hash_pred_mesh_T{T}_linear.ply')
-        metrics_path = join(results_dir, f'metrics_T{T}_linear.json')
+        model_path   = join(results_dir, f'hash_grid_T{T}.pth')
+        stats_path   = join(results_dir, f'tracker_T{T}.pt')
+        mesh_path    = join(results_dir, f'hash_pred_mesh_T{T}.ply')
+        metrics_path = join(results_dir, f'metrics_T{T}.json')
 
         print(f"Loading T={T}...")
         hash_grid = torch.load(model_path, map_location=device)
@@ -623,6 +623,7 @@ if __name__ == "__main__":
     #     device=device,
     # )
     
+    # Assumes that these models exists on disk. We can only fit one set of T=10..24 models at a time on UCSD RC. This takes roughly 30GB.
     T_values = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
 
     analyze_conflict_vs_T(

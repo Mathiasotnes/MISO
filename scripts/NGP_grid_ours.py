@@ -182,10 +182,10 @@ def main_scannet():
     args = parser.parse_args()
     
     T               = args.log2_hashmap_size
-    model_path      = join(args.save_dir, f'hash_grid_T{T}_linear.pth')
-    mesh_path       = join(args.save_dir, f'hash_pred_mesh_T{T}_linear.ply')
-    tracker_path    = join(args.save_dir, f'tracker_T{T}_linear.pt')
-    metrics_path    = join(args.save_dir, f'metrics_T{T}_linear.json')
+    model_path      = join(args.save_dir, f'hash_grid_T{T}.pth')
+    mesh_path       = join(args.save_dir, f'hash_pred_mesh_T{T}.ply')
+    tracker_path    = join(args.save_dir, f'tracker_T{T}.pt')
+    metrics_path    = join(args.save_dir, f'metrics_T{T}.json')
     
     cfg, hash_grid, dataset = initialize_scannet(args)
     
