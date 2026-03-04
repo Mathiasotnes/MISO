@@ -272,10 +272,10 @@ def analyze_conflict_vs_T(
     rows = []
 
     for T in T_values:
-        model_path   = join(results_dir, f'hash_grid_T{T}.pth')
-        stats_path   = join(results_dir, f'tracker_T{T}.pt')
-        mesh_path    = join(results_dir, f'hash_pred_mesh_T{T}.ply')
-        metrics_path = join(results_dir, f'metrics_T{T}.json')
+        model_path   = join(results_dir, f'hash_grid_T{T}_linear.pth')
+        stats_path   = join(results_dir, f'tracker_T{T}_linear.pt')
+        mesh_path    = join(results_dir, f'hash_pred_mesh_T{T}_linear.ply')
+        metrics_path = join(results_dir, f'metrics_T{T}_linear.json')
 
         print(f"Loading T={T}...")
         hash_grid = torch.load(model_path, map_location=device)
@@ -331,7 +331,7 @@ def analyze_conflict_vs_T(
         )
     print("=" * w + "\n")
 
-    plot_conflict_vs_metrics(rows, save_path="./conflict_vs_metrics.png")
+    plot_conflict_vs_metrics(rows, save_path="./conflict_vs_metrics_linear.png")
     return rows
 
 def plot_conflict_vs_metrics(rows: list, save_path: str):
@@ -412,7 +412,7 @@ def plot_conflict_vs_metrics(rows: list, save_path: str):
     ax.set_title(f"C_grad vs F-Score  (r={r_fscore:.3f})")
     ax.grid(True, alpha=0.3)
 
-    plt.suptitle("Scene-Level Hash Conflict vs. Reconstruction Quality", fontsize=13)
+    plt.suptitle("Scene-Level Hash Conflict vs. Reconstruction Quality (linear decoder)", fontsize=13)
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
@@ -623,7 +623,7 @@ if __name__ == "__main__":
     #     device=device,
     # )
     
-    T_values = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24]
+    T_values = [10, 11, 12, 13, 14, 15, 16, 17, 18]
 
     analyze_conflict_vs_T(
         T_values=T_values,
