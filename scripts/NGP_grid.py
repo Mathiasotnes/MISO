@@ -68,37 +68,10 @@ def mapping(cfg, hash_grid:BaseNet, dataset:SubmapDataset):
     mapper.mapping(
         mapping_kfs=range(frame_start, frame_end),
         iterations=cfg['train']['epochs'],
-        level_iterations=cfg['train']['max_epochs_in_level']
+        level_iterations=cfg['train']['max_epochs_in_level'],
+        optimizer_eps=1e-15,
+        optimizer_betas=(0.9, 0.99)
     )
-    
-def calculate_model_sparsity(model: torch.nn.Module):
-    """
-    Calculates the overall sparsity (percentage of zero weights) of a PyTorch model.
-    N.B: It's not taking into consideration parameters that SHOULD be 0. So use this carefully.
-    """
-    total_elements = 0
-    total_zeros = 0
-
-    for name, parameter in model.named_parameters():
-        if 'encoding.params' in name: # Focus on grid tensors
-            # Get the total number of elements in the tensor
-            num_elements = parameter.numel()
-            total_elements += num_elements
-
-            # Count the number of zero elements
-            num_zeros = torch.sum(parameter == 0).item()
-            total_zeros += num_zeros
-            
-            # Print sparsity for each layer
-            layer_sparsity = 100.0 * num_zeros / num_elements
-            print(f"Layer: {name} | Sparsity: {layer_sparsity:.2f}%")
-
-    # Calculate overall model sparsity
-    if total_elements > 0:
-        overall_sparsity = 100.0 * total_zeros / total_elements
-        return overall_sparsity
-    else:
-        return 0.0
 
 def save_mesh(
         model, 
@@ -166,7 +139,10 @@ def main_scannet():
     
     # Evaluate
     torch.save(hash_grid, model_path)
-    mesh = utils_sdf.save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
+    if hash_grid.track_occupancy:
+        mesh = save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
+    else:
+        mesh = utils_sdf.save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
     gt_mesh_path = join(args.scannet_root, f"scene{args.scene}/scene{args.scene}_vh_clean.ply")
     
     verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
