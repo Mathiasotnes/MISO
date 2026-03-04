@@ -5,6 +5,7 @@ from .diff import gradient3d
 from .models.base_net import BaseNet
 from .models.grid_net import GridNet
 from .models.grid_ngp import GridNGP
+from .models.grid_ngp_ours import GridNGPOurs
 from .models.neural_points import NeuralPoints
 from .models.neural_points_hash import NeuralPointsHash
 from .models.grid_atlas import GridAtlas
@@ -637,6 +638,48 @@ def miso_loss_regression(
     reg_loss = torch.mean(sample_weights * loss_vec)
     return reg_loss
 
+def miso_loss_regression_vector(
+        pred, 
+        targ, 
+        valid_mask=None, 
+        sample_weights=None,
+        loss_type='L1'
+    ):
+    """Helper function to compute the regression loss, and returns the loss vector instead of mean loss.
+
+    Args:
+        pred (_type_): Predicted value (N, d)
+        targ (_type_): Target value (N, d)
+        valid_mask (_type_): boolean mask (N, 1)
+        sample_weights (_type_): sample weights (N, 1)
+        loss_type (_type_): L2, L1, Cosine
+    """
+    assert pred.shape == targ.shape
+    num_samples = pred.shape[0]
+    if valid_mask is None:
+        valid_mask = torch.ones((num_samples, 1)).to(pred)
+    if sample_weights is None:
+        sample_weights = torch.ones((num_samples, 1)).to(pred)
+    assert valid_mask.shape == (num_samples, 1)
+    assert sample_weights.shape == (num_samples, 1)
+    if loss_type == 'L2':
+        # Compute L2 (MSE) loss
+        loss_vec = torch.sum((pred - targ)**2, dim=1, keepdim=True)  # (N, 1)
+    elif loss_type == 'L1':
+        # Compute L1 (MAE) loss
+        loss_vec = torch.sum(torch.abs(pred - targ), dim=1, keepdim=True)  # (N, 1)
+    elif loss_type == 'Cosine':
+        # Compute cosine similarity
+        loss_vec = 1.0 - F.cosine_similarity(pred, targ, dim=1, eps=1e-8).unsqueeze(1)  # (N, 1)
+    else:
+        raise ValueError(f"Invalid loss type: {loss_type}")
+    loss_vec = torch.where(
+        valid_mask == 1,
+        loss_vec,
+        torch.zeros_like(loss_vec)
+    )
+    reg_loss = sample_weights * loss_vec
+    return reg_loss.detach()
 
 def miso_loss_eikonal(
         model: BaseNet,
@@ -761,7 +804,7 @@ class MisoLossMappingBase(BaseLoss):
         return out_dict
         
     def compute(self, model, model_input: dict, gt: dict) -> dict:
-        assert (self.track_occupancy and isinstance(model, GridNGP)) or not self.track_occupancy, "Occupancy tracking only supported for GridNGP."
+        assert ((self.track_occupancy and isinstance(model, GridNGP)) or (self.track_occupancy and isinstance(model, GridNGPOurs))) or not self.track_occupancy, "Occupancy tracking only supported for GridNGP and GridNGPOurs."
         assert (self.init_neural_points and (isinstance(model, NeuralPoints) or isinstance(model, NeuralPointsHash))) or not self.init_neural_points, "Neural point initialization only supported for NeuralPoints."
         coords_frame = model_input['coords_frame'][0]
         sample_frame_ids = model_input['sample_frame_ids'][0, :, 0]
@@ -837,8 +880,7 @@ class MisoLossMappingBase(BaseLoss):
                     coords_v = coords_world[valid_mask]
                     sdf_v = gt_sdf[valid_mask]
                     model.init_neural_points(coords_v, sdf_v)
-
-            
+        
         return loss_dict
 
     def compute_clip(self, model, model_input: dict, gt: dict) -> dict:
@@ -878,7 +920,7 @@ class MisoLossMapping(MisoLossMappingBase):
     """For mapping within a single submap (GridNet).
     """
     def query_kf_pose(self, model, kf_id):
-        assert isinstance(model, GridNet) or isinstance(model, GridNGP) or isinstance(model, NeuralPoints) or isinstance(model, NeuralPointsHash), f"Invalid model type {type(model)}."
+        assert isinstance(model, GridNet) or isinstance(model, GridNGP) or isinstance(model, GridNGPOurs) or isinstance(model, NeuralPoints) or isinstance(model, NeuralPointsHash), f"Invalid model type {type(model)}."
         return model.updated_kf_pose_from_key(f'KF{kf_id}')
     
 

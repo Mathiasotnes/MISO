@@ -3,16 +3,35 @@ import numpy as np
 import math
 import torch
 import torch.nn as nn
-import grid_opt.utils.utils as utils
+from .collision_tracker import CollisionTracker
 from .base_net import BaseNet
 from .grid_modules import *
 import grid_opt.utils.utils_geometry as utils_geometry
 import logging
 
-import tinycudann as tcnn
-
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+def spatial_hash(coords_int: torch.Tensor, T: int) -> torch.Tensor:
+    x, y, z = coords_int[:, 0], coords_int[:, 1], coords_int[:, 2]
+    MASK = 0xFFFFFFFF # Cast to uint32 range explicitly to mimic TCNN behavior
+    h = (x ^ (y * 2_654_435_761) ^ (z * 805_459_861)) & MASK
+    return (h % T).long()
+
+def normalize_coordinates(x: torch.Tensor, bound: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize world coordinates to [0, 1]^3.
+    tcnn expects inputs in [0, 1], NOT [-1, 1] like utils.normalize_coordinates provides.
+
+    Args:
+        x:     (N, 3) tensor of world coordinates.
+        bound: (3, 2) tensor of [[xmin,xmax],[ymin,ymax],[zmin,zmax]].
+    Returns:
+        (N, 3) tensor with values in [0, 1].
+    """
+    lo = bound[:, 0]  # (3,)
+    hi = bound[:, 1]  # (3,)
+    return (x - lo) / (hi - lo)
 
 class OccupancyGrid:
     """ A lightweight/simple occupancy grid. """
@@ -58,7 +77,7 @@ class OccupancyGrid:
         Args:
             x (torch.Tensor):           (N,3) tensor of world coordinates corresponding to the SDF values.
             sdf (torch.Tensor):         (N,) tensor of SDF values corresponding to the input world coordinates.
-            tau (float, optional):      Threshold SDF value for marking cell as occupied. Defaults to 0.2.
+            tau (float, optional):      Threshold SDF value for marking cell as occupied. Defaults to 0.1.
         """
         sdf = sdf.view(-1)
         occ = sdf < tau
@@ -91,89 +110,210 @@ class OccupancyGrid:
         idx = self.grid_to_index(g)
         out[inb] = self.grid[idx]
         return out
-
-class GridNGP(BaseNet):
+    
+class MultiResHashEncoding(nn.Module):
     """
-    An implementation similar to grid_net, but with the regular grid
-    replaced by a hash grid implemented using tiny-cuda-nn / instantNGP
-    hash grids. It only contains a subset of the functionality of grid_net.
+    Multiresolution Hash Encoding as described in:
+      "Instant Neural Graphics Primitives with a Multiresolution Hash Encoding"
+
+    For each of L levels we maintain a hash table of size T, where each
+    entry is an F-dimensional trainable feature vector. Given a 3D input
+    coordinate (already normalised to [0,1]^3) we:
+      1. Scale the coordinate to that level's grid resolution.
+      2. Find the 8 surrounding integer corners.
+      3. Map every corner to a hash-table index via the spatial hash function.
+      4. Look up the F-dim feature vector for every corner.
+      5. Trilinearly interpolate the 8 vectors.
+      6. Concatenate the L interpolated vectors → output of size L*F.
+    """
+    def __init__(
+        self,
+        n_levels: int = 16,
+        n_features_per_level: int = 2,
+        log2_hashmap_size: int = 15,
+        base_resolution: int = 16,
+        per_level_scale: float = 1.26,
+    ):
+        super().__init__()
+        self.pi = [1, 2_654_435_761, 805_459_861]
+        self.n_levels = n_levels
+        self.F = n_features_per_level
+        self.T = 2 ** log2_hashmap_size
+        self.N_min = base_resolution
+        self.b = per_level_scale
+
+        self.n_output_dims = n_levels * n_features_per_level
+
+        ### Hash table initialized with U(-1e-4, 1e-4) as recommended in the paper.
+        self.hash_table = nn.Parameter(
+            torch.empty(n_levels * self.T, self.F).uniform_(-1e-4, 1e-4)
+        )
+
+        ### Per-level grid resolutions
+        resolutions = [
+            math.floor(self.N_min * (self.b ** level))
+            for level in range(n_levels)
+        ]
+        self.register_buffer("resolutions", torch.tensor(resolutions, dtype=torch.int32))
+
+        ### Corner offsets for trilinear interpolation
+        # 8 corners of the unit voxel: (0,0,0)…(1,1,1)
+        offsets = torch.tensor([[i, j, k] for i in range(2) for j in range(2) for k in range(2)], dtype=torch.int32) # (8, 3)
+        self.register_buffer("corner_offsets", offsets)
+
+    def hash(self, coords_int: torch.Tensor) -> torch.Tensor:
+        """ Spatial hash of integer grid coordinates. It's the same as spatial_hash(), but uses the class's T and pi values.
+        Args:
+            coords_int: (N, 3) long tensor of integer grid coordinates.
+        Returns:
+            (N,) long tensor of hash-table indices in [0, T).
+        """
+        x, y, z = coords_int[:, 0], coords_int[:, 1], coords_int[:, 2]
+        MASK = 0xFFFFFFFF # Cast to uint32 range explicitly to mimic TCNN behavior
+        h = (x ^ (y * self.pi[1]) ^ (z * self.pi[2])) & MASK
+        return (h % self.T).long()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (N, 3) float tensor of normalised coordinates in [0, 1]^3.
+        Returns:
+            (N, L*F) encoded feature tensor.
+        """
+        N = x.shape[0]
+        level_features = []
+
+        for level_idx in range(self.n_levels):
+            N_l = self.resolutions[level_idx].item()   # scalar grid resolution
+
+            ### Scale to level resolution
+            x_scaled = x * N_l                         # (N, 3)
+
+            ### Floor / ceil corners and interpolation weights
+            x_floor = torch.floor(x_scaled).long()     # (N, 3)
+            w = x_scaled - x_floor.float()             # (N, 3)  fractional offset
+
+            ### Hash all 8 corners, look up features
+            # corner_offsets: (8, 3) → broadcast to (N, 8, 3)
+            corners = x_floor.unsqueeze(1) + self.corner_offsets.unsqueeze(0) # corners: (N, 8, 3)
+            corners_flat = corners.reshape(N * 8, 3) # (N*8, 3)
+            
+            # Local index in [0, T), then offset into flat table for this level
+            local_idx = spatial_hash(corners_flat, self.T) # (N*8,)
+            global_idx = local_idx + level_idx * self.T    # (N*8,)
+
+            feats = self.hash_table[global_idx] # (N*8, F)
+            feats = feats.reshape(N, 8, self.F) # (N, 8, F)
+
+            ### Trilinear interpolation
+            # Decompose into per-axis weights for the 8 corners:
+            # corner order: (i,j,k) for i,j,k ∈ {0,1}  (matches corner_offsets)
+            wx0, wx1 = 1.0 - w[:, 0], w[:, 0] # (N,)
+            wy0, wy1 = 1.0 - w[:, 1], w[:, 1]
+            wz0, wz1 = 1.0 - w[:, 2], w[:, 2]
+
+            # weight for each of the 8 corners → (N, 8, 1)
+            weights = torch.stack([
+                wx0 * wy0 * wz0,    # (0, 0, 0)
+                wx0 * wy0 * wz1,    # (0, 0, 1)
+                wx0 * wy1 * wz0,    # (0, 1, 0)
+                wx0 * wy1 * wz1,    # (0, 1, 1)
+                wx1 * wy0 * wz0,    # (1, 0, 0)
+                wx1 * wy0 * wz1,    # (1, 0, 1)
+                wx1 * wy1 * wz0,    # (1, 1, 0)
+                wx1 * wy1 * wz1,    # (1, 1, 1)
+            ], dim=1).unsqueeze(-1) # (N, 8, 1)
+
+            interpolated = (weights * feats).sum(dim=1) # (N, F)
+            level_features.append(interpolated)
+
+        return torch.cat(level_features, dim=-1) # (N, L*F) Concatenate across levels
+
+class GridNGPOurs(BaseNet):
+    """
+    An implementation similar to grid_ngp, but implements our own non-optimized version
+    of the hash grid encoding instead of using tiny-cuda-nn.
     """
     def __init__(self,
         cfg: dict, 
         device = 'cuda:0',
         dtype = torch.float32,
-        track_occupancy = True
+        track_collisions = False,
+        track_occupancy = True,
+        n_levels = 16,
+        n_features_per_level = 2,
+        log2_hashmap_size = 15,
+        base_resolution = 16,
+        per_level_scale = 1.26,
+        n_hidden_layers = 2,
+        n_neurons = 64,
+        n_output_dims = 1
     ):
-        super(GridNGP, self).__init__(cfg, device, dtype)    
+        super(GridNGPOurs, self).__init__(cfg, device, dtype)    
         self.device = device
         self.dtype = dtype
-        self.track_occupancy = track_occupancy,
+        self.track_collisions = track_collisions
+        self.track_occupancy = track_occupancy
+        self.n_levels = n_levels
+        self.n_features_per_level = n_features_per_level
+        self.log2_hashmap_size = log2_hashmap_size
+        self.base_resolution = base_resolution
+        self.per_level_scale = per_level_scale
+        self.n_hidden_layers = n_hidden_layers
+        self.n_neurons = n_neurons
+        self.n_output_dims = n_output_dims
         self.init_ngp(cfg)
         self.init_occupancy_grid(cfg)
         self.init_poses(cfg)
+        self.num_levels = 1 # Hack to make it compatible with old MISO trainer.py
         
     def init_ngp(self, cfg):
         
-        # TODO: Move config to another location.
-        config_encoding = {
-            "otype": "Grid",            # Component type.
-            "type": "Hash",             # Type of backing storage of the
-                                        # grids. Can be "Hash", "Tiled"
-                                        # or "Dense".
-            "n_levels": 16,             # Number of levels (resolutions)
-            "n_features_per_level": 2,  # Dimensionality of feature vector
-                                        # stored in each level's entries.
-            "log2_hashmap_size": 15,    # If type is "Hash", is the base-2
-                                        # logarithm of the number of elements
-                                        # in each backing hash table.
-            "base_resolution": 16,      # The resolution of the coarsest le-
-                                        # vel is base_resolution^input_dims.
-            "per_level_scale": 1.26,    # The geometric growth factor, i.e.
-                                        # the factor by which the resolution
-                                        # of each grid is larger (per axis)
-                                        # than that of the preceding level.
-            "interpolation": "Linear",  # How to interpolate nearby grid
-                                        # lookups. Can be "Nearest", "Linear",
-                                        # or "Smoothstep" (for smooth deri-
-                                        # vatives).
-            "n_input_dims": 3,          # Number of dimensions of input coordinates.
-        }
-        config_network = {
-            "otype": "FullyFusedMLP",   # Component type.
-            "activation": "ReLU",       # Activation function. Can be "ReLU",
-            "output_activation": "None",# Activation function of the output layer.
-            "n_output_dims": 1,         # Number of dimensions of output features. 1 for SDF prediction.
-            "n_neurons": 64,            # Number of neurons in each hidden layer. (mus be 16, 32, 64 or 128)
-            "n_hidden_layers": 2        # Number of hidden layers.
-        }
+        self.encoding = MultiResHashEncoding(
+            n_levels             = self.n_levels,
+            n_features_per_level = self.n_features_per_level,
+            log2_hashmap_size    = self.log2_hashmap_size,
+            base_resolution      = self.base_resolution,
+            per_level_scale      = self.per_level_scale,
+        ).to(self.device)
         
-        self.num_levels = 1 # Hack to make it compatible with old MISO trainer.py
+        ########################################
+        # Decoder network (MLP)
+        ########################################
         
-        self.encoding = tcnn.Encoding(config_encoding["n_input_dims"], config_encoding)
-        
-        # Use this for an optimized fully fused MLP:
-        # self.network = tcnn.Network(self.encoding.n_output_dims, config_network["n_output_dims"], config_network)
-        
-        # I'm using this for research purposes to access decoder:
-        layers = []
+        decoder = []
         input_dim = self.encoding.n_output_dims
-        hidden_dim = config_network["n_neurons"]
 
-        for i in range(config_network["n_hidden_layers"]):
-            layer = nn.Linear(input_dim if i == 0 else hidden_dim, hidden_dim)
+        for i in range(self.n_hidden_layers):
+            layer = nn.Linear(input_dim if i == 0 else self.n_neurons, self.n_neurons)
             nn.init.xavier_uniform_(layer.weight) # InstantNGP paper uses Glorot (Xavier) initialization
-            layers.append(layer)
-            layers.append(nn.ReLU())
+            decoder.append(layer)
+            decoder.append(nn.ReLU())
 
-        # Final output layer (Linear) 
-        final_layer = nn.Linear(hidden_dim, config_network["n_output_dims"])
+        # Final output layer
+        if self.n_hidden_layers == 0:
+            final_layer = nn.Linear(input_dim, self.n_output_dims)
+        else:
+            final_layer = nn.Linear(self.n_neurons, self.n_output_dims)
         nn.init.xavier_uniform_(final_layer.weight)
-        layers.append(final_layer)
+        decoder.append(final_layer)
 
-        self.network = nn.Sequential(*layers)
+        self.decoder = nn.Sequential(*decoder)
+
+        ########################################
+        # Complete model
+        ########################################
         
-        self.model = torch.nn.Sequential(self.encoding, self.network)
+        self.model = torch.nn.Sequential(self.encoding, self.decoder)
         self.print_trainable_params()
+        
+        if self.track_collisions:
+            self.tracker = CollisionTracker(
+                encoding=self.encoding, 
+                scene_bound=self.bound, 
+                device=self.device
+            )
+            self.tracker.register_hooks()
         
     def init_occupancy_grid(self, cfg):
         """ The loss function updates the occupancy grid when the track_occupancy flag is on. This is
@@ -296,11 +436,11 @@ class GridNGP(BaseNet):
         return self.updated_kf_pose(kf_id)
     
     def query_feature(self, x):
-        x = utils.normalize_coordinates(x, self.bound)
+        x = normalize_coordinates(x, self.bound)
         return self.encoding(x)
     
     def forward(self, x):
-        x = utils.normalize_coordinates(x, self.bound)
+        x = normalize_coordinates(x, self.bound)
         return self.model(x)
     
     def params_at_level(self, level):
@@ -313,4 +453,4 @@ class GridNGP(BaseNet):
         logger.info(f"GridNet KF pose corrections: max_rot={math.degrees(max_rot):.3f}deg, max_tran={max_tran:.3f}m.")
         
     def print_feature_info(self):
-        logger.warning("Feature info not implemented yet for GridNGP.")
+        logger.warning("Feature info not implemented yet for GridNGPOurs.")

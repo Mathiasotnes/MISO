@@ -6,6 +6,7 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from .utils.utils import cond_mkdir, PerfTimer, prepare_batch
 import time
+from grid_opt.models.grid_ngp_ours import GridNGPOurs
 
 import logging
 logger = logging.getLogger(__name__)
@@ -215,6 +216,9 @@ class Trainer(object):
             if not torch.isnan(total_loss):
                 total_loss.backward(retain_graph=False)
                 self.optimizer.step()
+                if isinstance(self.model, GridNGPOurs):
+                    if self.model.track_collisions:
+                        self.model.tracker.update()
             else:
                 logger.warning(f"Loss at epoch {epoch} is nan! Skip backward step.")
 
@@ -375,6 +379,8 @@ class GridTrainer(Trainer):
                  train_dataloader,
                  val_dataloader=None, 
                  device='cuda:0', 
+                 optimizer_eps=1e-8,
+                 optimizer_betas=(0.9, 0.999),
                  dtype=torch.float32):
         """Constructor.
         """
@@ -382,6 +388,8 @@ class GridTrainer(Trainer):
         self.verbose = cfg['verbose']
         self.model = model
         self.loss_func = loss_func
+        self.optimizer_eps = optimizer_eps
+        self.optimizer_betas = optimizer_betas
         
         # Set device to use
         self.use_cuda = torch.cuda.is_available()
@@ -430,11 +438,16 @@ class GridTrainer(Trainer):
         self.level_optimizers = []
         if self.grid_training_mode != 'joint':
             for level in range(self.model.num_levels):
-                optimizer = optim_class(self.model.params_at_level(level), lr=self.cfg['learning_rate']) 
+                optimizer = optim_class(self.model.params_at_level(level), lr=self.cfg['learning_rate'], eps=self.optimizer_eps, betas=self.optimizer_betas) 
                 self.level_optimizers.append(optimizer)
 
         # Create a joint optimizer for final finetune
-        self.joint_optimizer = optim_class(self.model.parameters(), lr=self.cfg['learning_rate']) 
+        self.joint_optimizer = optim_class(
+            self.model.parameters(),
+            lr=self.cfg['learning_rate'],
+            eps=self.optimizer_eps,
+            betas=self.optimizer_betas
+        )
         
         # Set active optimizer
         self.reset_convergence_check()
