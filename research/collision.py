@@ -623,7 +623,7 @@ if __name__ == "__main__":
     #     device=device,
     # )
     
-    T_values = [10, 11, 12, 13, 14, 15, 16, 17, 18]
+    T_values = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
 
     analyze_conflict_vs_T(
         T_values=T_values,
