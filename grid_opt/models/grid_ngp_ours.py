@@ -35,7 +35,7 @@ def normalize_coordinates(x: torch.Tensor, bound: torch.Tensor) -> torch.Tensor:
 
 class OccupancyGrid:
     """ A lightweight/simple occupancy grid. """
-    def __init__(self, bound, res=0.1, device='cuda:0'):
+    def __init__(self, bound, res=0.05, device='cuda:0'):
         self.bound = bound
         self.res = res
         self.device = device
@@ -71,7 +71,7 @@ class OccupancyGrid:
         return g[:, 0] + self.Nx * (g[:, 1] + self.Ny * g[:, 2])
     
     @torch.no_grad()
-    def update(self, x: torch.Tensor, sdf: torch.Tensor, tau: float = 0.2):
+    def update(self, x: torch.Tensor, sdf: torch.Tensor, tau: float = 0.05):
         """ Update the occupancy grid based on the input world coordinates and their corresponding SDF values.
 
         Args:
