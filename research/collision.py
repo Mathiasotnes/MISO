@@ -153,8 +153,8 @@ def analyze_conflict_vs_T(
 
 def _plot_conflict_vs_metrics(rows: list, save_path: str):
     """ This plotting is only to see how the relationship is between C_grad and the reconstruction metrics. """
-    T_vals      = np.array([r['T']          for r in rows])
-    c_means     = np.array([r['mean']        for r in rows])
+    T_vals      = np.array([r['T']           for r in rows])
+    c_means     = np.array([r['c_grad_avg']  for r in rows])
     chamfer     = np.array([r['chamfer_l2']  for r in rows])
     f_scores    = np.array([r['f_score']     for r in rows])
 
