@@ -22,6 +22,7 @@ parser.add_argument('--pose_init', type=str, default='gt')  # reg_icp OR kiss_ic
 parser.add_argument('--scannet_root', type=str, default='../../data/ScanNet/scans')
 parser.add_argument('--scene', type=str, default='0000_00')
 parser.add_argument('--log2_hashmap_size', type=int, default=15, help='Log2 of hash table size T (e.g. 10 for T=2^10)')
+parser.add_argument('--track_occupancy', type=lambda x: x.lower() != 'false', default=True, help='Follow with "true" or "false", defaults to True')
 
 
 ##############################################
@@ -52,7 +53,7 @@ def initialize_scannet(args):
         device=cfg['device'], 
         dtype=torch.float32, 
         track_collisions=True,
-        track_occupancy=True,
+        track_occupancy=args.track_occupancy,
         n_levels = 16,
         n_features_per_level = 2,
         log2_hashmap_size = args.log2_hashmap_size,
@@ -66,14 +67,14 @@ def initialize_scannet(args):
     
     return cfg, hash_grid, dataset
 
-def mapping(cfg, hash_grid:BaseNet, dataset:SubmapDataset):
+def mapping(cfg, hash_grid:BaseNet, dataset:SubmapDataset, track_occupancy=True):
     frame_start = 0  
     frame_end = dataset.num_kfs
     mapper = Mapper(
         model=hash_grid,
         dataset=dataset,
         cfg=cfg,
-        track_occupancy=True # Custom parameter for NGPGrid
+        track_occupancy=track_occupancy # Custom parameter for NGPGrid
     )
     
     for kf_id in range(dataset.num_kfs):
@@ -152,7 +153,7 @@ def main_scannet():
     
     cfg, hash_grid, dataset = initialize_scannet(args)
     
-    mapping(cfg, hash_grid, dataset)
+    mapping(cfg, hash_grid, dataset, track_occupancy=args.track_occupancy)
     
     # Save collision statistics
     if hash_grid.track_collisions:

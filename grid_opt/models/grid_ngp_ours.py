@@ -44,6 +44,7 @@ class OccupancyGrid:
         self.Nz = math.ceil((self.bound[2,1] - self.bound[2,0]) / self.res)
         self.N = self.Nx * self.Ny * self.Nz
         self.grid = torch.zeros(self.N, dtype=torch.bool, device=device)
+        self.print_summary()
     
     def world_to_grid(self, x: torch.Tensor) -> torch.Tensor:
         """ Convert world coordinates to grid coordinates.
@@ -110,6 +111,18 @@ class OccupancyGrid:
         idx = self.grid_to_index(g)
         out[inb] = self.grid[idx]
         return out
+    
+    def print_summary(self):
+        memory_kb = self.N / 1024
+        logger.info(
+            f"\n{'='*40}\n"
+            f" OccupancyGrid\n"
+            f"   * Resolution : {self.res} m\n"
+            f"   * Dimensions : {self.Nx} x {self.Ny} x {self.Nz}\n"
+            f"   * Cells      : {self.N:,}\n"
+            f"   * Memory     ≈ {memory_kb:.1f} KB\n"
+            f"{'='*40}"
+        )
     
 class MultiResHashEncoding(nn.Module):
     """
@@ -266,6 +279,7 @@ class GridNGPOurs(BaseNet):
         self.init_occupancy_grid(cfg)
         self.init_poses(cfg)
         self.num_levels = 1 # Hack to make it compatible with old MISO trainer.py
+        self.print_summary()
         
     def init_ngp(self, cfg):
         
@@ -305,7 +319,6 @@ class GridNGPOurs(BaseNet):
         ########################################
         
         self.model = torch.nn.Sequential(self.encoding, self.decoder)
-        self.print_trainable_params()
         
         if self.track_collisions:
             self.tracker = CollisionTracker(
@@ -342,6 +355,22 @@ class GridNGPOurs(BaseNet):
         self.locked_pose_indices = set()
         self._pose_key_to_id = dict()
         logger.info(f"Initialized {self.num_poses} pose variables (optimize={self.optimize_pose}).")
+        
+    def print_summary(self):
+        total = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        logger.info(
+            f"\n{'='*40}\n"
+            f" GridNGPOurs\n"
+            f"   * Levels              : {self.n_levels}\n"
+            f"   * Features/level      : {self.n_features_per_level}\n"
+            f"   * Hash table size     : 2^{self.log2_hashmap_size} = {2**self.log2_hashmap_size:,}\n"
+            f"   * Base resolution     : {self.base_resolution}\n"
+            f"   * Per-level scale     : {self.per_level_scale}\n"
+            f"   * Hidden layers       : {self.n_hidden_layers}\n"
+            f"   * Neurons/layer       : {self.n_neurons}\n"
+            f"   * Trainable params    : {total:,}\n"
+            f"{'='*40}"
+        )
     
     def lock_pose(self):
         self.rotation_corrections.requires_grad_(False)
