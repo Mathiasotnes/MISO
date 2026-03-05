@@ -469,8 +469,20 @@ class GridNGPOurs(BaseNet):
         return self.encoding(x)
     
     def forward(self, x):
-        x = normalize_coordinates(x, self.bound)
-        return self.model(x)
+        x_norm = normalize_coordinates(x, self.bound)
+        
+        if self.track_occupancy:
+            with torch.no_grad():
+                occupied = self.occupancy_grid.get_occupancy(x)
+            
+            out = torch.ones(x.shape[0], self.n_output_dims, device=self.device, dtype=self.dtype)
+            
+            if occupied.any():
+                out[occupied] = self.model(x_norm[occupied])
+        else:
+            out = self.model(x_norm)
+        
+        return out
     
     def params_at_level(self, level):
         # FIXME: right now this always return the full set of params!

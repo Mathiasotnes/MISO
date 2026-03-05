@@ -163,7 +163,8 @@ def main_scannet():
     
     # Evaluate
     torch.save(hash_grid, model_path)
-    if hash_grid.track_occupancy:
+    #if hash_grid.track_occupancy:
+    if False:
         mesh = save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
     else:
         mesh = utils_sdf.save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
