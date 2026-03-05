@@ -468,21 +468,24 @@ class GridNGPOurs(BaseNet):
         x = normalize_coordinates(x, self.bound)
         return self.encoding(x)
     
+    # This is a test where I multiplied the occupancy mask with the interpolated features inspired by the 
+    # saliency map presented in "HollowNeRF". The idea is to avoid all contributions from "unimportant" voxels
+    # to the features.
+    # def forward(self, x):
+    #     x_norm = normalize_coordinates(x, self.bound)
+    #     if self.track_occupancy and self.occupancy_grid.grid.any():
+    #         with torch.no_grad():
+    #             occupied = self.occupancy_grid.get_occupancy(x)
+    #         out = torch.ones(x.shape[0], self.n_output_dims, device=self.device, dtype=self.dtype)
+    #         if occupied.any():
+    #             out[occupied] = self.model(x_norm[occupied])
+    #     else:
+    #         out = self.model(x_norm)
+    #     return out
+
     def forward(self, x):
-        x_norm = normalize_coordinates(x, self.bound)
-        
-        if self.track_occupancy:
-            with torch.no_grad():
-                occupied = self.occupancy_grid.get_occupancy(x)
-            
-            out = torch.ones(x.shape[0], self.n_output_dims, device=self.device, dtype=self.dtype)
-            
-            if occupied.any():
-                out[occupied] = self.model(x_norm[occupied])
-        else:
-            out = self.model(x_norm)
-        
-        return out
+        x = normalize_coordinates(x, self.bound)
+        return self.model(x)
     
     def params_at_level(self, level):
         # FIXME: right now this always return the full set of params!
