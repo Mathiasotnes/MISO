@@ -112,34 +112,39 @@ def analyze_conflict_vs_T(
 
         c = c_grad_t.cpu().numpy()
 
+        # Average C_eff across all layers and hash table entries
+        c_eff_avg = float(tracker.C_eff.mean().item())
+
         with open(metrics_path, 'r') as f:
             metrics = json.load(f)
 
         rows.append({
-            'T'             : T,
-            'min'           : c.min(),
-            'max'           : c.max(),
-            'mean'          : c.mean(),
-            'std'           : c.std(),
-            'chamfer_l2'    : metrics.get('Chamfer_L2 (cm)', float('nan')),
-            'f_score'       : metrics.get('F-score (%)',    float('nan')),
+            'T'          : T,
+            'c_grad_avg' : c.mean(),
+            'c_grad_std' : c.std(),
+            'c_eff_avg'  : c_eff_avg,
+            'chamfer_l2' : metrics.get('Chamfer_L2 (cm)', float('nan')),
+            'f_score'    : metrics.get('F-score (%)',     float('nan')),
+            'precision'  : metrics.get('Precision (%)',   float('nan')),
+            'recall'     : metrics.get('Recall (%)',      float('nan')),
         })
 
         del hash_grid, tracker, verts_t, c_grad_t
         torch.cuda.empty_cache()
 
     # Print table
-    w = 110
+    w = 130
     print("\n" + "=" * w)
     print(
-        f"{'T':>4} | {'2^T':>12} | {'C_grad min':>12} | {'C_grad max':>12} | {'C_grad mean':>12} | "
-        f"{'std':>10} | {'Chamfer-L2':>12} | {'F-Score':>12}"
+        f"{'T':>4} | {'2^T':>12} | {'C_grad avg':>12} | {'C_grad std':>12} | {'C_eff avg':>12} | "
+        f"{'Chamfer-L2':>12} | {'F-Score':>12} | {'Precision':>12} | {'Recall':>12}"
     )
     print("-" * w)
     for r in rows:
         print(
-            f"{r['T']:>4} | {2**r['T']:>12,} | {r['min']:>12.2f} | {r['max']:>12.2f} | "
-            f"{r['mean']:>12.2f} | {r['std']:>10.4f} | {r['chamfer_l2']:>12.2f} | {r['f_score']:>12.2f}"
+            f"{r['T']:>4} | {2**r['T']:>12,} | {r['c_grad_avg']:>12.2f} | {r['c_grad_std']:>12.4f} | "
+            f"{r['c_eff_avg']:>12.2f} | {r['chamfer_l2']:>12.2f} | {r['f_score']:>12.2f} | "
+            f"{r['precision']:>12.2f} | {r['recall']:>12.2f}"
         )
     print("=" * w + "\n")
 
@@ -230,7 +235,7 @@ def _plot_conflict_vs_metrics(rows: list, save_path: str):
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"Saved → {save_path}")
-
+    
 
 ###############################################################
 # Entry Point
