@@ -113,7 +113,7 @@ def analyze_conflict_vs_T(
         c = c_grad_t.cpu().numpy()
 
         # Average C_eff across all layers and hash table entries
-        c_eff_avg = float(tracker.C_eff.mean().item())
+        c_eff_avg = float(tracker.C_eff.float().mean().item())
 
         with open(metrics_path, 'r') as f:
             metrics = json.load(f)
