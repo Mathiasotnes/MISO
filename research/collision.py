@@ -205,7 +205,7 @@ def _plot_conflict_vs_metrics(rows: list, save_path: str):
     ax = axes[1, 0]
     ax.scatter(c_means, chamfer, c=T_vals, cmap='viridis', s=60, zorder=3)
     for r in rows:
-        ax.annotate(f"T={r['T']}", (r['mean'], r['chamfer_l2']),
+        ax.annotate(f"T={r['T']}", (r['c_grad_avg'], r['chamfer_l2']),
                     textcoords="offset points", xytext=(5, 3), fontsize=7)
     z = np.polyfit(c_means, chamfer, 1)
     xline = np.linspace(c_means.min(), c_means.max(), 100)
@@ -220,7 +220,7 @@ def _plot_conflict_vs_metrics(rows: list, save_path: str):
     sc = ax.scatter(c_means, f_scores, c=T_vals, cmap='viridis', s=60, zorder=3)
     fig.colorbar(sc, ax=ax, label='$\log_2(T)$')
     for r in rows:
-        ax.annotate(f"T={r['T']}", (r['mean'], r['f_score']),
+        ax.annotate(f"T={r['T']}", (r['c_grad_avg'], r['f_score']),
                     textcoords="offset points", xytext=(5, 3), fontsize=7)
     z = np.polyfit(c_means, f_scores, 1)
     xline = np.linspace(c_means.min(), c_means.max(), 100)
