@@ -22,7 +22,8 @@ parser.add_argument('--pose_init', type=str, default='gt')  # reg_icp OR kiss_ic
 parser.add_argument('--scannet_root', type=str, default='../../data/ScanNet/scans')
 parser.add_argument('--scene', type=str, default='0000_00')
 parser.add_argument('--log2_hashmap_size', type=int, default=15, help='Log2 of hash table size T (e.g. 10 for T=2^10)')
-parser.add_argument('--track_occupancy', type=lambda x: x.lower() != 'false', default=True, help='Follow with "true" or "false", defaults to True')
+parser.add_argument('--track_occupancy', action='store_true', help='Enable occupancy tracking')
+parser.add_argument('--track_saliency', action='store_true', help='Enable saliency map')
 
 
 ##############################################
@@ -54,6 +55,7 @@ def initialize_scannet(args):
         dtype=torch.float32, 
         track_collisions=True,
         track_occupancy=args.track_occupancy,
+        track_saliency=args.track_saliency,
         n_levels = 16,
         n_features_per_level = 2,
         log2_hashmap_size = args.log2_hashmap_size,
@@ -67,7 +69,7 @@ def initialize_scannet(args):
     
     return cfg, hash_grid, dataset
 
-def mapping(cfg, hash_grid:BaseNet, dataset:SubmapDataset, track_occupancy=True):
+def mapping(cfg, hash_grid:BaseNet, dataset:SubmapDataset, track_occupancy=False):
     frame_start = 0  
     frame_end = dataset.num_kfs
     mapper = Mapper(
@@ -163,8 +165,7 @@ def main_scannet():
     
     # Evaluate
     torch.save(hash_grid, model_path)
-    #if hash_grid.track_occupancy:
-    if False:
+    if hash_grid.track_occupancy:
         mesh = save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
     else:
         mesh = utils_sdf.save_mesh(hash_grid, hash_grid.bound, save_path=mesh_path)
