@@ -121,9 +121,7 @@ class SaliencyGrid(nn.Module):
     
     def sparsity(self) -> torch.Tensor:
         """ ||sigmoid(G)||_1 — the quantity we want to be < C. """
-        total = self.Nx * self.Ny * self.Nz
-        target = self.C * total
-        return torch.sigmoid(self.grid).sum() - target
+        return torch.sigmoid(self.grid).mean() - self.C
     
     def admm_loss(self) -> torch.Tensor:
         """
