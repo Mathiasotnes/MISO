@@ -30,7 +30,7 @@ class SaliencyGrid(nn.Module):
             bound: torch.Tensor,
             res: float = 0.1,
             C: float = 0.1,
-            rho: float = 0.1,
+            rho: float = 1e-3,
             device: str = 'cuda:0'
         ):
         super().__init__()
