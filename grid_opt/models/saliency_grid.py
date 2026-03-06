@@ -25,7 +25,7 @@ class SaliencyGrid(nn.Module):
     saliency weights are all sigmoid(1) ≈ 0.73, i.e. close to 1.
     """
 
-    def __init__(self, bound: torch.Tensor, res: float = 0.05, device: str = 'cuda:0'):
+    def __init__(self, bound: torch.Tensor, res: float = 0.1, device: str = 'cuda:0'):
         super().__init__()
         self.bound = bound
         self.res = res
