@@ -25,10 +25,19 @@ class SaliencyGrid(nn.Module):
     saliency weights are all sigmoid(1) ≈ 0.73, i.e. close to 1.
     """
 
-    def __init__(self, bound: torch.Tensor, res: float = 0.1, device: str = 'cuda:0'):
+    def __init__(
+            self, 
+            bound: torch.Tensor,
+            res: float = 0.1,
+            C: float = 0.1,
+            rho: float = 0.1,
+            device: str = 'cuda:0'
+        ):
         super().__init__()
-        self.bound = bound
-        self.res = res
+        self.bound  = bound
+        self.res    = res
+        self.C      = C      # sparsity target: fraction of non-zero voxels
+        self.rho    = rho    # learning rate for dual variable γ
         self.device = device
         
         self.Nx = math.ceil((bound[0, 1] - bound[0, 0]) / res)
@@ -42,6 +51,9 @@ class SaliencyGrid(nn.Module):
             dtype=torch.int32, device=device
         )  # (8, 3)
         self.register_buffer("corner_offsets", offsets)
+        
+        # Dual variable γ used for sparsity ADMM regularization
+        self.register_buffer('gamma', torch.tensor(0.0, device=device))
         
         self.print_summary()
         
@@ -106,6 +118,30 @@ class SaliencyGrid(nn.Module):
 
         interpolated = (weights * corner_vals).sum(dim=1)   # (M,)
         return torch.sigmoid(interpolated).unsqueeze(-1)    # (M, 1)
+    
+    def sparsity(self) -> torch.Tensor:
+        """ ||sigmoid(G)||_1 — the quantity we want to be < C. """
+        total = self.Nx * self.Ny * self.Nz
+        target = self.C * total
+        return torch.sigmoid(self.grid).sum() - target
+    
+    def admm_loss(self) -> torch.Tensor:
+        """
+        Augmented Lagrangian term to add to the main loss.
+        see HollowNeRF for details: https://arxiv.org/abs/2308.10122
+        """
+        s = self.sparsity()
+        # (ρ/2) * [s]²₊  +  γ * s
+        penalty = (self.rho / 2.0) * torch.clamp(s, min=0.0) ** 2
+        lagrangian = self.gamma.detach() * s   # detach γ — it's updated separately
+        return penalty + lagrangian
+    
+    @torch.no_grad()
+    def update_gamma(self):
+        s = self.sparsity()
+        self.gamma.clamp_(min=0.0)
+        self.gamma.add_(self.rho * s)
+        self.gamma.clamp_(min=0.0)
     
     def print_summary(self):
         params = sum(p.numel() for p in self.parameters() if p.requires_grad)

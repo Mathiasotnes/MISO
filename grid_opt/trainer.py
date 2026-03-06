@@ -212,13 +212,20 @@ class Trainer(object):
                 single_loss = loss.mean()
                 total_loss += single_loss
 
+            if isinstance(self.model, GridNGPOurs):
+                if self.model.track_saliency:
+                    total_loss += self.model.saliency_grid.admm_loss()
+
             # Backward step
             if not torch.isnan(total_loss):
                 total_loss.backward(retain_graph=False)
                 self.optimizer.step()
-                if isinstance(self.model, GridNGPOurs):
+                
+                if isinstance(self.model, GridNGPOurs):    
                     if self.model.track_collisions:
                         self.model.tracker.update()
+                    if self.model.track_saliency:
+                        self.model.saliency_grid.update_gamma()
             else:
                 logger.warning(f"Loss at epoch {epoch} is nan! Skip backward step.")
 
