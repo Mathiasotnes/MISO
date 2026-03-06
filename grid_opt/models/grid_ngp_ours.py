@@ -195,7 +195,7 @@ class GridNGPOurs(BaseNet):
             self.occupancy_grid = OccupancyGrid(device=self.device, bound=self.bound)
             
         if self.track_saliency:
-            self.saliency_grid = SaliencyGrid(res=64, device=self.device, bound=self.bound)
+            self.saliency_grid = SaliencyGrid(bound=self.bound, res=0.05, device=self.device)
         
         self.init_ngp(cfg)
         self.init_poses(cfg)
