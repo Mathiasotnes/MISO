@@ -43,7 +43,7 @@ class SaliencyGrid(nn.Module):
         self.Nx = math.ceil((bound[0, 1] - bound[0, 0]) / res)
         self.Ny = math.ceil((bound[1, 1] - bound[1, 0]) / res)
         self.Nz = math.ceil((bound[2, 1] - bound[2, 0]) / res)
-        self.grid = nn.Parameter(torch.full((self.Nx, self.Ny, self.Nz), -4.0, device=device))
+        self.grid = nn.Parameter(torch.ones((self.Nx, self.Ny, self.Nz), device=device))
 
         # Corner offsets for trilinear interpolation.
         offsets = torch.tensor(
