@@ -394,7 +394,7 @@ class GridNGPOurs(BaseNet):
         f = self.encoding(x_norm)
         if self.track_occupancy and self.occupancy_grid.grid.any():
             with torch.no_grad():
-                p = self.occupancy_grid.get_occupancy(x)
+                p = self.occupancy_grid.get_occupancy(x).float().unsqueeze(1)
             if p.any():
                 f = p * f
         return self.decoder(f)
