@@ -391,15 +391,13 @@ class GridNGPOurs(BaseNet):
     # to the features.
     def forward(self, x):
         x_norm = normalize_coordinates(x, self.bound)
+        f = self.encoding(x_norm)
         if self.track_occupancy and self.occupancy_grid.grid.any():
             with torch.no_grad():
-                occupied = self.occupancy_grid.get_occupancy(x)
-            out = torch.ones(x.shape[0], self.n_output_dims, device=self.device, dtype=self.dtype)
-            if occupied.any():
-                out[occupied] = self.model(x_norm[occupied])
-        else:
-            out = self.model(x_norm)
-        return out
+                p = self.occupancy_grid.get_occupancy(x)
+            if p.any():
+                f = p * f
+        return self.decoder(f)
 
     # def forward(self, x):
     #     x_norm = normalize_coordinates(x, self.bound)
