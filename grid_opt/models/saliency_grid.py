@@ -129,9 +129,8 @@ class SaliencyGrid(nn.Module):
         see HollowNeRF for details: https://arxiv.org/abs/2308.10122
         """
         s = self.sparsity()
-        # (ρ/2) * [s]²₊  +  γ * s
         penalty = (self.rho / 2.0) * torch.clamp(s, min=0.0) ** 2
-        lagrangian = self.gamma.detach() * s   # detach γ — it's updated separately
+        lagrangian = self.gamma.detach() * s
         return penalty + lagrangian
     
     @torch.no_grad()
