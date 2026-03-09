@@ -7,7 +7,6 @@ from grid_opt.slam.mapper import Mapper
 from grid_opt.utils.utils_sdf import *
 from grid_opt.configs import *
 from os.path import join
-from research.collision import analyze_disambiguation
 import grid_opt.utils.utils_scannet as utils_scannet
 import grid_opt.utils.utils_sdf as utils_sdf
 import open3d as o3d
