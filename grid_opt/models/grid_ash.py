@@ -43,7 +43,7 @@ class GridASH(BaseNet):
             
             
             ash_engine = ASHEngine(
-                key_dim=3, 
+                dim=3, # Key dimension. We want to use (x,y,z) as keys
                 capacity=self.max_voxels_per_level, 
                 device=self.device
             )
