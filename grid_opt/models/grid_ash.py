@@ -151,8 +151,7 @@ class GridASH(BaseNet):
         self.unlock_all_pose_indices()
         
     def ignore_level(self, l):
-        """Ignoring a feature level. The corresponding contribution from this level to the decoder will be set to zero.
-        """
+        """ Ignoring a feature level. The corresponding contribution from this level to the decoder will be set to zero. """
         self.ignore_level_[l] = True
         logger.warning(f"Ignore level: {self.ignore_level_}")
 
@@ -161,8 +160,7 @@ class GridASH(BaseNet):
         logger.warning(f"Ignore level: {self.ignore_level_}")
 
     def lock_level(self, l):
-        """Locking (fixing) the features at level l at the current value.
-        """
+        """ Locking (fixing) the features at level l at the current value. """
         self.features[l].requires_grad = False
 
     def unlock_level(self, l):
@@ -252,8 +250,7 @@ class GridASH(BaseNet):
     
     @torch.no_grad()
     def activate_level(self, x: torch.Tensor, level: int, init_std: float = 1e-4) -> int:
-        """
-        Activate the 8 trilinear corner vertices for points x at one level.
+        """ Activate the 8 trilinear corner vertices for points x at one level.
 
         Args:
             x: (N, 3) world coordinates
@@ -410,3 +407,45 @@ class GridASH(BaseNet):
         
     def print_feature_info(self):
         logger.warning("Feature info not implemented yet for GridASH.")
+        
+    def print_ash_stats(self):
+        dim_len = self.bound[:, 1] - self.bound[:, 0] # (d,)
+
+        total_active = 0
+        total_dense = 0
+
+        lines = [
+            f"\n{'='*60}",
+            " ASH Engine Statistics",
+            f"{'='*60}",
+        ]
+
+        for l in range(self.num_levels):
+            active      = int(self.ash_engines[l].size())
+            n_cells     = torch.ceil(dim_len / self.cell_sizes[l]).long()
+            dense       = int(torch.prod(n_cells + 1).item())
+            sparsity    = 100.0 * active / dense if dense > 0 else 0.0
+
+            total_active    += active
+            total_dense     += dense
+
+            lines.extend([
+                f" Level {l}:",
+                f"   * Cell size        : {self.cell_sizes[l]:.6f}",
+                f"   * Active features  : {active:,}",
+                f"   * Dense features   : {dense:,}",
+                f"   * Sparsity         : {sparsity:.2f}%",
+                f"{'-'*60}",
+            ])
+
+        total_sparsity = 100.0 * total_active / total_dense if total_dense > 0 else 0.0
+
+        lines.extend([
+            " Total:",
+            f"   * Active features  : {total_active:,}",
+            f"   * Dense features   : {total_dense:,}",
+            f"   * Sparsity         : {total_sparsity:.2f}%",
+            f"{'='*60}",
+        ])
+
+        logger.info("\n".join(lines))

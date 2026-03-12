@@ -833,7 +833,9 @@ class MisoLossMappingBase(BaseLoss):
             with torch.no_grad():
                 valid_mask = (gt_sdf_valid.squeeze(-1) == 1)
                 if valid_mask.any():
-                    model.activate_features(coords_world[valid_mask])
+                    activated = model.activate_features(coords_world[valid_mask])
+                    logger.info("Activated features: {}".format(activated))
+                    
             
         pred_dict = self.query_model(model, coords_world)
         pred_sdf  = pred_dict['sdf']

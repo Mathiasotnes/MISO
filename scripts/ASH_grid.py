@@ -89,7 +89,8 @@ def main_scannet():
     mapping(cfg, ash_grid, dataset)
     
     # Evaluate
-    torch.save(ash_grid, model_path)
+    ash_grid.print_ash_stats()
+    # torch.save(ash_grid, model_path) # The ASHEngine doesn't want to get pickled, so we need to figure out how to save it.
     mesh = utils_sdf.save_mesh(ash_grid, ash_grid.bound, save_path=mesh_path)
     gt_mesh_path = join(args.scannet_root, f"scene{args.scene}/scene{args.scene}_vh_clean.ply")
     
