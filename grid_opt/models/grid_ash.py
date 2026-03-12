@@ -59,6 +59,8 @@ class GridASH(BaseNet):
             self.ash_engines.append(ash_engine)
             self.features.append(feat)
             
+            self.encoding = None # TODO: Implement!
+            
         self.ignore_level_ = np.zeros(self.n_levels).astype(bool)
 
     def init_decoder(self, cfg):
@@ -143,12 +145,10 @@ class GridASH(BaseNet):
     def lock_level(self, l):
         """Locking (fixing) the features at level l at the current value.
         """
-        for param in self.features[l].parameters():
-            param.requires_grad = False
+        self.features[l].requires_grad = False
 
     def unlock_level(self, l):
-        for param in self.features[l].parameters():
-            param.requires_grad = True
+        self.features[l].requires_grad = True
 
     def lock_feature(self):
         for level in range(self.n_levels):
