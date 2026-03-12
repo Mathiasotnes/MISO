@@ -1,6 +1,7 @@
 import argparse
 import numpy as np
 import json
+from grid_opt.models.grid_ash import GridASH
 from grid_opt.utils.utils_eval import compute_chamfer_metrics, sample_points_from_mesh
 from grid_opt.datasets.submap_dataset import SubmapDataset
 from grid_opt.slam.mapper import Mapper
@@ -44,7 +45,7 @@ def initialize_scannet(args):
     dataset = utils_scannet.create_scannet_dataset(args.scannet_root, args.scene, n_rays=cfg['sample']['n_rays'], frame_downsample=1)
     cfg = create_configs_scannet(args, dataset)
 
-    ash_grid = GridASH(cfg['model'], device=cfg['device'], dtype=torch.float32) 
+    ash_grid = GridASH(cfg['model'], device=cfg['device'], dtype=torch.float32)
     ash_grid.to(cfg['device'])
     
     return cfg, ash_grid, dataset

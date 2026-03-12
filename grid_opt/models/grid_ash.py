@@ -1,6 +1,7 @@
 import numpy as np
 import math
 import torch
+import torch.nn as nn
 from .base_net import BaseNet
 from .modules import MLPNet
 from .grid_modules import *
@@ -16,7 +17,8 @@ class GridASH(BaseNet):
         device = 'cuda:0',
         dtype = torch.float32,
     ):
-        super(GridASH, self).__init__(cfg, device, dtype)        
+        super(GridASH, self).__init__(cfg, device, dtype)    
+        assert self.d == 3, "Currently only 3D ASH grid is supported!"    
         self.init_grid(cfg)
         self.init_decoder(cfg)
         self.init_poses(cfg)
@@ -27,14 +29,33 @@ class GridASH(BaseNet):
         self.base_cell_size = cfg['grid']['base_cell_size']
         self.scale_factor = cfg['grid']['per_level_scale']
         self.fdim = cfg['grid']['feature_dim']
+        self.cell_sizes = []
+        self.features = nn.ParameterList()
+        self.ash_engines = nn.ModuleList()
         
-        # TODO: Initialize empty ASH hash grid for each level.
-
+        self.max_voxels_per_level = int(1e6)  # TODO: make this configurable
+        
         for level in range(self.n_levels):
             cell_size = self.base_cell_size / (self.scale_factor**level)
             self.cell_sizes.append(cell_size)
-            grid = ...
-            self.features.append(grid)
+            
+            
+            ash_engine = ASHEngine(
+                key_dim=3, 
+                capacity=self.max_voxels_per_level, 
+                device=self.device
+            )
+            
+            feat = nn.Parameter(
+                torch.zeros(
+                    self.max_voxels_per_level,
+                    self.fdim,
+                    device=self.device
+                )
+            )
+            
+            self.ash_engines.append(ash_engine)
+            self.features.append(feat)
             
         self.ignore_level_ = np.zeros(self.n_levels).astype(bool)
 
@@ -77,17 +98,24 @@ class GridASH(BaseNet):
         logger.info(f"Initialized {self.num_poses} pose variables (optimize={self.optimize_pose}).")
         
     def print_summary(self):
-        total = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        decoder_params = sum(p.numel() for p in self.decoder.parameters())
+        encoding_params = sum(p.numel() for p in self.features)
         logger.info(
-            f"\n{'='*40}\n"
+            f"\n{'='*60}\n"
             f" GridASH\n"
-            f"   * Levels              : {self.n_levels}\n"
-            f"   * Base cell size      : {self.base_cell_size}\n"
-            f"   * Per-level scale     : {self.scale_factor}\n"
-            f"   * Hidden layers       : {self.decoder_hidden_dim}\n"
-            f"   * Neurons/layer       : {self.decoder_hidden_layers}\n"
-            f"   * Trainable params    : {total:,}\n"
-            f"{'='*40}"
+            f"   * Encoding levels          : {self.n_levels}\n"
+            f"   * Encoding feature dim     : {self.fdim}\n"
+            f"   * Base cell size           : {self.base_cell_size}\n"
+            f"   * Per-level scale          : {self.scale_factor}\n"
+            f"   * Decoder hidden layers    : {self.decoder_hidden_dim}\n"
+            f"   * Decoder hidden dim       : {self.decoder_hidden_layers}\n"
+            f"{'='*60}"
+            f"   * Trainable params         : {total_trainable:,}\n"
+            f"{'='*60}"
+            f"   * Encoding params          : {encoding_params:,}\n"
+            f"   * Decoder params           : {decoder_params:,}\n"
+            f"{'='*60}"
         )
     
     def lock_pose(self):
@@ -200,4 +228,4 @@ class GridASH(BaseNet):
         logger.info(f"GridNet KF pose corrections: max_rot={math.degrees(max_rot):.3f}deg, max_tran={max_tran:.3f}m.")
         
     def print_feature_info(self):
-        logger.warning("Feature info not implemented yet for GridNGPOurs.")
+        logger.warning("Feature info not implemented yet for GridASH.")
