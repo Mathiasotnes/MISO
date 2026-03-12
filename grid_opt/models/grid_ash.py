@@ -60,9 +60,26 @@ class GridASH(BaseNet):
             self.ash_engines.append(ash_engine)
             self.features.append(feat)
             
-            self.encoding = None # TODO: Implement!
-            
         self.ignore_level_ = np.zeros(self.num_levels).astype(bool)
+        
+        # For trilinear interpolation calculations
+        self.register_buffer(
+            'corner_offsets',
+            torch.tensor(
+                [
+                    [0, 0, 0],
+                    [1, 0, 0],
+                    [0, 1, 0],
+                    [1, 1, 0],
+                    [0, 0, 1],
+                    [1, 0, 1],
+                    [0, 1, 1],
+                    [1, 1, 1],
+                ],
+                dtype=torch.int32,
+                device=self.device,
+            )
+        )
 
     def init_decoder(self, cfg):
         self.decoder_hidden_dim = cfg['decoder']['hidden_dim']
@@ -113,8 +130,8 @@ class GridASH(BaseNet):
             f"   * Encoding feature dim     : {self.fdim}\n"
             f"   * Base cell size           : {self.base_cell_size}\n"
             f"   * Per-level scale          : {self.scale_factor}\n"
-            f"   * Decoder hidden layers    : {self.decoder_hidden_dim}\n"
-            f"   * Decoder hidden dim       : {self.decoder_hidden_layers}\n"
+            f"   * Decoder hidden layers    : {self.decoder_hidden_layers}\n"
+            f"   * Decoder hidden dim       : {self.decoder_hidden_dim}\n"
             f"{'='*60}\n"
             f"   * Trainable params         : {total_trainable:,}\n"
             f"{'='*60}\n"
@@ -233,17 +250,158 @@ class GridASH(BaseNet):
         kf_id = self.pose_key_to_id(kf_key)
         return self.updated_kf_pose(kf_id)
     
+    @torch.no_grad()
+    def activate_level(self, x: torch.Tensor, level: int, init_std: float = 1e-4) -> int:
+        """
+        Activate the 8 trilinear corner vertices for points x at one level.
+
+        Args:
+            x: (N, 3) world coordinates
+            level: grid level
+        Returns:
+            number of newly inserted vertices
+        """
+        assert x.ndim == 2 and x.shape[1] == 3
+
+        cell_size = self.cell_sizes[level]
+        x_grid = x / cell_size
+        base = torch.floor(x_grid).to(torch.int32)  # (N,3)
+
+        # 8 corner lattice coordinates
+        corner_coords = base[:, None, :] + self.corner_offsets[None, :, :]   # (N,8,3)
+        corner_coords = corner_coords.reshape(-1, 3)                          # (N*8,3)
+        corner_coords = torch.unique(corner_coords, dim=0)
+
+        indices, masks = self.ash_engines[level].find(corner_coords)
+        new_coords = corner_coords[~masks]
+
+        if new_coords.numel() == 0:
+            return 0
+
+        self.ash_engines[level].insert_keys(new_coords)
+
+        new_indices, new_masks = self.ash_engines[level].find(new_coords)
+        assert new_masks.all()
+
+        if init_std > 0:
+            self.features[level].data[new_indices].normal_(mean=0.0, std=init_std)
+        else:
+            self.features[level].data[new_indices].zero_()
+
+        return int(new_coords.shape[0])
+
+    @torch.no_grad()
+    def activate_features(self, x: torch.Tensor, init_std: float = 1e-4):
+        """
+        Activate all levels for queried world coordinates.
+        Returns list of inserted counts per level.
+        """
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        x = x.to(self.device, dtype=self.dtype)
+
+        inserted = []
+        for level in range(self.num_levels):
+            inserted.append(self.activate_level(x, level, init_std=init_std))
+        return inserted
+    
+    def _query_feature_level(self, x: torch.Tensor, level: int) -> torch.Tensor:
+        """ 
+        Trilinearly interpolate features from one level. Looks up voxels in the ASH engine.
+
+        Args:
+            x: (N, 3) world coordinates
+
+        Returns:
+            f_level: (N, fdim)
+        """
+        assert x.ndim == 2 and x.shape[1] == 3, f"Expected x to have shape (N,3), got {x.shape}"
+
+        if self.ignore_level_[level]:
+            return torch.zeros(x.shape[0], self.fdim, device=self.device, dtype=self.dtype)
+
+        cell_size = self.cell_sizes[level]
+
+        # Convert world coordinates to grid coordinates
+        x_grid = x / cell_size  # (N, 3), float
+        base = torch.floor(x_grid).to(torch.int32)  # (N, 3)
+        frac = (x_grid - base.to(x_grid.dtype)).to(self.dtype)  # (N, 3) in [0,1)
+
+        # 8 corner coordinates for each query point
+        # shape: (N, 8, 3)
+        corner_coords = base[:, None, :] + self.corner_offsets[None, :, :]
+        corner_coords_flat = corner_coords.reshape(-1, 3)  # (N*8, 3)
+
+        # Query ASH
+        corner_indices, corner_masks = self.ash_engines[level].find(corner_coords_flat)
+        # corner_indices: (N*8,)
+        # corner_masks:   (N*8,)
+
+        N = x.shape[0]
+
+        # Features that's not found in ASH gets set to 0.
+        # Not sure if this is the behavior we want.
+        safe_indices = corner_indices.clone()
+        safe_indices[~corner_masks] = 0
+        corner_feats = self.features[level][safe_indices] # (N*8, fdim)
+        corner_feats = corner_feats.view(N, 8, self.fdim) # (N, 8, fdim)
+        corner_masks = corner_masks.view(N, 8)
+        corner_feats = corner_feats * corner_masks.unsqueeze(-1).to(corner_feats.dtype)
+
+        # Trilinear weights
+        fx = frac[:, 0]
+        fy = frac[:, 1]
+        fz = frac[:, 2]
+
+        weights = torch.stack(
+            [
+                (1 - fx) * (1 - fy) * (1 - fz),  # 000
+                fx * (1 - fy) * (1 - fz),        # 100
+                (1 - fx) * fy * (1 - fz),        # 010
+                fx * fy * (1 - fz),              # 110
+                (1 - fx) * (1 - fy) * fz,        # 001
+                fx * (1 - fy) * fz,              # 101
+                (1 - fx) * fy * fz,              # 011
+                fx * fy * fz,                    # 111
+            ],
+            dim=1
+        )  # (N, 8)
+
+        # Missing corners should not contribute
+        valid_weights = weights * corner_masks.to(weights.dtype)  # (N, 8)
+
+        # Weighted sum
+        f_level = (corner_feats * valid_weights.unsqueeze(-1)).sum(dim=1)  # (N, fdim)
+
+        # Renormalize over existing corners only
+        weight_sum = valid_weights.sum(dim=1, keepdim=True)  # (N, 1)
+        has_any = weight_sum.squeeze(-1) > 0
+
+        out = torch.zeros_like(f_level)
+        out[has_any] = f_level[has_any] / weight_sum[has_any].clamp_min(1e-12)
+
+        return out
+    
     def query_feature(self, x):
-        logger.warning("Query_feature() not implemented yet for GridASH.")
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+
+        assert x.ndim == 2 and x.shape[1] == 3, f"Expected x to have shape (N,3), got {x.shape}"
+        x = x.to(device=self.device, dtype=self.dtype)
+
+        level_features = []
+        for level in range(self.num_levels):
+            f_level = self._query_feature_level(x, level)
+            level_features.append(f_level)
+
+        return torch.cat(level_features, dim=-1)
     
     def forward(self, x):
-        # TODO: Fix this once encoding is implemented
-        f = self.encoding(x)
+        f = self.query_feature(x)
         return self.decoder(f)
     
     def params_at_level(self, level):
-        # FIXME: right now this always return the full set of params!
-        return list(self.encoding.parameters())
+        return [self.features[level]]
     
     def print_kf_pose_info(self):
         max_rot = torch.max(torch.linalg.norm(self.rotation_corrections, dim=1))

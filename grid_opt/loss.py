@@ -826,6 +826,15 @@ class MisoLossMappingBase(BaseLoss):
                 R_world_frame,
                 t_world_frame
             )
+            
+        # The GridASH inserts points dynamically. This is done before the 
+        # forward pass so that the newly inserted points will also be supervised.
+        if isinstance(model, GridASH) and model.training:
+            with torch.no_grad():
+                valid_mask = (gt_sdf_valid.squeeze(-1) == 1)
+                if valid_mask.any():
+                    model.activate_features(coords_world[valid_mask])
+            
         pred_dict = self.query_model(model, coords_world)
         pred_sdf  = pred_dict['sdf']
         # Compute main SDF-based loss
