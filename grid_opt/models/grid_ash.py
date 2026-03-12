@@ -8,6 +8,8 @@ from .grid_modules import *
 import grid_opt.utils.utils_geometry as utils_geometry
 import logging
 
+from ash.core import ASHEngine
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
