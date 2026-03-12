@@ -130,13 +130,33 @@ class GridASH(BaseNet):
         self.translation_corrections.requires_grad_(True)
         self.unlock_all_pose_indices()
         
-    def lock_feature(self):
-        for param in self.encoding.parameters():
+    def ignore_level(self, l):
+        """Ignoring a feature level. The corresponding contribution from this level to the decoder will be set to zero.
+        """
+        self.ignore_level_[l] = True
+        logger.warning(f"Ignore level: {self.ignore_level_}")
+
+    def include_level(self, l):
+        self.ignore_level_[l] = False
+        logger.warning(f"Ignore level: {self.ignore_level_}")
+
+    def lock_level(self, l):
+        """Locking (fixing) the features at level l at the current value.
+        """
+        for param in self.features[l].parameters():
             param.requires_grad = False
+
+    def unlock_level(self, l):
+        for param in self.features[l].parameters():
+            param.requires_grad = True
+
+    def lock_feature(self):
+        for level in range(self.n_levels):
+            self.lock_level(level)
     
     def unlock_feature(self):
-        for param in self.encoding.parameters():
-            param.requires_grad = True
+        for level in range(self.n_levels):
+            self.unlock_level(level)
     
     def lock_pose_index(self, pose_index:int):
         self.locked_pose_indices.add(pose_index)
