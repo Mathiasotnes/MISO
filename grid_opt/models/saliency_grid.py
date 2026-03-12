@@ -8,6 +8,12 @@ logger.setLevel(logging.INFO)
 
 class SaliencyGrid(nn.Module):
     """
+    --------------------------------------------------------------------
+    NOTE (Mathias): 
+    This is not finished, and will likely not be worked more on. It's a possible direction for improving InstantNGP, 
+    but my work is gonna focus on explicit hash grids instead of implicit ones, so I'm leaving this as-is for now.
+    --------------------------------------------------------------------
+    
     Trainable 3D saliency grid as described in HollowNeRF.
 
     A Nx*Ny*Nz tensor of learnable scalar weights is trained alongside the
