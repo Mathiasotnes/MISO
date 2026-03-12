@@ -24,6 +24,7 @@ class GridASH(BaseNet):
         self.init_grid(cfg)
         self.init_decoder(cfg)
         self.init_poses(cfg)
+        self.print_summary()
 
     def init_grid(self, cfg):
         self.num_levels = cfg['grid']['n_levels']
