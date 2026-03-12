@@ -36,7 +36,7 @@ class GridASH(BaseNet):
         self.features = nn.ParameterList()
         self.ash_engines = nn.ModuleList()
         
-        self.max_voxels_per_level = int(1e6)  # TODO: make this configurable
+        self.max_voxels_per_level = [int(3_000), int(80_000)]  # TODO: make this configurable
         
         for level in range(self.num_levels):
             cell_size = self.base_cell_size / (self.scale_factor**level)
@@ -45,13 +45,13 @@ class GridASH(BaseNet):
             
             ash_engine = ASHEngine(
                 dim=3, # Key dimension. We want to use (x,y,z) as keys
-                capacity=self.max_voxels_per_level, 
+                capacity=self.max_voxels_per_level[level], 
                 device=self.device
             )
             
             feat = nn.Parameter(
                 torch.zeros(
-                    self.max_voxels_per_level,
+                    self.max_voxels_per_level[level],
                     self.fdim,
                     device=self.device
                 )
