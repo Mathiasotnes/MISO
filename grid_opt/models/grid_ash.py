@@ -26,7 +26,7 @@ class GridASH(BaseNet):
         self.init_poses(cfg)
 
     def init_grid(self, cfg):
-        self.n_levels = cfg['grid']['n_levels']
+        self.num_levels = cfg['grid']['n_levels']
         self.second_order_grid_sample = 'second_order_grid_sample' in cfg['grid'] and cfg['grid']['second_order_grid_sample']
         self.base_cell_size = cfg['grid']['base_cell_size']
         self.scale_factor = cfg['grid']['per_level_scale']
@@ -37,7 +37,7 @@ class GridASH(BaseNet):
         
         self.max_voxels_per_level = int(1e6)  # TODO: make this configurable
         
-        for level in range(self.n_levels):
+        for level in range(self.num_levels):
             cell_size = self.base_cell_size / (self.scale_factor**level)
             self.cell_sizes.append(cell_size)
             
@@ -61,13 +61,13 @@ class GridASH(BaseNet):
             
             self.encoding = None # TODO: Implement!
             
-        self.ignore_level_ = np.zeros(self.n_levels).astype(bool)
+        self.ignore_level_ = np.zeros(self.num_levels).astype(bool)
 
     def init_decoder(self, cfg):
         self.decoder_hidden_dim = cfg['decoder']['hidden_dim']
         self.decoder_hidden_layers = cfg['decoder']['hidden_layers']
         self.decoder_out_dim = cfg['decoder']['out_dim']
-        input_dim = self.n_levels * self.fdim
+        input_dim = self.num_levels * self.fdim
         
         logger.debug(f"Using MLP decoder.")
         self.decoder = MLPNet(
@@ -108,7 +108,7 @@ class GridASH(BaseNet):
         logger.info(
             f"\n{'='*60}\n"
             f" GridASH\n"
-            f"   * Encoding levels          : {self.n_levels}\n"
+            f"   * Encoding levels          : {self.num_levels}\n"
             f"   * Encoding feature dim     : {self.fdim}\n"
             f"   * Base cell size           : {self.base_cell_size}\n"
             f"   * Per-level scale          : {self.scale_factor}\n"
@@ -151,11 +151,11 @@ class GridASH(BaseNet):
         self.features[l].requires_grad = True
 
     def lock_feature(self):
-        for level in range(self.n_levels):
+        for level in range(self.num_levels):
             self.lock_level(level)
     
     def unlock_feature(self):
-        for level in range(self.n_levels):
+        for level in range(self.num_levels):
             self.unlock_level(level)
     
     def lock_pose_index(self, pose_index:int):
