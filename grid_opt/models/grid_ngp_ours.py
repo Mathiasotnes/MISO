@@ -203,6 +203,10 @@ class GridNGPOurs(BaseNet):
         
     def init_ngp(self, cfg):
         
+        ########################################
+        # Encoding network (MHE)
+        ########################################
+        
         self.encoding = MultiResHashEncoding(
             n_levels             = self.n_levels,
             n_features_per_level = self.n_features_per_level,
@@ -235,7 +239,7 @@ class GridNGPOurs(BaseNet):
         self.decoder = nn.Sequential(*decoder)
 
         ########################################
-        # Complete model
+        # Collision Tracker
         ########################################
         
         if self.track_collisions:
