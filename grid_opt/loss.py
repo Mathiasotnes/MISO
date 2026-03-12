@@ -7,7 +7,6 @@ from .models.grid_net import GridNet
 from .models.grid_ngp import GridNGP
 from .models.grid_ngp_ours import GridNGPOurs
 from .models.neural_points import NeuralPoints
-from .models.neural_points_hash import NeuralPointsHash
 from .models.grid_atlas import GridAtlas
 import grid_opt.utils.utils_geometry as utils_geometry
 
@@ -805,7 +804,7 @@ class MisoLossMappingBase(BaseLoss):
         
     def compute(self, model, model_input: dict, gt: dict) -> dict:
         assert ((self.track_occupancy and isinstance(model, GridNGP)) or (self.track_occupancy and isinstance(model, GridNGPOurs))) or not self.track_occupancy, "Occupancy tracking only supported for GridNGP and GridNGPOurs."
-        assert (self.init_neural_points and (isinstance(model, NeuralPoints) or isinstance(model, NeuralPointsHash))) or not self.init_neural_points, "Neural point initialization only supported for NeuralPoints."
+        assert (self.init_neural_points and (isinstance(model, NeuralPoints))) or not self.init_neural_points, "Neural point initialization only supported for NeuralPoints."
         coords_frame = model_input['coords_frame'][0]
         sample_frame_ids = model_input['sample_frame_ids'][0, :, 0]
         sample_weights = model_input['weights'][0]
@@ -920,7 +919,7 @@ class MisoLossMapping(MisoLossMappingBase):
     """For mapping within a single submap (GridNet).
     """
     def query_kf_pose(self, model, kf_id):
-        assert isinstance(model, GridNet) or isinstance(model, GridNGP) or isinstance(model, GridNGPOurs) or isinstance(model, NeuralPoints) or isinstance(model, NeuralPointsHash), f"Invalid model type {type(model)}."
+        assert isinstance(model, GridNet) or isinstance(model, GridNGP) or isinstance(model, GridNGPOurs) or isinstance(model, NeuralPoints), f"Invalid model type {type(model)}."
         return model.updated_kf_pose_from_key(f'KF{kf_id}')
     
 

@@ -130,7 +130,6 @@ def main_scannet():
     args = parser.parse_args()
     model_path      = join(args.save_dir, 'hash_grid.pth')
     mesh_path       = join(args.save_dir, 'hash_pred_mesh.ply')
-    tracker_path    = join(args.save_dir, f'tracker.pt')
     metrics_path    = join(args.save_dir, f'metrics.json')
     cfg, hash_grid, dataset = initialize_scannet(args)
     
@@ -148,8 +147,12 @@ def main_scannet():
     verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
     verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
     
-    metrics_results = compute_chamfer_metrics(verts_pred, verts_trgt, threshold=0.05)
+    metrics_results = compute_chamfer_metrics(verts_pred, verts_trgt, threshold=0.05, truncation_acc=0.50, truncation_com=0.50)
     print(json.dumps(metrics_results, indent=4))
+    
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics_results, f, indent=4)
+    print(f"Saved metrics → {metrics_path}")
 
 if __name__ == "__main__":
     main_scannet()

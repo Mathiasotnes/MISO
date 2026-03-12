@@ -4,6 +4,8 @@ import math
 import torch
 import torch.nn as nn
 from .collision_tracker import CollisionTracker
+from .occupancy_grid import OccupancyGrid
+from .saliency_grid import SaliencyGrid
 from .base_net import BaseNet
 from .grid_modules import *
 import grid_opt.utils.utils_geometry as utils_geometry
@@ -33,84 +35,7 @@ def normalize_coordinates(x: torch.Tensor, bound: torch.Tensor) -> torch.Tensor:
     hi = bound[:, 1]  # (3,)
     return (x - lo) / (hi - lo)
 
-class OccupancyGrid:
-    """ A lightweight/simple occupancy grid. """
-    def __init__(self, bound, res=0.1, device='cuda:0'):
-        self.bound = bound
-        self.res = res
-        self.device = device
-        self.Nx = math.ceil((self.bound[0,1] - self.bound[0,0]) / self.res)
-        self.Ny = math.ceil((self.bound[1,1] - self.bound[1,0]) / self.res)
-        self.Nz = math.ceil((self.bound[2,1] - self.bound[2,0]) / self.res)
-        self.N = self.Nx * self.Ny * self.Nz
-        self.grid = torch.zeros(self.N, dtype=torch.bool, device=device)
-    
-    def world_to_grid(self, x: torch.Tensor) -> torch.Tensor:
-        """ Convert world coordinates to grid coordinates.
-        Args:
-            x: (N, 3) tensor of world coordinates
-        Returns:
-            (N, 3) tensor of grid coordinates
-        """
-        # in-bounds mask in world space
-        mask = (
-            (x[:, 0] >= self.bound[0, 0]) & (x[:, 0] < self.bound[0, 1]) &
-            (x[:, 1] >= self.bound[1, 0]) & (x[:, 1] < self.bound[1, 1]) &
-            (x[:, 2] >= self.bound[2, 0]) & (x[:, 2] < self.bound[2, 1])
-        )
 
-        if not mask.any():
-            return None, mask
-
-        g = (x[mask] - self.bound[:, 0]) / self.res
-        g = torch.floor(g).long()
-        return g, mask
-    
-    def grid_to_index(self, g: torch.Tensor) -> torch.Tensor:
-        """ Convert grid coordinates to grid index. """
-        return g[:, 0] + self.Nx * (g[:, 1] + self.Ny * g[:, 2])
-    
-    @torch.no_grad()
-    def update(self, x: torch.Tensor, sdf: torch.Tensor, tau: float = 0.2):
-        """ Update the occupancy grid based on the input world coordinates and their corresponding SDF values.
-
-        Args:
-            x (torch.Tensor):           (N,3) tensor of world coordinates corresponding to the SDF values.
-            sdf (torch.Tensor):         (N,) tensor of SDF values corresponding to the input world coordinates.
-            tau (float, optional):      Threshold SDF value for marking cell as occupied. Defaults to 0.1.
-        """
-        sdf = sdf.view(-1)
-        occ = sdf < tau
-        
-        g = self.world_to_grid(x)
-        g, inb = self.world_to_grid(x)
-        
-        if g is None:
-            return
-        
-        valid = occ[inb]
-        if not valid.any():
-            return
-
-        idx = self.grid_to_index(g)
-        self.grid[idx[valid]] = True
-
-    
-    def get_occupancy(self, x: torch.Tensor) -> torch.Tensor:
-        """ Get the occupancy status of the grid cells corresponding to the input world coordinates.
-        Args:
-            x: (N, 3) tensor of world coordinates
-        Returns:
-            (N,) tensor of occupancy status (True for occupied, False for free)
-        """
-        g, inb = self.world_to_grid(x)
-        out = torch.zeros(x.shape[0], device=x.device, dtype=torch.bool)
-        if g is None:
-            return out
-        idx = self.grid_to_index(g)
-        out[inb] = self.grid[idx]
-        return out
-    
 class MultiResHashEncoding(nn.Module):
     """
     Multiresolution Hash Encoding as described in:
@@ -239,7 +164,8 @@ class GridNGPOurs(BaseNet):
         device = 'cuda:0',
         dtype = torch.float32,
         track_collisions = False,
-        track_occupancy = True,
+        track_occupancy = False,
+        track_saliency = False,
         n_levels = 16,
         n_features_per_level = 2,
         log2_hashmap_size = 15,
@@ -254,6 +180,7 @@ class GridNGPOurs(BaseNet):
         self.dtype = dtype
         self.track_collisions = track_collisions
         self.track_occupancy = track_occupancy
+        self.track_saliency = track_saliency
         self.n_levels = n_levels
         self.n_features_per_level = n_features_per_level
         self.log2_hashmap_size = log2_hashmap_size
@@ -262,10 +189,17 @@ class GridNGPOurs(BaseNet):
         self.n_hidden_layers = n_hidden_layers
         self.n_neurons = n_neurons
         self.n_output_dims = n_output_dims
-        self.init_ngp(cfg)
-        self.init_occupancy_grid(cfg)
-        self.init_poses(cfg)
         self.num_levels = 1 # Hack to make it compatible with old MISO trainer.py
+        
+        if self.track_occupancy:
+            self.occupancy_grid = OccupancyGrid(device=self.device, bound=self.bound)
+            
+        if self.track_saliency:
+            self.saliency_grid = SaliencyGrid(bound=self.bound, res=0.1, device=self.device)
+        
+        self.init_ngp(cfg)
+        self.init_poses(cfg)
+        self.print_summary()
         
     def init_ngp(self, cfg):
         
@@ -304,9 +238,6 @@ class GridNGPOurs(BaseNet):
         # Complete model
         ########################################
         
-        self.model = torch.nn.Sequential(self.encoding, self.decoder)
-        self.print_trainable_params()
-        
         if self.track_collisions:
             self.tracker = CollisionTracker(
                 encoding=self.encoding, 
@@ -342,6 +273,22 @@ class GridNGPOurs(BaseNet):
         self.locked_pose_indices = set()
         self._pose_key_to_id = dict()
         logger.info(f"Initialized {self.num_poses} pose variables (optimize={self.optimize_pose}).")
+        
+    def print_summary(self):
+        total = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        logger.info(
+            f"\n{'='*40}\n"
+            f" GridNGPOurs\n"
+            f"   * Levels              : {self.n_levels}\n"
+            f"   * Features/level      : {self.n_features_per_level}\n"
+            f"   * Hash table size     : 2^{self.log2_hashmap_size} = {2**self.log2_hashmap_size:,}\n"
+            f"   * Base resolution     : {self.base_resolution}\n"
+            f"   * Per-level scale     : {self.per_level_scale}\n"
+            f"   * Hidden layers       : {self.n_hidden_layers}\n"
+            f"   * Neurons/layer       : {self.n_neurons}\n"
+            f"   * Trainable params    : {total:,}\n"
+            f"{'='*40}"
+        )
     
     def lock_pose(self):
         self.rotation_corrections.requires_grad_(False)
@@ -354,11 +301,11 @@ class GridNGPOurs(BaseNet):
         self.unlock_all_pose_indices()
         
     def lock_feature(self):
-        for param in self.model.parameters():
+        for param in self.encoding.parameters():
             param.requires_grad = False
     
     def unlock_feature(self):
-        for param in self.model.parameters():
+        for param in self.encoding.parameters():
             param.requires_grad = True
     
     def lock_pose_index(self, pose_index:int):
@@ -439,13 +386,30 @@ class GridNGPOurs(BaseNet):
         x = normalize_coordinates(x, self.bound)
         return self.encoding(x)
     
+    # This is a test where I multiplied the occupancy mask with the interpolated features inspired by the 
+    # saliency map presented in "HollowNeRF". The idea is to avoid all contributions from "unimportant" voxels
+    # to the features.
     def forward(self, x):
-        x = normalize_coordinates(x, self.bound)
-        return self.model(x)
+        x_norm = normalize_coordinates(x, self.bound)
+        f = self.encoding(x_norm)
+        if self.track_occupancy and self.occupancy_grid.grid.any():
+            with torch.no_grad():
+                p = self.occupancy_grid.get_occupancy(x).float().unsqueeze(1)
+            if p.any():
+                f = p * f
+        return self.decoder(f)
+
+    # def forward(self, x):
+    #     x_norm = normalize_coordinates(x, self.bound)
+    #     f = self.encoding(x_norm)
+    #     if self.track_saliency:
+    #         p = self.saliency_grid(x)
+    #         f = p * f
+    #     return self.decoder(f)
     
     def params_at_level(self, level):
         # FIXME: right now this always return the full set of params!
-        return list(self.model.parameters())
+        return list(self.encoding.parameters())
     
     def print_kf_pose_info(self):
         max_rot = torch.max(torch.linalg.norm(self.rotation_corrections, dim=1))

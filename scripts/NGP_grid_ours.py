@@ -7,7 +7,6 @@ from grid_opt.slam.mapper import Mapper
 from grid_opt.utils.utils_sdf import *
 from grid_opt.configs import *
 from os.path import join
-from research.collision import analyze_disambiguation
 import grid_opt.utils.utils_scannet as utils_scannet
 import grid_opt.utils.utils_sdf as utils_sdf
 import open3d as o3d
@@ -22,6 +21,8 @@ parser.add_argument('--pose_init', type=str, default='gt')  # reg_icp OR kiss_ic
 parser.add_argument('--scannet_root', type=str, default='../../data/ScanNet/scans')
 parser.add_argument('--scene', type=str, default='0000_00')
 parser.add_argument('--log2_hashmap_size', type=int, default=15, help='Log2 of hash table size T (e.g. 10 for T=2^10)')
+parser.add_argument('--track_occupancy', action='store_true', help='Enable occupancy tracking')
+parser.add_argument('--track_saliency', action='store_true', help='Enable saliency map')
 
 
 ##############################################
@@ -52,7 +53,8 @@ def initialize_scannet(args):
         device=cfg['device'], 
         dtype=torch.float32, 
         track_collisions=True,
-        track_occupancy=True,
+        track_occupancy=args.track_occupancy,
+        track_saliency=args.track_saliency,
         n_levels = 16,
         n_features_per_level = 2,
         log2_hashmap_size = args.log2_hashmap_size,
@@ -66,14 +68,14 @@ def initialize_scannet(args):
     
     return cfg, hash_grid, dataset
 
-def mapping(cfg, hash_grid:BaseNet, dataset:SubmapDataset):
+def mapping(cfg, hash_grid:BaseNet, dataset:SubmapDataset, track_occupancy=False):
     frame_start = 0  
     frame_end = dataset.num_kfs
     mapper = Mapper(
         model=hash_grid,
         dataset=dataset,
         cfg=cfg,
-        track_occupancy=True # Custom parameter for NGPGrid
+        track_occupancy=track_occupancy # Custom parameter for NGPGrid
     )
     
     for kf_id in range(dataset.num_kfs):
@@ -152,7 +154,7 @@ def main_scannet():
     
     cfg, hash_grid, dataset = initialize_scannet(args)
     
-    mapping(cfg, hash_grid, dataset)
+    mapping(cfg, hash_grid, dataset, track_occupancy=args.track_occupancy)
     
     # Save collision statistics
     if hash_grid.track_collisions:
@@ -171,7 +173,7 @@ def main_scannet():
     verts_pred = sample_points_from_mesh(mesh_path, mesh_sample_point=1000000)
     verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
     
-    metrics_results = compute_chamfer_metrics(verts_pred, verts_trgt, threshold=0.05)
+    metrics_results = compute_chamfer_metrics(verts_pred, verts_trgt, threshold=0.05, truncation_acc=0.50, truncation_com=0.50)
     print(json.dumps(metrics_results, indent=4))
     
     with open(metrics_path, 'w') as f:

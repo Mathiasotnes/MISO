@@ -64,6 +64,8 @@ class CollisionTracker:
         self._voxels    = [torch.empty(0, dtype=torch.long, device=device) for _ in range(self.n_levels)]
         self._G         = [torch.empty(0, dtype=torch.float32, device=device) for _ in range(self.n_levels)]
         self._pending: list = []
+        
+        self.print_config()
 
     #########################################################
     # Hook registration
@@ -322,6 +324,23 @@ class CollisionTracker:
         tracker._G      = [g.to(device) for g in data["_G"]]
         logger.info(f"CollisionTracker loaded from {path}.")
         return tracker
+    
+    def print_config(self):
+        buffer_bytes = sum(v.numel() * 8 for v in self._voxels)   # int64 = 8 bytes
+        buffer_bytes += sum(g.numel() * 4 for g in self._G)        # float32 = 4 bytes
+        buffer_bytes += self.C_eff.numel() * 4                     # int32 = 4 bytes
+        buffer_kb = buffer_bytes / 1024
+
+        logger.info(
+            f"\n{'='*40}\n"
+            f" CollisionTracker\n"
+            f"   * Levels              : {self.n_levels}\n"
+            f"   * Hash table size     : {self.T:,}\n"
+            f"   * Features/level      : {self.F}\n"
+            f"   * Resolutions         : {self.resolutions[0].item()} → {self.resolutions[-1].item()}\n"
+            f"   * Buffer memory       ≈ {buffer_kb:.1f} KB\n"
+            f"{'='*40}"
+        )
 
     def print_summary(self):
         if self.C_pot is None:
