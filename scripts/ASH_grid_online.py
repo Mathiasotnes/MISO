@@ -84,8 +84,28 @@ def mapping(cfg, ash_grid:GridASH, dataset:SubmapDataset):
         
         model_input, gt = dataset[0]
         model_input, gt = prepare_batch(model_input, gt)
+        coords_frame = model_input['coords_frame'][0]
+        sample_frame_ids = model_input['sample_frame_ids'][0, :, 0]
+        sample_weights = model_input['weights'][0]
+        gt_sdf = gt['sdf'][0]
+        gt_sdf_valid = gt['sdf_valid'][0]
+        gt_sdf_sign = gt['sdf_signs'][0]
+        assert coords_frame.ndim == 2 and gt_sdf.ndim == 2
+        assert sample_weights.shape == gt_sdf.shape
+        # Transform coords from keyframe to world frame
+        unique_frame_ids = np.unique(sample_frame_ids.detach().cpu().numpy()).tolist()
+        coords_world = coords_frame.clone()
+        for kf_id in unique_frame_ids:
+            idxs_select = torch.nonzero(sample_frame_ids == kf_id, as_tuple=False).squeeze(1)
+            if idxs_select.numel() == 0: continue
+            R_world_frame, t_world_frame = loss_fn.query_kf_pose(ash_grid, kf_id)
+            coords_world[idxs_select, :] = utils_geometry.transform_points_to(
+                coords_frame[idxs_select, :],
+                R_world_frame,
+                t_world_frame
+            )
         
-        ash_grid.prepare_features(model_input) # This will make the features at the current frame trainable, and freeze all other features.
+        ash_grid.prepare_features(coords_world) # This will make the features at the current frame trainable, and freeze all other features.
         ash_grid.print_summary() # Just to see how many parameters are active
         
         optimizer = torch.optim.Adam(ash_grid.parameters(), lr=cfg['train']['learning_rate'])
