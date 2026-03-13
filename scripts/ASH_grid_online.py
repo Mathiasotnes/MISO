@@ -50,24 +50,69 @@ def initialize_scannet(args):
     
     return cfg, ash_grid, dataset
 
-def mapping(cfg, ash_grid:BaseNet, dataset:SubmapDataset):
-    frame_start = 0  
-    frame_end = dataset.num_kfs
-    mapper = Mapper(
-        model=ash_grid,
-        dataset=dataset,
-        cfg=cfg
+def train_epoch(model):
+    """ Override this if there is a need to override the dataset iteration. """
+    
+
+def mapping(cfg, ash_grid:GridASH, dataset:SubmapDataset):
+    # Mapping one frame at a time to work "online"
+    cfg_map = cfg['mapping']
+    ash_grid.train()
+    timer = PerfTimer(activate=True)
+    
+    loss_fn = MisoLossMapping(
+        weight_sdf=cfg_map['weight_sdf'],
+        weight_eik=cfg_map['weight_eik'],
+        weight_fs=cfg_map['weight_fs'],
+        loss_type=cfg_map['loss_type'],
+        trunc_dist=cfg_map['trunc_dist'],
+        finite_diff_eps=cfg_map['finite_diff_eps'],
+        grad_method=cfg_map['grad_method'],
+        eik_trunc_dist=cfg_map['eik_trunc_dist']
     )
     
+    cpu_time, gpu_time = 0, 0
+    
+    # Iterate over frames
+    # NOTE: We should probably have some replay buffer to avoid catastrophic forgetting.
     for kf_id in range(dataset.num_kfs):
         R, t = dataset.true_kf_pose_in_world(kf_id)
         ash_grid.set_initial_kf_pose(kf_id, R, t, kf_key=f"KF{kf_id}")
-    
-    mapper.mapping(
-        mapping_kfs=range(frame_start, frame_end),
-        iterations=cfg['train']['epochs'],
-        level_iterations=cfg['train']['max_epochs_in_level']
-    )
+        dataset.select_keyframes([kf_id])
+        
+        timer.reset()
+        
+        model_input, gt = dataset[0]
+        model_input, gt = prepare_batch(model_input, gt)
+        
+        ash_grid.prepare_features(model_input) # This will make the features at the current frame trainable, and freeze all other features.
+        ash_grid.print_summary() # Just to see how many parameters are active
+        
+        optimizer = torch.optim.Adam(ash_grid.parameters(), lr=cfg['train']['learning_rate'])
+        optimizer.zero_grad()
+                
+        # Loss 
+        total_loss = 0.
+        loss_dict = loss_fn.compute(ash_grid, model_input, gt)
+        for _, loss in loss_dict.items():
+            single_loss = loss.mean()
+            total_loss += single_loss
+
+        # Backward step
+        if not torch.isnan(total_loss):
+            total_loss.backward(retain_graph=False)
+            optimizer.step()
+                    
+        else:
+            logger.warning(f"Loss at frame {kf_id} is nan! Skip backward step.")
+            
+        ash_grid.sync_active_to_store()
+
+        # Logging
+        step_cpu_time, step_gpu_time = timer.check()
+        logger.info(f"Frame {kf_id} | train_loss={total_loss.item():.2e}")
+        cpu_time += step_cpu_time
+        gpu_time += step_gpu_time
     
 
 ##############################################
