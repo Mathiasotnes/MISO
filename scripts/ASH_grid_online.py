@@ -82,7 +82,7 @@ def mapping(cfg, ash_grid:GridASH, dataset:SubmapDataset):
     # NOTE: We should probably have some replay buffer to avoid catastrophic forgetting.
     for kf_id in range(dataset.num_kfs):
         kf_ids.append(kf_id)
-        dataset.select_keyframes([kf_ids]) # Currently training equally on all frames up to the current frame (not ideal).
+        dataset.select_keyframes(kf_ids) # Currently training equally on all frames up to the current frame (not ideal).
         timer.reset()
         
         # Taken from loss_fn.compute() to get coords in world frame. It's probably better to just call the "prepare_features()" directly in the loss function
