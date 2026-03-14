@@ -826,15 +826,17 @@ class MisoLossMappingBase(BaseLoss):
                 R_world_frame,
                 t_world_frame
             )
-            
+        
+        # -------------- Remove this whenever it's decided how to add points to GridASH -------
         # The GridASH inserts points dynamically. This is done before the 
         # forward pass so that the newly inserted points will also be supervised.
-        if isinstance(model, GridASH) and model.training:
-            with torch.no_grad():
-                valid_mask = (gt_sdf_valid.squeeze(-1) == 1)
-                if valid_mask.any():
-                    activated = model.activate_features(coords_world[valid_mask])
-                    logger.info("Activated features: {}".format(activated))
+        # if isinstance(model, GridASH) and model.training:
+        #     with torch.no_grad():
+        #         valid_mask = (gt_sdf_valid.squeeze(-1) == 1)
+        #         if valid_mask.any():
+        #             activated = model.activate_features(coords_world[valid_mask])
+        #             logger.info("Activated features: {}".format(activated))
+        # --------------------------------------------------------------------------------------
                     
             
         pred_dict = self.query_model(model, coords_world)
