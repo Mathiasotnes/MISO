@@ -82,14 +82,14 @@ def mapping(cfg, ash_grid:GridASH, dataset:SubmapDataset):
         
         timer.reset()
         
+        # Taken from loss_fn.compute() to get coords in world frame. It's probably better to just call the "prepare_features()" directly in the loss function
+        # to avoid calculating this twice.
         model_input, gt = dataset[0]
         model_input, gt = prepare_batch(model_input, gt)
         coords_frame = model_input['coords_frame'][0]
-        sample_frame_ids = model_input['sample_frame_ids'][0, :, 0]
+        sample_frame_ids = model_input['sample_frame_ids'][:, 0]
         sample_weights = model_input['weights'][0]
         gt_sdf = gt['sdf'][0]
-        gt_sdf_valid = gt['sdf_valid'][0]
-        gt_sdf_sign = gt['sdf_signs'][0]
         assert coords_frame.ndim == 2 and gt_sdf.ndim == 2
         assert sample_weights.shape == gt_sdf.shape
         # Transform coords from keyframe to world frame
