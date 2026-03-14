@@ -76,7 +76,7 @@ def mapping(cfg, ash_grid:GridASH, dataset:SubmapDataset):
     initial_kf_id = 0
     kf_ids = []
     R, t = dataset.true_kf_pose_in_world(initial_kf_id)
-    ash_grid.set_initial_kf_pose(initial_kf_id, R, t, kf_key=f"KF{kf_id}")
+    ash_grid.set_initial_kf_pose(initial_kf_id, R, t, kf_key=f"KF{initial_kf_id}")
     
     # Iterate over frames
     # NOTE: We should probably have some replay buffer to avoid catastrophic forgetting.
