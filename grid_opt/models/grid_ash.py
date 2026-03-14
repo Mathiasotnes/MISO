@@ -35,7 +35,7 @@ class GridASH(BaseNet):
         self.cell_sizes = []
         self.ash_engines = nn.ModuleList()
         
-        self.max_voxels_per_level = [int(3_000), int(80_000)]  # TODO: make this configurable
+        self.max_voxels_per_level = [int(30_000), int(800_000)]  # TODO: make this configurable
         self.active_features = nn.ParameterList()
         self._active_ash_indices = []
         
