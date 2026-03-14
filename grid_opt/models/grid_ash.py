@@ -257,6 +257,7 @@ class GridASH(BaseNet):
         if x.ndim == 1:
             x = x.unsqueeze(0)
         x = x.to(self.device, dtype=self.dtype)
+        new_features = 0
 
         for level in range(self.num_levels):
             # --- 1. Sync existing active params back to store BEFORE inserting new keys ---
@@ -267,7 +268,7 @@ class GridASH(BaseNet):
                 )
 
             # --- 2. Insert new keys for x ---
-            self.activate_level(x, level, init_std=init_std)
+            new_features += self.activate_level(x, level, init_std=init_std)
 
             # --- 3. Compute unique corner keys that x produces at this level ---
             cell_size = self.cell_sizes[level]
@@ -286,7 +287,7 @@ class GridASH(BaseNet):
             self.active_features[level] = nn.Parameter(active_feats.to(self.dtype))
             self._active_ash_indices[level] = active_indices
 
-        logger.info("prepare_features: rebuilt active parameter tensors for x-touched voxels.")
+        logger.info(f"prepare_features: Inserted: {new_features} | Active: {sum(len(p) for p in self.active_features)}")
     
     @torch.no_grad()
     def sync_active_to_store(self):

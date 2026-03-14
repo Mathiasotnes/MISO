@@ -107,7 +107,6 @@ def mapping(cfg, ash_grid:GridASH, dataset:SubmapDataset):
             )
         
         ash_grid.prepare_features(coords_world) # This will make the features at the current frame trainable, and freeze all other features.
-        ash_grid.print_summary() # Just to see how many parameters are active
         
         optimizer = torch.optim.Adam(ash_grid.parameters(), lr=cfg['train']['learning_rate'])
         optimizer.zero_grad()
