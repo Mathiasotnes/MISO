@@ -16,7 +16,7 @@ logger.setLevel(logging.INFO)
 class GridASH(BaseNet):
     
     ######################################################
-    # GridASH specific implementation
+    # GridASH Initialization
     ######################################################
     
     def __init__(self,
@@ -39,10 +39,13 @@ class GridASH(BaseNet):
         self.fdim = cfg['grid']['feature_dim']
         self.cell_sizes = []
         
-        self.ash_engines = nn.ModuleList() # We create a hash map per layer.
-        self._init_capacity = [int(1_024), int(8_192)]  # TODO: make this configurable (2^10, 2^13) for now.
-        self.capacity = list(self._init_capacity) # Current buffer capacity. Buffers will double capacity whenever the capacity is exceeded.
+        # When we exceed double_threshold, we start extending buffers with chunk_size instead of doubling.
+        self.double_threshold = 32_768 # 2^15
+        self.chunk_size = 4096 # 2^12
+        init_capacity = int(1_024) # TODO: make this configurable initializing capacities to (2^10) for now.
+        
         self.active_features = nn.ParameterList()
+        self.ash_engines = nn.ModuleList() # We create a hash map per layer. The ASHEngine is a nn.Module so it needs to be in a ModuleList.
         self._active_ash_indices = []
         
         for level in range(self.num_levels):
@@ -50,13 +53,13 @@ class GridASH(BaseNet):
             self.cell_sizes.append(cell_size)
             ash_engine = ASHEngine(
                 dim=3, # Key dimension. We want to use (x,y,z) as keys. We might want to pack these into a single int in the future?
-                capacity=self._init_capacity[level], 
+                capacity=init_capacity, 
                 device=self.device
             )
             self.ash_engines.append(ash_engine)
             self.active_features.append(nn.Parameter(torch.zeros(0, self.fdim, device=self.device, dtype=self.dtype)))
             self._active_ash_indices.append(torch.zeros(0, dtype=torch.long, device=self.device))
-            self.register_buffer(f'_features_{level}', torch.zeros(self._init_capacity[level], self.fdim, device=self.device, dtype=self.dtype))
+            self.register_buffer(f'_features_{level}', torch.zeros(init_capacity, self.fdim, device=self.device, dtype=self.dtype))
             self.register_buffer(f'_active_lut_{level}', torch.zeros(0, dtype=torch.long, device=self.device))
 
             
@@ -88,111 +91,27 @@ class GridASH(BaseNet):
         )
         logger.debug(f"Initialized docoder:\n {self.decoder}")
     
-    def print_summary(self):
-        bytes_per_elem = torch.finfo(self.dtype).bits // 8
-
-        def mb(num_elements):
-            return (num_elements * bytes_per_elem) / (1024 ** 2)
         
-        def ash_mb(level):
-            cap = self.ash_engines[level].capacity
-            heap_mb    = (cap * 4) / (1024**2)          # int32
-            keys_mb    = (cap * 3 * 4) / (1024**2)      # int32, dim=3
-            indices_mb = (cap * 8) / (1024**2)          # long
-            return heap_mb + keys_mb + indices_mb
-
-        # Parameter counts
-        total_trainable   = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        decoder_params    = sum(p.numel() for p in self.decoder.parameters())
-
-        # Memory
-        feature_buf_elems = sum(getattr(self, f'_features_{l}').numel() for l in range(self.num_levels))
-        active_feat_vecs  = sum(self.active_features[l].shape[0] for l in range(self.num_levels))
-        active_feat_elems = sum(self.active_features[l].numel() for l in range(self.num_levels))
-        lut_elems         = sum(getattr(self, f'_active_lut_{l}').numel() for l in range(self.num_levels))
-        lut_mb            = (lut_elems * 8) / (1024 ** 2)  # long = 8 bytes
-
-        lines = [
-            f"\n{'='*60}",
-            f" GridASH Summary ({'TRAINING' if self.training else 'EVAL'} mode)",
-            f"{'='*60}",
-            f" Architecture",
-            f"   * Encoding levels          : {self.num_levels}",
-            f"   * Encoding feature dim     : {self.fdim}",
-            f"   * Base cell size           : {self.base_cell_size}",
-            f"   * Per-level scale          : {self.scale_factor}",
-            f"   * Decoder hidden layers    : {self.decoder_hidden_layers}",
-            f"   * Decoder hidden dim       : {self.decoder_hidden_dim}",
-            f"{'='*60}",
-            f" Parameters",
-            f"   * Total trainable          : {total_trainable:,}",
-            f"   * Encoding (active)        : {active_feat_vecs:,}  ({mb(active_feat_elems):.2f} MB)",
-            f"   * Decoder                  : {decoder_params:,}  ({mb(decoder_params):.2f} MB)",
-            f"{'='*60}",
-            f" Memory Buffers",
-        ]
-
-        total_feat_vecs  = 0
-        total_active_vecs = 0
-        for l in range(self.num_levels):
-            feat_vecs    = getattr(self, f'_features_{l}').shape[0]
-            occupied     = int(self.ash_engines[l].size())
-            active_vecs  = self.active_features[l].shape[0]
-            utilization  = 100.0 * occupied / feat_vecs if feat_vecs > 0 else 0.0
-            total_feat_vecs  += feat_vecs
-            total_active_vecs += active_vecs
-            ash_engine_mb = ash_mb(l)
-            lines += [
-                f"   Level {l}:",
-                f"     * Cell size              : {self.cell_sizes[l]:.6f}",
-                f"     * Features               : {feat_vecs:,}  ({mb(feat_vecs * self.fdim):.2f} MB)",
-                f"     * Occupied (ASH)         : {occupied:,}  ({utilization:.1f}% utilization)",
-                f"     * Active (trainable)     : {active_vecs:,} ({mb(active_vecs * self.fdim):.2f} MB)",
-                f"     * LUT size               : {getattr(self, f'_active_lut_{l}').shape[0]:,}",
-                f"     * ASH engine             : {ash_engine_mb:.2f} MB",
-            ]
-
-        total_occupied  = sum(int(self.ash_engines[l].size()) for l in range(self.num_levels))
-        total_util      = 100.0 * total_occupied / total_feat_vecs if total_feat_vecs > 0 else 0.0
-        total_ash_mb = sum(ash_mb(l) for l in range(self.num_levels))
-        
-        total_dense_vecs = sum(
-            int(torch.prod(torch.ceil((self.bound[:, 1] - self.bound[:, 0]) / self.cell_sizes[l]).long() + 1).item())
-            for l in range(self.num_levels)
-        )
-        dense_feat_mb = mb(total_dense_vecs * self.fdim)
-        total_mb = mb(feature_buf_elems) + total_ash_mb + mb(active_feat_elems) + lut_mb + mb(decoder_params)
-
-        lines += [
-            f"   Total:",
-            f"     * Features               : {total_feat_vecs:,}  ({mb(feature_buf_elems):.2f} MB)",
-            f"     * Occupied (ASH)         : {total_occupied:,}  ({total_util:.1f}% utilization)",
-            f"     * Active (trainable)     : {total_active_vecs:,}",
-            f"{'='*60}",
-            f" Training State",
-            f"   * Active features          : {active_feat_vecs:,}  ({mb(active_feat_elems):.2f} MB)",
-            f"   * LUT buffers              : {lut_elems:,}  ({lut_mb:.2f} MB)",
-            f"{'='*60}",
-            f" Estimated Total Memory Usage",
-            f"   * Feature buffers          : {mb(feature_buf_elems):.2f} MB",
-            f"   * ASH engines              : {total_ash_mb:.2f} MB",
-            f"   * Active features          : {mb(active_feat_elems):.2f} MB",
-            f"   * LUT buffers              : {lut_mb:.2f} MB",
-            f"   * Decoder weights          : {mb(decoder_params):.2f} MB",
-            f"   * Grand total (est.)       : {total_mb:.2f} MB",
-            f"   * Dense grid equivalent    : {dense_feat_mb:.2f} MB  ({100.0 * (total_mb / dense_feat_mb):.1f}% of dense)",
-            f"{'='*60}",
-        ]
-
-        logger.info("\n".join(lines))
+    ######################################################
+    # Buffer getters
+    ######################################################
         
     @property
     def features(self):
         return [getattr(self, f'_features_{l}') for l in range(self.num_levels)]
+    
+    @property
+    def capacity(self):
+        return [getattr(self, f'_features_{l}').shape[0] for l in range(self.num_levels)]
 
     @property
     def _active_lut(self):
         return [getattr(self, f'_active_lut_{l}') for l in range(self.num_levels)]
+    
+    
+    ######################################################
+    # GridASH logic
+    ######################################################
     
     @torch.no_grad()
     def prepare_features(self, x: torch.Tensor, init_std: float = 1e-4):
@@ -230,43 +149,18 @@ class GridASH(BaseNet):
             self.register_buffer(f'_active_lut_{level}', lut)
 
         # logger.info(f"prepare_features: Inserted: {new_features} | Active: {sum(len(p) for p in self.active_features)}")
-    
-    @torch.no_grad()
-    def sync_active_to_store(self):
-        """ Copy current active_features (post-optimizer-step values) back into features. """
-        for level in range(self.num_levels):
-            idx = self._active_ash_indices[level]
-            if idx.numel() > 0:
-                self.features[level][idx] = self.active_features[level].data
-                
-    def clear_training_state(self):
-        """
-        Call after training is complete to free memory used by training-only state:
-        - active_features (trainable parameters, only needed for gradient flow)
-        - _active_lut (only needed to map feat_idx -> active_features during training)
-        - _active_ash_indices (only needed to rebuild the LUT and sync back to features)
-        
-        Make sure to call sync_active_to_store() before this to persist the final
-        optimized values back into the feature buffers.
-        """
-        assert not self.training, "Call model.eval() before clearing training state."
-
-        for level in range(self.num_levels):
-            self.active_features[level] = nn.Parameter(
-                torch.zeros(0, self.fdim, device=self.device, dtype=self.dtype),
-                requires_grad=False
-            )
-            self.register_buffer(f'_active_lut_{level}', torch.zeros(0, dtype=torch.long, device=self.device))
-            self._active_ash_indices[level] = torch.zeros(0, dtype=torch.long, device=self.device)
-
-        logger.info("Cleared training state!")
                 
     @torch.no_grad()
     def extend_capacity(self, level: int):
-        """ Double capacity for one level in both ASH engine and feature buffer. Make sure 
-        parameters are synced to feature buffer before calling this. """
+        """ Increase capacity for one level in both ASH engine and feature buffer. Make sure 
+        parameters are synced to feature buffer before calling this. We double the size until
+        we reach double_threshold, then we increase by chunk_size to avoid over-allocating. """
         old_cap = int(self.capacity[level])
-        new_cap = 2 * old_cap
+        
+        if old_cap < self.double_threshold:
+            new_cap = old_cap * 2
+        else:
+            new_cap = old_cap + self.chunk_size
 
         old_features = self.features[level]
         new_features = torch.zeros(new_cap, self.fdim, device=self.device, dtype=self.dtype)
@@ -278,7 +172,6 @@ class GridASH(BaseNet):
         )
 
         self.register_buffer(f'_features_{level}', new_features)
-        self.capacity[level] = new_cap
 
         assert self.features[level].shape[0] == self.ash_engines[level].capacity
         logger.info(f"Extended level {level} capacity: {old_cap} -> {new_cap}")
@@ -402,46 +295,148 @@ class GridASH(BaseNet):
     def forward(self, x):
         f = self.query_feature(x)
         return self.decoder(f)
+    
+    
+    ######################################################
+    # Utilities
+    ######################################################
+    
+    @torch.no_grad()
+    def sync_active_to_store(self):
+        """ Copy current active_features (post-optimizer-step values) back into features. """
+        for level in range(self.num_levels):
+            idx = self._active_ash_indices[level]
+            if idx.numel() > 0:
+                self.features[level][idx] = self.active_features[level].data
+                
+    def clear_training_state(self):
+        """
+        Call after training is complete to free memory used by training-only state:
+        - active_features (trainable parameters, only needed for gradient flow)
+        - _active_lut (only needed to map feat_idx -> active_features during training)
+        - _active_ash_indices (only needed to rebuild the LUT and sync back to features)
         
-    def print_ash_stats(self):
-        dim_len = self.bound[:, 1] - self.bound[:, 0] # (d,)
+        Make sure to call sync_active_to_store() before this to persist the final
+        optimized values back into the feature buffers.
+        """
+        assert not self.training, "Call model.eval() before clearing training state."
 
-        total_active = 0
-        total_dense = 0
+        for level in range(self.num_levels):
+            self.active_features[level] = nn.Parameter(
+                torch.zeros(0, self.fdim, device=self.device, dtype=self.dtype),
+                requires_grad=False
+            )
+            self.register_buffer(f'_active_lut_{level}', torch.zeros(0, dtype=torch.long, device=self.device))
+            self._active_ash_indices[level] = torch.zeros(0, dtype=torch.long, device=self.device)
+
+        logger.info("Cleared training state!")
+    
+    
+    ######################################################
+    # Diagnostics
+    ######################################################
+        
+    def print_summary(self):
+        bytes_per_elem = torch.finfo(self.dtype).bits // 8
+
+        def mb(num_elements):
+            return (num_elements * bytes_per_elem) / (1024 ** 2)
+        
+        def ash_mb(level):
+            # One entry in ASH has 32b heap + 3*32b keys + 64b values -> 192b = 24 bytes.
+            # For comparison: 
+            #   - A feature with fdim=4 and float64 precision is 4*64b = 32 bytes.
+            #   - A feature with fdim=128 and float64 precision is 128*64b = 1024 bytes.
+            # So the ASH overhead can be significant for e.g. SDF feautres, but very small for e.g. language feautures.
+            # An idea to reduce memory in SDF tasks could be to increase the fdim and reduce resolution to minimize ASH overhead.
+            cap = self.ash_engines[level].capacity
+            heap_mb    = (cap * 4) / (1024**2)          # int32
+            keys_mb    = (cap * 3 * 4) / (1024**2)      # int32, dim=3
+            indices_mb = (cap * 8) / (1024**2)          # long
+            return heap_mb + keys_mb + indices_mb
+
+        # Parameter counts
+        total_trainable   = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        decoder_params    = sum(p.numel() for p in self.decoder.parameters())
+
+        # Memory
+        feature_buf_elems = sum(getattr(self, f'_features_{l}').numel() for l in range(self.num_levels))
+        active_feat_vecs  = sum(self.active_features[l].shape[0] for l in range(self.num_levels))
+        active_feat_elems = sum(self.active_features[l].numel() for l in range(self.num_levels))
+        lut_elems         = sum(getattr(self, f'_active_lut_{l}').numel() for l in range(self.num_levels))
+        lut_mb            = (lut_elems * 8) / (1024 ** 2)  # long = 8 bytes
 
         lines = [
             f"\n{'='*60}",
-            " ASH Engine Statistics",
+            f" GridASH Summary ({'TRAINING' if self.training else 'EVAL'} mode)",
             f"{'='*60}",
+            f" Architecture",
+            f"   * Encoding levels          : {self.num_levels}",
+            f"   * Encoding feature dim     : {self.fdim}",
+            f"   * Base cell size           : {self.base_cell_size}",
+            f"   * Per-level scale          : {self.scale_factor}",
+            f"   * Decoder hidden layers    : {self.decoder_hidden_layers}",
+            f"   * Decoder hidden dim       : {self.decoder_hidden_dim}",
+            f"{'='*60}",
+            f" Parameters",
+            f"   * Total trainable          : {total_trainable:,}",
+            f"   * Encoding (active)        : {active_feat_vecs:,}  ({mb(active_feat_elems):.2f} MB)",
+            f"   * Decoder                  : {decoder_params:,}  ({mb(decoder_params):.2f} MB)",
+            f"{'='*60}",
+            f" Memory Buffers",
         ]
 
+        total_feat_vecs  = 0
+        total_active_vecs = 0
         for l in range(self.num_levels):
-            active      = int(self.ash_engines[l].size())
-            n_cells     = torch.ceil(dim_len / self.cell_sizes[l]).long()
-            dense       = int(torch.prod(n_cells + 1).item())
-            sparsity    = 100.0 * active / dense if dense > 0 else 0.0
+            feat_vecs    = getattr(self, f'_features_{l}').shape[0]
+            occupied     = int(self.ash_engines[l].size())
+            active_vecs  = self.active_features[l].shape[0]
+            utilization  = 100.0 * occupied / feat_vecs if feat_vecs > 0 else 0.0
+            total_feat_vecs  += feat_vecs
+            total_active_vecs += active_vecs
+            ash_engine_mb = ash_mb(l)
+            lines += [
+                f"   Level {l}:",
+                f"     * Cell size              : {self.cell_sizes[l]:.6f}",
+                f"     * Features               : {feat_vecs:,}  ({mb(feat_vecs * self.fdim):.2f} MB)",
+                f"     * Occupied (ASH)         : {occupied:,}  ({utilization:.1f}% utilization)",
+                f"     * Active (trainable)     : {active_vecs:,} ({mb(active_vecs * self.fdim):.2f} MB)",
+                f"     * LUT size               : {getattr(self, f'_active_lut_{l}').shape[0]:,}",
+                f"     * ASH engine             : {ash_engine_mb:.2f} MB",
+            ]
 
-            total_active    += active
-            total_dense     += dense
+        total_occupied  = sum(int(self.ash_engines[l].size()) for l in range(self.num_levels))
+        total_util      = 100.0 * total_occupied / total_feat_vecs if total_feat_vecs > 0 else 0.0
+        total_ash_mb = sum(ash_mb(l) for l in range(self.num_levels))
+        
+        total_dense_vecs = sum(
+            int(torch.prod(torch.ceil((self.bound[:, 1] - self.bound[:, 0]) / self.cell_sizes[l]).long() + 1).item())
+            for l in range(self.num_levels)
+        )
+        dense_feat_mb = mb(total_dense_vecs * self.fdim)
+        total_mb = mb(feature_buf_elems) + total_ash_mb + mb(active_feat_elems) + lut_mb + mb(decoder_params)
 
-            lines.extend([
-                f" Level {l}:",
-                f"   * Cell size        : {self.cell_sizes[l]:.6f}",
-                f"   * Active features  : {active:,}",
-                f"   * Dense features   : {dense:,}",
-                f"   * Sparsity         : {sparsity:.2f}%",
-                f"{'-'*60}",
-            ])
-
-        total_sparsity = 100.0 * total_active / total_dense if total_dense > 0 else 0.0
-
-        lines.extend([
-            " Total:",
-            f"   * Active features  : {total_active:,}",
-            f"   * Dense features   : {total_dense:,}",
-            f"   * Sparsity         : {total_sparsity:.2f}%",
+        lines += [
+            f"   Total:",
+            f"     * Features               : {total_feat_vecs:,}  ({mb(feature_buf_elems):.2f} MB)",
+            f"     * Occupied (ASH)         : {total_occupied:,}  ({total_util:.1f}% utilization)",
+            f"     * Active (trainable)     : {total_active_vecs:,}",
             f"{'='*60}",
-        ])
+            f" Training State",
+            f"   * Active features          : {active_feat_vecs:,}  ({mb(active_feat_elems):.2f} MB)",
+            f"   * LUT buffers              : {lut_elems:,}  ({lut_mb:.2f} MB)",
+            f"{'='*60}",
+            f" Estimated Total Memory Usage",
+            f"   * Feature buffers          : {mb(feature_buf_elems):.2f} MB",
+            f"   * ASH engines              : {total_ash_mb:.2f} MB",
+            f"   * Active features          : {mb(active_feat_elems):.2f} MB",
+            f"   * LUT buffers              : {lut_mb:.2f} MB",
+            f"   * Decoder weights          : {mb(decoder_params):.2f} MB",
+            f"   * Grand total (est.)       : {total_mb:.2f} MB",
+            f"   * Dense grid equivalent    : {dense_feat_mb:.2f} MB  ({100.0 * (total_mb / dense_feat_mb):.1f}% of dense)",
+            f"{'='*60}",
+        ]
 
         logger.info("\n".join(lines))
         
