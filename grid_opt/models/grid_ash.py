@@ -95,15 +95,15 @@ class GridASH(BaseNet):
             return (num_elements * bytes_per_elem) / (1024 ** 2)
 
         # Parameter counts
-        total_trainable  = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        decoder_params   = sum(p.numel() for p in self.decoder.parameters())
-        encoding_params  = sum(p.numel() for p in self.active_features)
+        total_trainable   = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        decoder_params    = sum(p.numel() for p in self.decoder.parameters())
 
-        # Other memory buffers
-        feature_buf_elems  = sum(getattr(self, f'_features_{l}').numel() for l in range(self.num_levels))
-        active_feat_elems  = sum(self.active_features[l].numel() for l in range(self.num_levels))
-        lut_elems          = sum(getattr(self, f'_active_lut_{l}').numel() for l in range(self.num_levels))
-        lut_mb             = (lut_elems * 8) / (1024 ** 2)  # long = 8 bytes
+        # Memory
+        feature_buf_elems = sum(getattr(self, f'_features_{l}').numel() for l in range(self.num_levels))
+        active_feat_vecs  = sum(self.active_features[l].shape[0] for l in range(self.num_levels))
+        active_feat_elems = sum(self.active_features[l].numel() for l in range(self.num_levels))
+        lut_elems         = sum(getattr(self, f'_active_lut_{l}').numel() for l in range(self.num_levels))
+        lut_mb            = (lut_elems * 8) / (1024 ** 2)  # long = 8 bytes
 
         lines = [
             f"\n{'='*60}",
@@ -119,40 +119,43 @@ class GridASH(BaseNet):
             f"{'='*60}",
             f" Parameters",
             f"   * Total trainable          : {total_trainable:,}",
-            f"   * Encoding (active)        : {encoding_params:,}  ({mb(active_feat_elems):.2f} MB)",
+            f"   * Encoding (active)        : {active_feat_vecs:,}  ({mb(active_feat_elems):.2f} MB)",
             f"   * Decoder                  : {decoder_params:,}  ({mb(decoder_params):.2f} MB)",
             f"{'='*60}",
-            f" Feature Buffers (persistent)",
+            f" Memory Buffers",
         ]
 
-        total_allocated = 0
-        total_active    = 0
+        total_feat_vecs  = 0
+        total_active_vecs = 0
         for l in range(self.num_levels):
-            allocated   = getattr(self, f'_features_{l}').shape[0]  # capacity
-            active      = int(self.ash_engines[l].size())           # actually occupied
-            utilization = 100.0 * active / allocated if allocated > 0 else 0.0
-            total_allocated += allocated
-            total_active    += active
+            feat_vecs    = getattr(self, f'_features_{l}').shape[0]
+            occupied     = int(self.ash_engines[l].size())
+            active_vecs  = self.active_features[l].shape[0]
+            utilization  = 100.0 * occupied / feat_vecs if feat_vecs > 0 else 0.0
+            total_feat_vecs  += feat_vecs
+            total_active_vecs += active_vecs
             lines += [
                 f"   Level {l}:",
-                f"     * Cell size            : {self.cell_sizes[l]:.6f}",
-                f"     * Capacity (allocated) : {allocated:,}  ({mb(allocated * self.fdim):.2f} MB)",
-                f"     * Occupied (ASH)       : {active:,}  ({utilization:.1f}% utilization)",
-                f"     * Active (trainable)   : {self.active_features[l].shape[0]:,}",
-                f"     * LUT size             : {getattr(self, f'_active_lut_{l}').shape[0]:,}",
+                f"     * Cell size              : {self.cell_sizes[l]:.6f}",
+                f"     * Features               : {feat_vecs:,}  ({mb(feat_vecs * self.fdim):.2f} MB)",
+                f"     * Occupied (ASH)         : {occupied:,}  ({utilization:.1f}% utilization)",
+                f"     * Active (trainable)     : {active_vecs:,} ({mb(active_vecs * self.fdim):.2f} MB)",
+                f"     * LUT size               : {getattr(self, f'_active_lut_{l}').shape[0]:,}",
             ]
 
-        total_util = 100.0 * total_active / total_allocated if total_allocated > 0 else 0.0
+        total_occupied  = sum(int(self.ash_engines[l].size()) for l in range(self.num_levels))
+        total_util      = 100.0 * total_occupied / total_feat_vecs if total_feat_vecs > 0 else 0.0
         lines += [
             f"   Total:",
-            f"     * Capacity (allocated) : {total_allocated:,}  ({mb(feature_buf_elems):.2f} MB)",
-            f"     * Occupied (ASH)       : {total_active:,}  ({total_util:.1f}% utilization)",
+            f"     * Features               : {total_feat_vecs:,}  ({mb(feature_buf_elems):.2f} MB)",
+            f"     * Occupied (ASH)         : {total_occupied:,}  ({total_util:.1f}% utilization)",
+            f"     * Active (trainable)     : {total_active_vecs:,}",
             f"{'='*60}",
-            f" Training-only State {'[CLEARED]' if self.active_features[0].numel() == 0 else ''}",
-            f"   * Active features          : {active_feat_elems:,}  ({mb(active_feat_elems):.2f} MB)",
+            f" Training State",
+            f"   * Active features          : {active_feat_vecs:,}  ({mb(active_feat_elems):.2f} MB)",
             f"   * LUT buffers              : {lut_elems:,}  ({lut_mb:.2f} MB)",
             f"{'='*60}",
-            f" Estimated Total GPU Memory",
+            f" Estimated Total Memory Usage",
             f"   * Feature buffers          : {mb(feature_buf_elems):.2f} MB",
             f"   * Active features          : {mb(active_feat_elems):.2f} MB",
             f"   * LUT buffers              : {lut_mb:.2f} MB",
