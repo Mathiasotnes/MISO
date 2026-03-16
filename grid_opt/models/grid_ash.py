@@ -160,7 +160,7 @@ class GridASH(BaseNet):
             int(torch.prod(torch.ceil((self.bound[:, 1] - self.bound[:, 0]) / self.cell_sizes[l]).long() + 1).item())
             for l in range(self.num_levels)
         )
-        dense_feat_mb = mb(total_dense_vecs * self.num_levels * self.fdim)
+        dense_feat_mb = mb(total_dense_vecs * self.fdim)
         total_mb = mb(feature_buf_elems) + total_ash_mb + mb(active_feat_elems) + lut_mb + mb(decoder_params)
 
         lines += [
