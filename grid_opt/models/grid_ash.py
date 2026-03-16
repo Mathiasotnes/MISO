@@ -93,6 +93,13 @@ class GridASH(BaseNet):
 
         def mb(num_elements):
             return (num_elements * bytes_per_elem) / (1024 ** 2)
+        
+        def ash_mb(level):
+            cap = self.ash_engines[level].capacity
+            heap_mb    = (cap * 4) / (1024**2)          # int32
+            keys_mb    = (cap * 3 * 4) / (1024**2)      # int32, dim=3
+            indices_mb = (cap * 8) / (1024**2)          # long
+            return heap_mb + keys_mb + indices_mb
 
         # Parameter counts
         total_trainable   = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -134,6 +141,7 @@ class GridASH(BaseNet):
             utilization  = 100.0 * occupied / feat_vecs if feat_vecs > 0 else 0.0
             total_feat_vecs  += feat_vecs
             total_active_vecs += active_vecs
+            ash_engine_mb = ash_mb(l)
             lines += [
                 f"   Level {l}:",
                 f"     * Cell size              : {self.cell_sizes[l]:.6f}",
@@ -141,10 +149,13 @@ class GridASH(BaseNet):
                 f"     * Occupied (ASH)         : {occupied:,}  ({utilization:.1f}% utilization)",
                 f"     * Active (trainable)     : {active_vecs:,} ({mb(active_vecs * self.fdim):.2f} MB)",
                 f"     * LUT size               : {getattr(self, f'_active_lut_{l}').shape[0]:,}",
+                f"     * ASH engine             : {ash_engine_mb:.2f} MB",
             ]
 
         total_occupied  = sum(int(self.ash_engines[l].size()) for l in range(self.num_levels))
         total_util      = 100.0 * total_occupied / total_feat_vecs if total_feat_vecs > 0 else 0.0
+        total_ash_mb = sum(ash_mb(l) for l in range(self.num_levels))
+
         lines += [
             f"   Total:",
             f"     * Features               : {total_feat_vecs:,}  ({mb(feature_buf_elems):.2f} MB)",
@@ -157,6 +168,7 @@ class GridASH(BaseNet):
             f"{'='*60}",
             f" Estimated Total Memory Usage",
             f"   * Feature buffers          : {mb(feature_buf_elems):.2f} MB",
+            f"   * ASH engines              : {total_ash_mb:.2f} MB",
             f"   * Active features          : {mb(active_feat_elems):.2f} MB",
             f"   * LUT buffers              : {lut_mb:.2f} MB",
             f"   * Decoder weights          : {mb(decoder_params):.2f} MB",
