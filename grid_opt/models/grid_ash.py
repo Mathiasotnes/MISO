@@ -155,6 +155,13 @@ class GridASH(BaseNet):
         total_occupied  = sum(int(self.ash_engines[l].size()) for l in range(self.num_levels))
         total_util      = 100.0 * total_occupied / total_feat_vecs if total_feat_vecs > 0 else 0.0
         total_ash_mb = sum(ash_mb(l) for l in range(self.num_levels))
+        
+        total_dense_vecs = sum(
+            int(torch.prod(torch.ceil((self.bound[:, 1] - self.bound[:, 0]) / self.cell_sizes[l]).long() + 1).item())
+            for l in range(self.num_levels)
+        )
+        dense_feat_mb = mb(total_dense_vecs * self.num_levels * self.fdim)
+        total_mb = mb(feature_buf_elems) + total_ash_mb + mb(active_feat_elems) + lut_mb + mb(decoder_params)
 
         lines += [
             f"   Total:",
@@ -172,7 +179,8 @@ class GridASH(BaseNet):
             f"   * Active features          : {mb(active_feat_elems):.2f} MB",
             f"   * LUT buffers              : {lut_mb:.2f} MB",
             f"   * Decoder weights          : {mb(decoder_params):.2f} MB",
-            f"   * Grand total (est.)       : {mb(feature_buf_elems) + mb(active_feat_elems) + lut_mb + mb(decoder_params):.2f} MB",
+            f"   * Grand total (est.)       : {total_mb:.2f} MB",
+            f"   * Dense grid equivalent    : {dense_feat_mb:.2f} MB  ({100.0 * (total_mb / dense_feat_mb):.1f}% of dense)",
             f"{'='*60}",
         ]
 
@@ -221,7 +229,7 @@ class GridASH(BaseNet):
             lut[active_indices] = torch.arange(active_indices.shape[0], device=self.device)
             self.register_buffer(f'_active_lut_{level}', lut)
 
-        logger.info(f"prepare_features: Inserted: {new_features} | Active: {sum(len(p) for p in self.active_features)}")
+        # logger.info(f"prepare_features: Inserted: {new_features} | Active: {sum(len(p) for p in self.active_features)}")
     
     @torch.no_grad()
     def sync_active_to_store(self):
