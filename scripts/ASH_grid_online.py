@@ -135,6 +135,11 @@ def mapping(cfg, ash_grid:GridASH, dataset:SubmapDataset):
         cpu_time += step_cpu_time
         gpu_time += step_gpu_time
     
+    ash_grid.print_summary()
+    ash_grid.eval()
+    ash_grid.clear_training_state()
+    ash_grid.print_summary()
+    
 
 ##############################################
 # Main entry point

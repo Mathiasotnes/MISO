@@ -44,7 +44,6 @@ class GridASH(BaseNet):
         self.capacity = list(self._init_capacity) # Current buffer capacity. Buffers will double capacity whenever the capacity is exceeded.
         self.active_features = nn.ParameterList()
         self._active_ash_indices = []
-        self.features = []
         
         for level in range(self.num_levels):
             cell_size = self.base_cell_size / (self.scale_factor**level)
@@ -57,7 +56,9 @@ class GridASH(BaseNet):
             self.ash_engines.append(ash_engine)
             self.active_features.append(nn.Parameter(torch.zeros(0, self.fdim, device=self.device, dtype=self.dtype)))
             self._active_ash_indices.append(torch.zeros(0, dtype=torch.long, device=self.device))
-            self.features.append(torch.zeros(self._init_capacity[level], self.fdim, device=self.device, dtype=self.dtype))
+            self.register_buffer(f'_features_{level}', torch.zeros(self._init_capacity[level], self.fdim, device=self.device, dtype=self.dtype))
+            self.register_buffer(f'_active_lut_{level}', torch.zeros(0, dtype=torch.long, device=self.device))
+
             
         self.ignore_level_ = np.zeros(self.num_levels).astype(bool)
         
@@ -88,26 +89,87 @@ class GridASH(BaseNet):
         logger.debug(f"Initialized docoder:\n {self.decoder}")
     
     def print_summary(self):
-        total_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        decoder_params = sum(p.numel() for p in self.decoder.parameters())
-        encoding_params = sum(p.numel() for p in self.active_features)
-        logger.info(
-            f"\n{'='*60}\n"
-            f" GridASH\n"
-            f"   * Encoding levels          : {self.num_levels}\n"
-            f"   * Encoding feature dim     : {self.fdim}\n"
-            f"   * Base cell size           : {self.base_cell_size}\n"
-            f"   * Per-level scale          : {self.scale_factor}\n"
-            f"   * Decoder hidden layers    : {self.decoder_hidden_layers}\n"
-            f"   * Decoder hidden dim       : {self.decoder_hidden_dim}\n"
-            f"   * Current capacities       : {self.capacity}\n"
-            f"{'='*60}\n"
-            f"   * Trainable params         : {total_trainable:,}\n"
-            f"{'='*60}\n"
-            f"   * Encoding params          : {encoding_params:,}\n"
-            f"   * Decoder params           : {decoder_params:,}\n"
-            f"{'='*60}"
-        )
+        bytes_per_elem = torch.finfo(self.dtype).bits // 8
+
+        def mb(num_elements):
+            return (num_elements * bytes_per_elem) / (1024 ** 2)
+
+        # Parameter counts
+        total_trainable  = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        decoder_params   = sum(p.numel() for p in self.decoder.parameters())
+        encoding_params  = sum(p.numel() for p in self.active_features)
+
+        # Other memory buffers
+        feature_buf_elems  = sum(getattr(self, f'_features_{l}').numel() for l in range(self.num_levels))
+        active_feat_elems  = sum(self.active_features[l].numel() for l in range(self.num_levels))
+        lut_elems          = sum(getattr(self, f'_active_lut_{l}').numel() for l in range(self.num_levels))
+        lut_mb             = (lut_elems * 8) / (1024 ** 2)  # long = 8 bytes
+
+        lines = [
+            f"\n{'='*60}",
+            f" GridASH Summary ({'TRAINING' if self.training else 'EVAL'} mode)",
+            f"{'='*60}",
+            f" Architecture",
+            f"   * Encoding levels          : {self.num_levels}",
+            f"   * Encoding feature dim     : {self.fdim}",
+            f"   * Base cell size           : {self.base_cell_size}",
+            f"   * Per-level scale          : {self.scale_factor}",
+            f"   * Decoder hidden layers    : {self.decoder_hidden_layers}",
+            f"   * Decoder hidden dim       : {self.decoder_hidden_dim}",
+            f"{'='*60}",
+            f" Parameters",
+            f"   * Total trainable          : {total_trainable:,}",
+            f"   * Encoding (active)        : {encoding_params:,}  ({mb(active_feat_elems):.2f} MB)",
+            f"   * Decoder                  : {decoder_params:,}  ({mb(decoder_params):.2f} MB)",
+            f"{'='*60}",
+            f" Feature Buffers (persistent)",
+        ]
+
+        total_allocated = 0
+        total_active    = 0
+        for l in range(self.num_levels):
+            allocated   = getattr(self, f'_features_{l}').shape[0]  # capacity
+            active      = int(self.ash_engines[l].size())           # actually occupied
+            utilization = 100.0 * active / allocated if allocated > 0 else 0.0
+            total_allocated += allocated
+            total_active    += active
+            lines += [
+                f"   Level {l}:",
+                f"     * Cell size            : {self.cell_sizes[l]:.6f}",
+                f"     * Capacity (allocated) : {allocated:,}  ({mb(allocated * self.fdim):.2f} MB)",
+                f"     * Occupied (ASH)       : {active:,}  ({utilization:.1f}% utilization)",
+                f"     * Active (trainable)   : {self.active_features[l].shape[0]:,}",
+                f"     * LUT size             : {getattr(self, f'_active_lut_{l}').shape[0]:,}",
+            ]
+
+        total_util = 100.0 * total_active / total_allocated if total_allocated > 0 else 0.0
+        lines += [
+            f"   Total:",
+            f"     * Capacity (allocated) : {total_allocated:,}  ({mb(feature_buf_elems):.2f} MB)",
+            f"     * Occupied (ASH)       : {total_active:,}  ({total_util:.1f}% utilization)",
+            f"{'='*60}",
+            f" Training-only State {'[CLEARED]' if self.active_features[0].numel() == 0 else ''}",
+            f"   * Active features          : {active_feat_elems:,}  ({mb(active_feat_elems):.2f} MB)",
+            f"   * LUT buffers              : {lut_elems:,}  ({lut_mb:.2f} MB)",
+            f"{'='*60}",
+            f" Estimated Total GPU Memory",
+            f"   * Feature buffers          : {mb(feature_buf_elems):.2f} MB",
+            f"   * Active features          : {mb(active_feat_elems):.2f} MB",
+            f"   * LUT buffers              : {lut_mb:.2f} MB",
+            f"   * Decoder weights          : {mb(decoder_params):.2f} MB",
+            f"   * Grand total (est.)       : {mb(feature_buf_elems) + mb(active_feat_elems) + lut_mb + mb(decoder_params):.2f} MB",
+            f"{'='*60}",
+        ]
+
+        logger.info("\n".join(lines))
+        
+    @property
+    def features(self):
+        return [getattr(self, f'_features_{l}') for l in range(self.num_levels)]
+
+    @property
+    def _active_lut(self):
+        return [getattr(self, f'_active_lut_{l}') for l in range(self.num_levels)]
     
     @torch.no_grad()
     def prepare_features(self, x: torch.Tensor, init_std: float = 1e-4):
@@ -138,6 +200,11 @@ class GridASH(BaseNet):
             active_feats = self.features[level][active_indices].clone()
             self.active_features[level] = nn.Parameter(active_feats.to(self.dtype))
             self._active_ash_indices[level] = active_indices
+            
+            # Create a LUT from features -> active_features. This will be used to query trainable params during training, and can be removed after training.
+            lut = torch.full((self.ash_engines[level].capacity,), -1, dtype=torch.long, device=self.device)
+            lut[active_indices] = torch.arange(active_indices.shape[0], device=self.device)
+            self.register_buffer(f'_active_lut_{level}', lut)
 
         logger.info(f"prepare_features: Inserted: {new_features} | Active: {sum(len(p) for p in self.active_features)}")
     
@@ -148,6 +215,28 @@ class GridASH(BaseNet):
             idx = self._active_ash_indices[level]
             if idx.numel() > 0:
                 self.features[level][idx] = self.active_features[level].data
+                
+    def clear_training_state(self):
+        """
+        Call after training is complete to free memory used by training-only state:
+        - active_features (trainable parameters, only needed for gradient flow)
+        - _active_lut (only needed to map feat_idx -> active_features during training)
+        - _active_ash_indices (only needed to rebuild the LUT and sync back to features)
+        
+        Make sure to call sync_active_to_store() before this to persist the final
+        optimized values back into the feature buffers.
+        """
+        assert not self.training, "Call model.eval() before clearing training state."
+
+        for level in range(self.num_levels):
+            self.active_features[level] = nn.Parameter(
+                torch.zeros(0, self.fdim, device=self.device, dtype=self.dtype),
+                requires_grad=False
+            )
+            self.register_buffer(f'_active_lut_{level}', torch.zeros(0, dtype=torch.long, device=self.device))
+            self._active_ash_indices[level] = torch.zeros(0, dtype=torch.long, device=self.device)
+
+        logger.info("Cleared training state!")
                 
     @torch.no_grad()
     def extend_capacity(self, level: int):
@@ -165,7 +254,7 @@ class GridASH(BaseNet):
             new_external_values={"features": new_features},
         )
 
-        self.features[level] = new_features
+        self.register_buffer(f'_features_{level}', new_features)
         self.capacity[level] = new_cap
 
         assert self.features[level].shape[0] == self.ash_engines[level].capacity
@@ -213,55 +302,47 @@ class GridASH(BaseNet):
             self.features[level][new_indices].zero_()
 
         return int(new_coords.shape[0])
-
-    
+        
     def _query_feature_level(self, x: torch.Tensor, level: int) -> torch.Tensor:
-        """ This currently samples only from the features that are optimizable. Whenever we're not training,
-        we should query from the feature buffer instead. """
+        """ Query the feature at level l for points x using trilinear interpolation. Uses active_features 
+        as trainable features during training, and features buffer directly during eval. """
         
         assert x.ndim == 2 and x.shape[1] == 3
 
         if self.ignore_level_[level]:
             return torch.zeros(x.shape[0], self.fdim, device=self.device, dtype=self.dtype)
 
+        N = x.shape[0]
         cell_size = self.cell_sizes[level]
         x_grid = x / cell_size
         base = torch.floor(x_grid).to(torch.int32)
         frac = (x_grid - base.to(x_grid.dtype)).to(self.dtype)
 
-        corner_coords = base[:, None, :] + self.corner_offsets[None, :, :]
-        corner_coords_flat = corner_coords.reshape(-1, 3)
+        # Include all 8 corners around all points in x as keys to query from ASH
+        coord_keys = base[:, None, :] + self.corner_offsets[None, :, :]
+        coord_keys = coord_keys.reshape(-1, 3) # (N*8, 3)
 
-        # ASH gives us indices into features / active_features row space.
-        # We need to remap: ash_index -> row in active_features.
-        corner_ash_indices, corner_masks = self.ash_engines[level].find(corner_coords_flat)
-        # corner_ash_indices: (N*8,), indices into the capacity-sized store
-        # corner_masks:       (N*8,), True if key exists
+        # ASH maps our corner coordinates to indicies in the self.feature buffer
+        feat_idx, feat_mask = self.ash_engines[level].find(coord_keys)
+        feat_idx[~feat_mask] = 0 # Set invalid indices to 0 to avoid errors. These features must be filtered out later.
+        # feat_idx:  (N*8,) Index in the feature buffer for each corner key.
+        # feat_mask: (N*8,) Valid mask. True if key was found in ASH.
 
-        # Build a lookup table: ash_store_index -> active_param_row
-        # _active_ash_indices[level][i] = ash_index means active_features[level][i] owns that slot
-        active_ash_idx = self._active_ash_indices[level]   # (M,)
-        max_cap = self.ash_engines[level].capacity
-
-        # Scatter active rows into a capacity-sized lookup (-1 = not active)
-        lut = torch.full((max_cap,), -1, dtype=torch.long, device=self.device)
-        lut[active_ash_idx] = torch.arange(active_ash_idx.shape[0], device=self.device)
-
-        N = x.shape[0]
-        safe_ash = corner_ash_indices.clone()
-        safe_ash[~corner_masks] = 0   # dummy index, will be zeroed by mask anyway
-
-        active_rows = lut[safe_ash]   # (N*8,)  — row in active_features, or -1
-        found_in_active = (active_rows >= 0) & corner_masks
-
-        safe_rows = active_rows.clone()
-        safe_rows[~found_in_active] = 0
-
-        # Fetch from trainable parameter (differentiable)
-        corner_feats = self.active_features[level][safe_rows]   # (N*8, fdim)
-        corner_feats = corner_feats.view(N, 8, self.fdim)
-        valid_mask = found_in_active.view(N, 8)
-        corner_feats = corner_feats * valid_mask.unsqueeze(-1).to(corner_feats.dtype)
+        if self.training:
+            # Training: Use the features -> active_features LUT to find the corresponding indices in their trainable buffer
+            active_rows = self._active_lut[level][feat_idx] # (N*8,), -1 if not active
+            in_active = (active_rows >= 0) & feat_mask
+            active_rows[~in_active] = 0
+            feats = self.active_features[level][active_rows]  # (N*8, fdim), differentiable
+            valid = in_active
+        else:
+            # Inference: Use the non-trainable feature buffer directly
+            feats = self.features[level][feat_idx] # (N*8, fdim)
+            valid = feat_mask
+            
+        feats = feats.view(N, 8, self.fdim)
+        valid = valid.view(N, 8)
+        feats = feats * valid.unsqueeze(-1).to(feats.dtype)
 
         # Trilinear interpolation weights
         fx, fy, fz = frac[:, 0], frac[:, 1], frac[:, 2]
@@ -272,8 +353,8 @@ class GridASH(BaseNet):
             (1-fx)*fy*fz,         fx*fy*fz,
         ], dim=1)  # (N, 8)
 
-        valid_weights = weights * valid_mask.to(weights.dtype)
-        f_level = (corner_feats * valid_weights.unsqueeze(-1)).sum(dim=1)
+        valid_weights = weights * valid.to(weights.dtype)
+        f_level = (feats * valid_weights.unsqueeze(-1)).sum(dim=1)
 
         weight_sum = valid_weights.sum(dim=1, keepdim=True)
         has_any = weight_sum.squeeze(-1) > 0
