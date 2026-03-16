@@ -61,6 +61,9 @@ def mapping(cfg, ash_grid:GridASH, dataset:SubmapDataset):
     timer = PerfTimer(activate=True)
     train_loader = DataLoader(dataset, shuffle=True, batch_size=1, num_workers=0)
     
+    ash_grid.print_summary()
+    print("Beginning mapping...")
+    
     loss_fn = MisoLossMapping(
         weight_sdf=cfg_map['weight_sdf'],
         weight_eik=cfg_map['weight_eik'],
