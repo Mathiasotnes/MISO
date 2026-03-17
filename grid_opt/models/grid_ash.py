@@ -345,8 +345,8 @@ class GridASH(BaseNet):
         def ash_mb(level):
             # One entry in ASH has 32b heap + 3*32b keys + 64b values -> 192b = 24 bytes.
             # For comparison: 
-            #   - A feature with fdim=4 and float64 precision is 4*64b = 32 bytes.
-            #   - A feature with fdim=128 and float64 precision is 128*64b = 1024 bytes.
+            #   - A feature with fdim=4 and float32 precision is 4*32b = 16 bytes.
+            #   - A feature with fdim=128 and float32 precision is 128*32b = 4096b = 512 bytes.
             # So the ASH overhead can be significant for e.g. SDF feautres, but very small for e.g. language feautures.
             # An idea to reduce memory in SDF tasks could be to increase the fdim and reduce resolution to minimize ASH overhead.
             cap = self.ash_engines[level].capacity
