@@ -62,17 +62,17 @@ class GridNet(BaseNet):
                     init_stddev=cfg['grid']['init_stddev'],
                     second_order_grid_sample=self.second_order_grid_sample
                 )
-                grid_mu = FeatureGrid(
-                    d = self.d,
-                    fdim=1,
-                    bound=self.bound,
-                    cell_size=cell_size,
-                    name=f"stab-{level}",
-                    dtype=self.dtype,
-                    initial_feature=None,
-                    init_stddev=0.0,
-                    second_order_grid_sample=self.second_order_grid_sample
-                )
+                # grid_mu = FeatureGrid(
+                #     d = self.d,
+                #     fdim=1,
+                #     bound=self.bound,
+                #     cell_size=cell_size,
+                #     name=f"stab-{level}",
+                #     dtype=self.dtype,
+                #     initial_feature=None,
+                #     init_stddev=0.0,
+                #     second_order_grid_sample=self.second_order_grid_sample
+                # )
                 basis = None
             elif self.grid_type == 'VM':
                 grid = FeatureGridVM(
@@ -98,7 +98,7 @@ class GridNet(BaseNet):
             else:
                 raise ValueError(f"Unknown grid type: {self.grid_type}!")
             self.features.append(grid)
-            self.feature_stability.append(grid_mu)
+            # self.feature_stability.append(grid_mu)
             self.bases.append(basis)
         self.ignore_level_ = np.zeros(self.num_levels).astype(bool)
 

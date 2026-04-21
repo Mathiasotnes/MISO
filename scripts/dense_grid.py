@@ -128,7 +128,8 @@ def main_scannet():
     torch.manual_seed(55)
     args = parser.parse_args()
     model_path = join(args.save_dir, 'grid.pth')
-    mesh_path = join(args.save_dir, 'pred_mesh.ply')
+    mesh_path = join(args.save_dir, 'dense_pred_mesh.ply')
+    metrics_path = join(args.save_dir, f'dense_metrics.json')
     cfg, grid, dataset = initialize_scannet(args)
     tracker = GPUMemoryTracker(device=cfg['device'])
     
@@ -151,7 +152,13 @@ def main_scannet():
     metrics_results = compute_chamfer_metrics(verts_pred, verts_trgt, threshold=0.05)
     metrics_results["gpu_peak_allocated_gb"] = mem_stats["peak_allocated_gb"]
     metrics_results["gpu_peak_reserved_gb"]  = mem_stats["peak_reserved_gb"]
-    print(json.dumps(metrics_results, indent=4))
+    metrics_results_rounded = {k: round(v, 2) for k, v in metrics_results.items()}
+
+    print(json.dumps(metrics_results_rounded, indent=4))
+    
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics_results_rounded, f, indent=4)
+        
 
 if __name__ == "__main__":
     main_scannet()
