@@ -170,11 +170,11 @@ class GridNet(BaseNet):
         """Locking (fixing) the features at level l at the current value.
         """
         self.features[l].lock()
-        self.feature_stability[l].lock()
+        # self.feature_stability[l].lock()
 
     def unlock_level(self, l):
         self.features[l].unlock()
-        self.feature_stability[l].unlock()
+        # self.feature_stability[l].unlock()
 
     def lock_feature(self):
         for level in range(self.num_levels):
@@ -341,7 +341,7 @@ class GridNet(BaseNet):
         target_levels = [level] if level < self.num_levels else range(self.num_levels)
         for l in target_levels:
             params += list(self.features[l].parameters())
-            params += list(self.feature_stability[l].parameters())
+            # params += list(self.feature_stability[l].parameters())
         # Always append decoder, if not fixed
         if not self.decoder_fixed:
             params += list(self.decoder.parameters())
