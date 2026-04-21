@@ -11,6 +11,7 @@ import grid_opt.utils.utils_scannet as utils_scannet
 import grid_opt.utils.utils_sdf as utils_sdf
 import open3d as o3d
 import logging
+import time
 logging.basicConfig(level=logging.INFO)
 
 parser = argparse.ArgumentParser()
@@ -134,7 +135,9 @@ def main_scannet():
     tracker = GPUMemoryTracker(device=cfg['device'])
     
     tracker.start()
+    start_time = time.time()
     mapping(cfg, grid, dataset)
+    elapsed_time = time.time() - start_time
     mem_stats = tracker.report(label="mapping")
     
     # Check Sparsity
@@ -152,12 +155,13 @@ def main_scannet():
     metrics_results = compute_chamfer_metrics(verts_pred, verts_trgt, threshold=0.05)
     metrics_results["gpu_peak_allocated_gb"] = mem_stats["peak_allocated_gb"]
     metrics_results["gpu_peak_reserved_gb"]  = mem_stats["peak_reserved_gb"]
-    metrics_results_rounded = {k: round(v, 2) for k, v in metrics_results.items()}
+    metrics_results = {k: round(v, 2) for k, v in metrics_results.items()} # Round to 2 decimals
+    metrics_results["training_time_s"] = round(elapsed_time, 3)
 
-    print(json.dumps(metrics_results_rounded, indent=4))
+    print(json.dumps(metrics_results, indent=4))
     
     with open(metrics_path, 'w') as f:
-        json.dump(metrics_results_rounded, f, indent=4)
+        json.dump(metrics_results, f, indent=4)
         
 
 if __name__ == "__main__":
