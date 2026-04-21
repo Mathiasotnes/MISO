@@ -1,6 +1,7 @@
 import argparse
 import numpy as np
 import json
+import time
 from grid_opt.models.grid_ash import GridASH
 from grid_opt.utils.utils_eval import compute_chamfer_metrics, sample_points_from_mesh
 from grid_opt.datasets.submap_dataset import SubmapDataset
@@ -14,7 +15,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--config', type=str, help='Path to config file.', default='./configs/rgbd/scannet.yaml')
+parser.add_argument('--config', type=str, help='Path to config file.', default='./configs/rgbd/ash.yaml')
 parser.add_argument('--default_config', type=str, help='Path to config file.', default='./configs/base.yaml')
 parser.add_argument('--save_dir', type=str, default='./results/mapping')
 parser.add_argument('--pose_init', type=str, default='gt')  # reg_icp OR kiss_icp OR gt
@@ -69,6 +70,23 @@ def mapping(cfg, ash_grid:BaseNet, dataset:SubmapDataset):
         level_iterations=cfg['train']['max_epochs_in_level']
     )
     
+class GPUMemoryTracker:
+    def __init__(self, device="cuda"):
+        self.device = device
+
+    def start(self):
+        torch.cuda.reset_peak_memory_stats(self.device)
+
+    def report(self, label=""):
+        peak_allocated = torch.cuda.max_memory_allocated(self.device)
+        peak_reserved  = torch.cuda.max_memory_reserved(self.device)
+        tag = f"[{label}] " if label else ""
+        print(f"{tag}GPU memory — peak allocated: {peak_allocated / 1e9:.3f} GB | "
+              f"peak reserved: {peak_reserved / 1e9:.3f} GB")
+        return {
+            "peak_allocated_gb": peak_allocated / 1e9,
+            "peak_reserved_gb":  peak_reserved  / 1e9,
+        }
 
 ##############################################
 # Main entry point
@@ -80,10 +98,16 @@ def main_scannet():
     args = parser.parse_args()
     
     model_path      = join(args.save_dir, f'ash_grid.pth')
-    mesh_path       = join(args.save_dir, f'hash_pred_mesh.ply')
-    metrics_path    = join(args.save_dir, f'metrics.json')
+    mesh_path       = join(args.save_dir, f'ash_pred_mesh.ply')
+    metrics_path    = join(args.save_dir, f'ash_metrics.json')
     
+    tracker = GPUMemoryTracker(device=cfg['device'])
+    
+    tracker.start()
+    start_time = time.time()
     cfg, ash_grid, dataset = initialize_scannet(args)
+    elapsed_time = time.time() - start_time
+    mem_stats = tracker.report(label="mapping")
     
     mapping(cfg, ash_grid, dataset)
     
@@ -97,6 +121,10 @@ def main_scannet():
     verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
     
     metrics_results = compute_chamfer_metrics(verts_pred, verts_trgt, threshold=0.05, truncation_acc=0.50, truncation_com=0.50)
+    metrics_results["gpu_peak_allocated_gb"] = mem_stats["peak_allocated_gb"]
+    metrics_results["gpu_peak_reserved_gb"]  = mem_stats["peak_reserved_gb"]
+    metrics_results = {k: round(v, 2) for k, v in metrics_results.items()} # Round to 2 decimals
+    metrics_results["training_time_s"] = round(elapsed_time, 3)
     print(json.dumps(metrics_results, indent=4))
     
     with open(metrics_path, 'w') as f:

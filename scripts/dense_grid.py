@@ -128,7 +128,7 @@ def main_scannet():
     np.random.seed(55)
     torch.manual_seed(55)
     args = parser.parse_args()
-    model_path = join(args.save_dir, 'grid.pth')
+    model_path = join(args.save_dir, 'dense_grid.pth')
     mesh_path = join(args.save_dir, 'dense_pred_mesh.ply')
     metrics_path = join(args.save_dir, f'dense_metrics.json')
     cfg, grid, dataset = initialize_scannet(args)
