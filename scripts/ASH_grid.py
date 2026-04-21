@@ -101,15 +101,14 @@ def main_scannet():
     mesh_path       = join(args.save_dir, f'ash_pred_mesh.ply')
     metrics_path    = join(args.save_dir, f'ash_metrics.json')
     
+    cfg, ash_grid, dataset = initialize_scannet(args)
     tracker = GPUMemoryTracker(device=cfg['device'])
     
     tracker.start()
     start_time = time.time()
-    cfg, ash_grid, dataset = initialize_scannet(args)
+    mapping(cfg, ash_grid, dataset)
     elapsed_time = time.time() - start_time
     mem_stats = tracker.report(label="mapping")
-    
-    mapping(cfg, ash_grid, dataset)
     
     # Evaluate
     ash_grid.print_ash_stats()
