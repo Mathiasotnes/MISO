@@ -14,7 +14,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--config', type=str, help='Path to config file.', default='./configs/rgbd/scannet.yaml')
+parser.add_argument('--config', type=str, help='Path to config file.', default='./configs/rgbd/dense.yaml')
 parser.add_argument('--default_config', type=str, help='Path to config file.', default='./configs/base.yaml')
 parser.add_argument('--save_dir', type=str, default='./results/mapping')
 parser.add_argument('--pose_init', type=str, default='gt')  # reg_icp OR kiss_icp OR gt
@@ -100,6 +100,24 @@ def calculate_model_sparsity(model: torch.nn.Module):
     else:
         return 0.0
     
+class GPUMemoryTracker:
+    def __init__(self, device="cuda"):
+        self.device = device
+
+    def start(self):
+        torch.cuda.reset_peak_memory_stats(self.device)
+
+    def report(self, label=""):
+        peak_allocated = torch.cuda.max_memory_allocated(self.device)
+        peak_reserved  = torch.cuda.max_memory_reserved(self.device)
+        tag = f"[{label}] " if label else ""
+        print(f"{tag}GPU memory — peak allocated: {peak_allocated / 1e9:.3f} GB | "
+              f"peak reserved: {peak_reserved / 1e9:.3f} GB")
+        return {
+            "peak_allocated_gb": peak_allocated / 1e9,
+            "peak_reserved_gb":  peak_reserved  / 1e9,
+        }
+    
 
 ##############################################
 # Main entry point
@@ -112,8 +130,11 @@ def main_scannet():
     model_path = join(args.save_dir, 'grid.pth')
     mesh_path = join(args.save_dir, 'pred_mesh.ply')
     cfg, grid, dataset = initialize_scannet(args)
+    tracker = GPUMemoryTracker(device=cfg['device'])
     
+    tracker.start()
     mapping(cfg, grid, dataset)
+    mem_stats = tracker.report(label="mapping")
     
     # Check Sparsity
     sparsity = calculate_model_sparsity(grid)
@@ -128,6 +149,8 @@ def main_scannet():
     verts_trgt = sample_points_from_mesh(gt_mesh_path, mesh_sample_point=1000000)
     
     metrics_results = compute_chamfer_metrics(verts_pred, verts_trgt, threshold=0.05)
+    metrics_results["gpu_peak_allocated_gb"] = mem_stats["peak_allocated_gb"]
+    metrics_results["gpu_peak_reserved_gb"]  = mem_stats["peak_reserved_gb"]
     print(json.dumps(metrics_results, indent=4))
 
 if __name__ == "__main__":
