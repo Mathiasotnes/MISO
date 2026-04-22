@@ -5,8 +5,10 @@ import torch
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from .utils.utils import cond_mkdir, PerfTimer, prepare_batch
+from .utils import utils_geometry
 import time
 from grid_opt.models.grid_ngp_ours import GridNGPOurs
+from grid_opt.models.grid_ash import GridASH
 
 import logging
 logger = logging.getLogger(__name__)
@@ -205,12 +207,37 @@ class Trainer(object):
             model_input, gt = prepare_batch(model_input, gt)
             self.optimizer.zero_grad()
             
-            # Loss 
-            total_loss = 0.
-            loss_dict = self.loss_func.compute(self.model, model_input, gt)
-            for loss_name, loss in loss_dict.items():
-                single_loss = loss.mean()
-                total_loss += single_loss
+            if isinstance(self.model, GridASH):
+                coords_frame = model_input['coords_frame'][0]
+                sample_frame_ids = model_input['sample_frame_ids'][0, :, 0]
+                sample_weights = model_input['weights'][0]
+                gt_sdf = gt['sdf'][0]
+                assert coords_frame.ndim == 2 and gt_sdf.ndim == 2
+                assert sample_weights.shape == gt_sdf.shape
+                # Transform coords from keyframe to world frame
+                unique_frame_ids = np.unique(sample_frame_ids.detach().cpu().numpy()).tolist()
+                coords_world = coords_frame.clone()
+                for kf_id in unique_frame_ids:
+                    idxs_select = torch.nonzero(sample_frame_ids == kf_id, as_tuple=False).squeeze(1)
+                    if idxs_select.numel() == 0: continue
+                    R_world_frame, t_world_frame = self.loss_func.query_kf_pose(self.model, kf_id)
+                    coords_world[idxs_select, :] = utils_geometry.transform_points_to(
+                        coords_frame[idxs_select, :],
+                        R_world_frame,
+                        t_world_frame
+                    )
+                
+                self.model.prepare_features(coords_world) # This will make the features at the current frame trainable, and freeze all other features.
+                
+                optimizer = torch.optim.Adam(self.model.parameters(), lr=self.cfg['learning_rate'])
+                optimizer.zero_grad()
+            else:
+                # Loss 
+                total_loss = 0.
+                loss_dict = self.loss_func.compute(self.model, model_input, gt)
+                for loss_name, loss in loss_dict.items():
+                    single_loss = loss.mean()
+                    total_loss += single_loss
 
             if isinstance(self.model, GridNGPOurs):
                 if self.model.track_saliency:
