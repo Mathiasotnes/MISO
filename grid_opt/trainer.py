@@ -231,13 +231,13 @@ class Trainer(object):
                 
                 optimizer = torch.optim.Adam(self.model.parameters(), lr=self.cfg['learning_rate'])
                 optimizer.zero_grad()
-            else:
-                # Loss 
-                total_loss = 0.
-                loss_dict = self.loss_func.compute(self.model, model_input, gt)
-                for loss_name, loss in loss_dict.items():
-                    single_loss = loss.mean()
-                    total_loss += single_loss
+            
+            # Loss 
+            total_loss = 0.
+            loss_dict = self.loss_func.compute(self.model, model_input, gt)
+            for loss_name, loss in loss_dict.items():
+                single_loss = loss.mean()
+                total_loss += single_loss
 
             if isinstance(self.model, GridNGPOurs):
                 if self.model.track_saliency:
